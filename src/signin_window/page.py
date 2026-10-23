@@ -2,7 +2,8 @@
 
 The page explains what is about to happen, opens a window when the person continues, shows it through noVNC once the
 sign-in page is up, follows the window until it ends and says how it ended. All its text is yours to change;
-``{service}`` and ``{label}`` in it are replaced (escaped) by the service's name and the link's label. In the
+``{service}`` and ``{label}`` anywhere in it are replaced (escaped) by the service's name and the link's label (what
+it signs in: an account, a site). In the
 outcome messages, ``{name}`` is replaced in the browser by the escaped public field ``name`` of the link's state
 (what your relay hooks ``show``).
 """
@@ -44,6 +45,7 @@ class PageText:
     host_label: str = ""
     starting: str = "Opening {service}…"
     waiting: str = "Sign in as you usually do. This page notices when you're in."
+    saving: str = "Signed in. Saving…"
     #: State -> HTML shown when the link ends in that state; your own final states go here too.
     outcomes: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_OUTCOMES))
     #: States whose message offers "Try again".
@@ -71,24 +73,25 @@ def render(text: PageText, label: str | None) -> str:
     """The link's page; ``label`` None is the expired page."""
     if label is None:
         body = f"<main class=msg>{text.html(text.outcomes.get('expired', DEFAULT_OUTCOMES['expired']))}</main>"
-        return (
-            _PAGE.replace("{{TITLE}}", html.escape(text.plain(text.title)))
-            .replace("{{BODY}}", body)
-            .replace("{{SCRIPT}}", "")
-        )
+        title = text.plain(text.title.replace(" {label}", "")).strip()  # no link, no label
+        return _PAGE.replace("{{TITLE}}", html.escape(title)).replace("{{BODY}}", body).replace("{{SCRIPT}}", "")
     body = (
-        _BODY.replace("{{HEADING}}", html.escape(text.plain(text.title)))
+        _BODY.replace("{{HEADING}}", html.escape(text.plain(text.title, label)))
         .replace("{{HELP}}", text.html(text.help_html, label))
-        .replace("{{HOST}}", html.escape(text.plain(text.host_label)))
+        .replace("{{HOST}}", html.escape(text.plain(text.host_label, label)))
         .replace("{{INTRO}}", text.html(text.intro_html, label))
-        .replace("{{BUTTON}}", html.escape(text.plain(text.button)))
+        .replace("{{BUTTON}}", html.escape(text.plain(text.button, label)))
     )
     config = {
-        "text": {"starting": text.plain(text.starting), "waiting": text.plain(text.waiting)},  # set as text
+        "text": {
+            "starting": text.plain(text.starting, label),
+            "waiting": text.plain(text.waiting, label),
+            "saving": text.plain(text.saving, label),
+        },
         "outcomes": {state: text.html(message, label) for state, message in text.outcomes.items()},
         "noRetry": list(text.no_retry),
         "secureHost": text.secure_host,
-        "frameTitle": text.plain(text.title),
+        "frameTitle": text.plain(text.title, label),
     }
     # JSON in a script element: "</" would end it, so it is escaped.
     script = (
@@ -98,11 +101,8 @@ def render(text: PageText, label: str | None) -> str:
         + ";</script>\n"
         + _SCRIPT
     )
-    return (
-        _PAGE.replace("{{TITLE}}", html.escape(text.plain(text.title)))
-        .replace("{{BODY}}", body)
-        .replace("{{SCRIPT}}", script)
-    )
+    title = html.escape(text.plain(text.title, label))
+    return _PAGE.replace("{{TITLE}}", title).replace("{{BODY}}", body).replace("{{SCRIPT}}", script)
 
 
 _BODY = """<header><h1>{{HEADING}}</h1>

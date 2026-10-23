@@ -15,6 +15,9 @@ When the window ends, one of your hooks says how it went, and the link takes tha
   when the page has a message for it (a login service that keeps sessions itself reports ``"connected"`` and the
   like), else ``"failed"``.
 
+``before_start(link) -> state | None``, if given, runs before each window opens: return None to go on, or a state of
+your own (say ``"invite_required"``) to refuse; it may also add to ``link.params``.
+
 Hooks run one at a time, in a worker thread. ``link.show(name=...)`` adds public fields to the link's state (the
 page can show them). The link never shows, returns or reads a session.
 
@@ -56,7 +59,7 @@ log = logging.getLogger("signin_window")
 
 LINK_ID = re.compile(r"[A-Za-z0-9_-]{32,64}\Z")
 FIELD = re.compile(r"[a-z_][a-z0-9_]{0,39}\Z")
-ACTIVE = ("starting", "waiting")
+ACTIVE = ("starting", "waiting", "saving")
 FINAL = ("connected",)
 MISS_WINDOW, MISSES_PER_ADDRESS, MISSES_TOTAL = 10 * 60, 20, 200  # requests for ids that do not exist
 HEADERS = {
@@ -165,6 +168,7 @@ class Relay:
         text: PageText | None = None,
         on_signed_in: Callable[[Link, dict[str, Any]], str] | None = None,
         on_ended: Callable[[Link, dict[str, Any]], str] | None = None,
+        before_start: Callable[[Link], str | None] | None = None,
         link_ttl: int = 20 * 60,
         max_links: int = 50,
         links_per_hour: int = 6,
@@ -176,7 +180,7 @@ class Relay:
             raise ValueError("public_url must be an http(s) URL without a query")
         self.backend, self.public_url = backend, public_url.rstrip("/")
         self.text = text or PageText()
-        self._on_signed_in, self._on_ended = on_signed_in, on_ended
+        self._on_signed_in, self._on_ended, self._before_start = on_signed_in, on_ended, before_start
         self.link_ttl, self.max_links, self.links_per_hour, self.max_starts = (
             link_ttl, max_links, links_per_hour, max_starts,
         )  # fmt: skip
@@ -268,6 +272,16 @@ class Relay:
         with link.lock:
             if link.closed or link.state in ACTIVE or link.state in FINAL or link.starts >= self.max_starts:
                 return
+            if self._before_start is not None:
+                with self._hooks:
+                    try:
+                        refused = self._before_start(link)
+                    except Exception as exc:
+                        log.warning("%s: the start hook failed: %s", link.key, type(exc).__name__)
+                        refused = "failed"
+                if refused is not None:
+                    link.state = refused if refused in self.text.outcomes else "failed"
+                    return
             link.starts += 1
             try:
                 window = self.backend.start(layout if layout in ("phone", "desktop") else "desktop", **link.params)
@@ -328,7 +342,7 @@ class Relay:
 
     def cancel(self, link: Link) -> None:
         with link.lock:
-            if link.state in ACTIVE:
+            if link.state in ("starting", "waiting"):
                 self._close(link)
 
     # -- HTTP -----------------------------------------------------------------------------------------------------

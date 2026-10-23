@@ -170,3 +170,33 @@ def test_the_bridge_relays_a_persons_viewer_to_the_window(service):
         assert ws.receive_bytes() == b"RFB 003.008\n"
         ws.send_bytes(b"hello")
         assert ws.receive_bytes() == b"hello"
+
+
+def test_request_calls_a_consumers_own_route_with_the_bearer(tmp_path):
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    async def refresh(request):
+        return JSONResponse({"refreshed": request.path_params["account"]})
+
+    windows = Windows(lambda window: None)
+    app = build_app(windows, token=TOKEN, novnc_dir=tmp_path, routes=[Route("/accounts/{account}/refresh", refresh,
+                                                                            methods=["POST"])])  # fmt: skip
+    port = free_port()
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        for _ in range(200):
+            if server.started:
+                break
+            time.sleep(0.02)
+        client = LoginClient(f"http://127.0.0.1:{port}", TOKEN)
+        assert client.request("POST", "/accounts/jane/refresh") == (200, {"refreshed": "jane"})
+        assert LoginClient(f"http://127.0.0.1:{port}", "w" * 40).request("POST", "/accounts/jane/refresh")[0] == 401
+        for bad in ("accounts/x", "/a/../b", "//evil.example/x"):
+            with pytest.raises(LoginUnavailable):
+                client.request("GET", bad)
+    finally:
+        server.should_exit = True
+        thread.join(5)

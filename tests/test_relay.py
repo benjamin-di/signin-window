@@ -340,3 +340,33 @@ def test_a_shown_field_cannot_replace_the_state():
     link = Link("x" * 32, "k", 0.0, 1.0, "https://example.com/x")
     link.show(state="connected", host="evil", name="J" * 300, **{"Bad-Name": "x"})
     assert link.public() == {"name": "J" * 100, "state": "ready", "host": ""}
+
+
+def test_before_start_can_refuse_a_window_or_add_to_its_params(backend, stored, clock):
+    allowed = {"ok": False}
+
+    def before_start(link):
+        if not allowed["ok"]:
+            return "invite_required"
+        link.params["account"] = "jane"
+        return None
+
+    text = PageText().with_outcomes(invite_required="<h1>Enter your invite code</h1>")
+    relay = Relay(backend, "https://mcp.example.com/connect", text=text, before_start=before_start, clock=clock)
+    http = TestClient(Starlette(routes=relay.routes("/connect")))
+    link = relay.create("pending")
+    assert start(http, link)["state"] == "invite_required" and backend.started == []
+    allowed["ok"] = True
+    assert start(http, link)["state"] == "starting"
+    assert backend.started == [("desktop", {"account": "jane"})]
+
+
+def test_a_saving_window_is_followed_and_not_cancelled(relay, http, backend):
+    link = relay.create("alice")
+    start(http, link)
+    backend.states["window-0000000000"] = {"state": "saving", "host": "www.example.com"}
+    assert state(http, link)["state"] == "saving"
+    http.post(path(link) + "/cancel")
+    assert backend.closed == [] and state(http, link)["state"] == "saving"
+    backend.end("window-0000000000", "connected")
+    assert state(http, link)["state"] == "connected"

@@ -38,3 +38,12 @@ def test_the_expired_page_has_no_script():
 def test_extra_script_comes_before_the_page_script():
     page = render(PageText(script_extra="window.signinBeforeStart = async () => true;"), "jane")
     assert page.index("window.signinBeforeStart = async") < page.index("const CONFIG")
+
+
+def test_the_label_fills_the_title_host_and_button_too():
+    text = PageText(service="Shop", title="Sign in to {label}", host_label="{label}", button="Continue on {label}")
+    page = render(text, "shop.example<")
+    assert "<title>Sign in to shop.example&lt;</title>" in page and "<h1>Sign in to shop.example&lt;</h1>" in page
+    assert "<span id=host>shop.example&lt;</span>" in page and ">Continue on shop.example&lt;</button>" in page
+    assert config(page)["frameTitle"] == "Sign in to shop.example<"
+    assert "<title>Sign in to</title>" in render(text, None)

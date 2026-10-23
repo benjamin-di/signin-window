@@ -375,3 +375,53 @@ def test_a_display_that_exits_at_once_is_an_error(tmp_path):
     with pytest.raises(RuntimeError):
         windows.start_display(window)
     windows.stop_display(window)
+
+
+def test_a_window_saving_a_kept_session_closes_its_view_and_finishes_through_a_cancel(tmp_path):
+    release, saved = {}, threading.Event()
+
+    def runner(window):  # a plain function, like a sync browser library's
+        window.waiting("accounts.example.com")
+        while not release.get(window.id):
+            if window.cancelled.wait(0.01):
+                return None
+        window.saving()
+        time.sleep(0.3)  # writing the snapshot; a cancel meanwhile changes nothing
+        saved.set()
+        window.finish("connected")
+
+    def start_params(body):
+        return {"key": body.get("account")}
+
+    app = app_for(no_display(Windows(runner, slots=2)), tmp_path, start_params=start_params)
+    with TestClient(app) as client:
+        started = client.post("/logins", json={"account": "a"}, headers=AUTH).json()
+        window_id = started["id"]
+        poll(client, window_id, "waiting")
+        release[window_id] = True
+        poll(client, window_id, "saving")
+        with (
+            pytest.raises(WebSocketDisconnect),
+            client.websocket_connect(f"/logins/{window_id}/vnc?t={started['view_token']}"),
+        ):
+            pass  # no live view while saving
+        client.delete(f"/logins/{window_id}", headers=AUTH)  # ignored
+        client.post("/logins", json={"account": "a"}, headers=AUTH)  # a newer window does not cancel it either
+        poll(client, window_id, "connected")
+        assert saved.is_set()
+
+
+def test_close_key_closes_every_window_of_a_key(tmp_path):
+    def start_params(body):
+        return {"key": body.get("account")}
+
+    windows = no_display(Windows(waiting_until({}), slots=3))
+    app = app_for(windows, tmp_path, start_params=start_params)
+    with TestClient(app) as client:
+        mine = client.post("/logins", json={"account": "a"}, headers=AUTH).json()["id"]
+        other = client.post("/logins", json={"account": "b"}, headers=AUTH).json()["id"]
+        poll(client, mine, "waiting")
+        poll(client, other, "waiting")
+        client.portal.call(windows.close_key, "a")
+        poll(client, mine, "cancelled")
+        assert client.get(f"/logins/{other}", headers=AUTH).json()["state"] == "waiting"

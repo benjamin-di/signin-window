@@ -76,8 +76,10 @@ A window ends in one of two ways:
   it is dropped. The login service keeps nothing.
 - **Kept**: the runner keeps the session itself (a browser profile it refreshes, a snapshot it writes for the server
   to read) and calls `window.finish("connected")`, or another final state of its own such as `"wrong_account"`.
-  `window.report(account=...)` adds public fields to the window's state. Pass a `lock` to `Windows` if a keeper
-  uses the same profile.
+  `window.report(account=...)` adds public fields to the window's state. Once the person is signed in, call
+  `window.saving()` while you keep the session: the live view closes and closing the window no longer interrupts
+  you. Pass a `lock` to `Windows` if a keeper uses the same profile, and `windows.close_key(key)` closes every
+  window of an account you remove.
 
 A runner can be a plain function too (it runs in a thread and should watch `window.cancelled`), or a command:
 `signin_window.child.run_child(window, argv)` runs it on the window's display and follows its progress lines
@@ -93,6 +95,7 @@ same key cancel the older), `title` for the plain view page, and `routes` of you
 The service's API (`build_app`): `POST /logins`, `GET /logins/{id}`, `POST /logins/{id}/result` (the session, once),
 `DELETE /logins/{id}`, `WS /logins/{id}/vnc?t=` (the live view, with the window's view token), `GET /view/{id}?t=`
 (a plain page showing the window, for someone on the service's own network), `GET /novnc/...` and `GET /health`.
+Shutting the service down closes its windows. `LoginClient.request(method, path)` calls a route of your own on it.
 
 ## The relay, in your server
 
@@ -130,10 +133,13 @@ Hooks run one at a time, in a worker thread:
 - `on_ended(link, window_state) -> state`: the window ended without a hand-over. By default its state is kept when
   the page has a message for it (a kept session's `"connected"`), else `"failed"`.
 
+- `before_start(link) -> state | None`: runs before each window opens. Return None to go on, or a state of your own
+  to refuse (an invite code the person has not entered yet, say); it may add to `link.params`.
+
 `link.show(name=...)` adds public fields to the link's state, which the page's messages can use (`{name}`).
 
-`PageText` holds everything the page says: `service`, `title`, `help_html`, `intro_html` (with `{service}` and
-`{label}`), `button`, `secure_host` (a host it matches gets a padlock), `starting`, `waiting`, `outcomes` (state ->
+`PageText` holds everything the page says (`{service}` and `{label}` work in all of it): `service`, `title`,
+`help_html`, `intro_html`, `button`, `secure_host` (a host it matches gets a padlock), `starting`, `waiting`, `saving`, `outcomes` (state ->
 message; `with_outcomes(...)` adds your own) and `script_extra` (it may define `window.signinBeforeStart`, an async
 function that must return true before a window opens, for an invite code the person enters first, say).
 

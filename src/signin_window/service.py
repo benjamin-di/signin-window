@@ -13,9 +13,9 @@ view), and ends in one of two ways:
 - **kept**: it keeps the session itself (in a profile or snapshot this service owns) and calls
   ``window.finish(state)`` with a final state of its own, such as ``"connected"`` or ``"wrong_account"``.
 
-States: ``starting`` -> ``waiting`` -> ``signed_in`` (hand-over) or the runner's own final state; or ``failed``,
-``expired`` (past its time), ``cancelled`` (closed early), ``busy`` (the shared lock stayed taken) or ``closed``
-(its session was taken). Ended windows stay readable for ``ENDED_TTL`` so the caller sees how they ended.
+States: ``starting`` -> ``waiting`` -> (``saving`` ->) ``signed_in`` (hand-over) or the runner's own final state; or
+``failed``, ``expired`` (past its time), ``cancelled`` (closed early), ``busy`` (the shared lock stayed taken) or
+``closed`` (its session was taken). Ended windows stay readable for ``ENDED_TTL`` so the caller sees how they ended.
 
 The HTTP API (``build_app``) needs a bearer for everything but ``/health``, noVNC's files and the person's own view,
 which needs the window's view token. Only the caller that started a window gets that token.
@@ -55,7 +55,9 @@ log = logging.getLogger("signin_window")
 
 #: Window sizes for the person's screen: the display is made this size, and so should the browser window be.
 LAYOUTS: dict[str, tuple[int, int]] = {"desktop": (1280, 860), "phone": (430, 900)}
-ACTIVE = ("starting", "waiting")
+#: Open windows: they hold a slot and can still end either way. ``saving``: the person has signed in and the runner
+#: is keeping the session (a kept session); the live view is closed and a cancel no longer interrupts it.
+ACTIVE = ("starting", "waiting", "saving")
 #: The one state with a live view: the sign-in page is up and nothing else may be on screen.
 VIEWABLE = "waiting"
 RESULT_TTL = 5 * 60  # a handed-over session waits this long to be taken, then it is dropped
@@ -133,6 +135,12 @@ class Window:
         if self.state == "starting":
             self.state = "waiting"
 
+    def saving(self) -> None:
+        """The person has signed in; the runner is now keeping the session. The live view closes, and closing the
+        window no longer interrupts the runner (the sign-in is done)."""
+        if self.state in ("starting", "waiting"):
+            self.state = "saving"
+
     def at(self, host: str) -> None:
         """The host the window shows now (the page tells the person where they are)."""
         self.host = str(host)[:100]
@@ -203,7 +211,7 @@ class Windows:
             self._reap()
             if key is not None:
                 for other in self._windows.values():
-                    if other.key == key and other.state in ACTIVE:
+                    if other.key == key and other.state in ("starting", "waiting"):  # a saving one finishes
                         self._cancel(other)
             used = {w.slot for w in self._windows.values() if w.state in ACTIVE}
             free = [slot for slot in range(self.slots) if slot not in used]
@@ -247,7 +255,7 @@ class Windows:
                 window.result = None
                 window.state, window.ended_at = "closed", self._clock()
                 return
-            if window.state not in ACTIVE:
+            if window.state not in ("starting", "waiting"):  # ended, or saving a finished sign-in
                 return
             self._cancel(window)
             task = window.task
@@ -259,6 +267,11 @@ class Windows:
         for window_id in list(self._windows):
             await self.close(window_id)
 
+    async def close_key(self, key: str) -> None:
+        """Close every window of ``key`` (an account being removed, say)."""
+        for window in [w for w in list(self._windows.values()) if w.key == key]:
+            await self.close(window.id)
+
     def _cancel(self, window: Window) -> None:
         window.cancelled.set()
         if window.task is not None and not window.task.done():
@@ -268,7 +281,7 @@ class Windows:
         """Windows past their time are stopped; untaken sessions and ended windows are dropped (hold ``_guard``)."""
         now = self._clock()
         for window in list(self._windows.values()):
-            if window.state in ACTIVE and now > window.deadline:
+            if window.state in ("starting", "waiting") and now > window.deadline:
                 self._cancel(window)
             elif window.state == "signed_in" and window.result_at is not None and now - window.result_at > RESULT_TTL:
                 window.result = None
@@ -299,7 +312,10 @@ class Windows:
             else:
                 self._end(window, "failed", window.error or "no_session")
         except asyncio.CancelledError:
-            self._end(window, "expired" if self._clock() > window.deadline else "cancelled")
+            if window._outcome is not None:  # it finished all the same (a kept session being saved)
+                self._end(window, *window._outcome)
+            else:
+                self._end(window, "expired" if self._clock() > window.deadline else "cancelled")
         except Exception as exc:
             log.warning("window %s failed: %s", window.id[:6], type(exc).__name__)
             self._end(window, "failed", window.error or type(exc).__name__)
@@ -596,7 +612,13 @@ def build_app(
     ]
     if novnc_dir.is_dir():
         all_routes.append(Mount("/novnc", app=StaticFiles(directory=novnc_dir)))
-    return Starlette(routes=all_routes, middleware=[Middleware(BearerOnly, token=token)])
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_: Starlette):  # type: ignore[no-untyped-def]
+        yield
+        await windows.close_all()  # on shutdown: runners stop, displays and profiles go
+
+    return Starlette(routes=all_routes, middleware=[Middleware(BearerOnly, token=token)], lifespan=lifespan)
 
 
 async def _pipe(ws: WebSocket, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,

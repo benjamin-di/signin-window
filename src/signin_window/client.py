@@ -85,6 +85,13 @@ class LoginClient:
         except ValueError:
             raise LoginUnavailable("not json") from None
 
+    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> tuple[int, Any]:
+        """Call one of your own routes on the login service (``build_app(routes=...)``), with its bearer: (status,
+        JSON body). ``path`` is a fixed path you build from validated parts."""
+        if not path.startswith("/") or ".." in path or "//" in path:
+            raise LoginUnavailable("bad path")
+        return self._call(method, path, body)
+
     @staticmethod
     def _id(window_id: str) -> str:
         if not WINDOW_ID.match(window_id or ""):
