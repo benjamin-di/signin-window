@@ -33,6 +33,7 @@ from playwright.async_api import async_playwright
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
+from signin_window.browser import LAUNCH_ARGS, harden
 from signin_window.client import LoginClient
 from signin_window.page import PageText
 from signin_window.relay import Relay
@@ -110,12 +111,17 @@ async def main(windows_box: list) -> int:
             """Instead of a real site: one text field, in a headed Chromium on the window's display. It counts as
             signed in once the field holds the pasted text."""
             # The window fills the display: with no window manager, keys go to the window under the pointer.
+            # Kiosk mode and harden(), as a real runner's window (scripts/browser_check.py checks what they do).
             width, height = window.size
             browser = await pw.chromium.launch(
-                headless=False, env=window.env(), args=["--window-position=0,0", f"--window-size={width},{height}"]
+                headless=False,
+                env=window.env(),
+                args=["--window-position=0,0", f"--window-size={width},{height}", *LAUNCH_ARGS],
             )
             try:
-                page = await browser.new_page(no_viewport=True)
+                context = await browser.new_context(no_viewport=True)
+                await harden(context, browser)
+                page = await context.new_page()
                 await page.set_content(FIELD_PAGE)
                 await page.focus("#f")
                 remote["page"] = SHOTS["remote"] = page

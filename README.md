@@ -44,6 +44,7 @@ page is up (the live view opens only then), and returns the session when the sit
 import asyncio
 
 from playwright.async_api import async_playwright
+from signin_window.browser import LAUNCH_ARGS, harden
 from signin_window.hosts import allowed, host_resolver_rules
 from signin_window.service import Windows, build_app
 
@@ -53,8 +54,9 @@ async def sign_in(window):
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
             window.temp_profile(), headless=False, env=window.env(), no_viewport=True,
-            args=[f"--host-resolver-rules={host_resolver_rules(HOSTS)}", "--window-position=0,0"],
+            args=[f"--host-resolver-rules={host_resolver_rules(HOSTS)}", "--window-position=0,0", *LAUNCH_ARGS],
         )
+        await harden(context)
         await context.route("**/*", lambda r: r.continue_() if allowed(r.request.url, HOSTS) else r.abort())
         page = await context.new_page()
         await page.goto("https://www.example.com/signin")
@@ -69,6 +71,28 @@ app = build_app(Windows(sign_in), token=TOKEN, novnc_dir="/opt/novnc")
 ```
 
 [`examples/minimal/login_service.py`](examples/minimal/login_service.py) is the complete version.
+
+### Locking the browser down
+
+The window is a real browser in front of a person: `signin_window.browser` makes it show the site's sign-in and
+nothing else.
+
+- `LAUNCH_ARGS` (kiosk mode): no address bar, tabs, menus or window frame, and every window fills the display (which
+  has no window manager). DevTools stay closed.
+- `POLICY`, Chromium's managed policy: the image installs it as root (`python -m signin_window.browser
+  install-policy`; `check-policy` tests for it, and `policy_installed()` lets a service refuse to open a window
+  without it). Chromium does not offer to save passwords or fill addresses and cards, and opens no local files,
+  file dialogs, downloads, printing, browser sign-in or sync; its own pages (new tab, history, settings) and `file:`,
+  `data:` and `view-source:` addresses are blocked.
+- `harden(context)` (`harden_sync` for Playwright's sync API): hides WebAuthn from every page and frame, so a site
+  offers its other ways to sign in instead of a passkey dialog that cannot work (no authenticator is near the
+  server), and closes a tab or window opened with Ctrl+T or Ctrl+N. Kiosk mode reaches the windows of a persistent
+  context only: for `browser.new_context()`, call `harden(context, browser)`, which makes its windows full screen
+  (kiosk mode keeps them so) and closes windows opened outside it.
+
+`scripts/browser_check.py` checks all of it in a real Chromium; CI runs it on every change. In your route check, tell
+the page's own address from what it loads with `hosts.top_level(request)`: Playwright has no frame yet for a popup's
+first page, and asking for it raises.
 
 A window ends in one of two ways:
 
@@ -157,11 +181,11 @@ for a login service of another shape.
   Content-Security-Policy; nothing in the link's state or page is ever the session.
 - Keep the window on the site: `signin_window.hosts` checks every request against the site's hosts and makes every
   other host unresolvable for the browser, so neither a link on the page nor a redirect turns the window into a
-  general browser. On a shared login service, also lock the browser down with Chromium's policies (no file
-  access, no extensions, no other profiles).
+  general browser. Lock the browser itself down too ("Locking the browser down"): no address bar, no Chromium pages,
+  no local files.
 - A hand-over session leaves the login service once, to your server's hook, and is dropped if nobody takes it.
-- Passkeys do not work in a remote window (they need the person's own device nearby): people sign in with a
-  password and a code.
+- Passkeys do not work in a remote window (they need the person's own device nearby): `harden()` hides them, and
+  people sign in with a password and a code. Chromium never offers to keep the password (`POLICY`).
 
 Report vulnerabilities privately ([SECURITY.md](SECURITY.md)).
 
@@ -172,6 +196,7 @@ make bootstrap   # uv sync --locked
 make check       # lint, format, tests
 uv sync --group browser && uv run playwright install chromium && uv run pytest tests/test_paste_dom.py
 NOVNC_DIR=/opt/novnc uv run --group browser python scripts/e2e.py   # with Xvfb and x11vnc installed
+sudo .venv/bin/python -m signin_window.browser install-policy && uv run --group browser python scripts/browser_check.py
 ```
 
 `scripts/e2e.py` runs the whole path with real browsers and a stand-in site: a link, its live view, paste, a

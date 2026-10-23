@@ -1,6 +1,6 @@
 """Sign-in windows a person drives themselves, through noVNC: the login service (``service``), the MCP server's
-client for it (``client``), sign-in links (``relay``, ``page``), child-process windows (``child``) and keeping a
-window on the site (``hosts``)."""
+client for it (``client``), sign-in links (``relay``, ``page``), child-process windows (``child``), keeping a
+window on the site (``hosts``) and locking its browser down (``browser``)."""
 
 from importlib.metadata import PackageNotFoundError, version
 

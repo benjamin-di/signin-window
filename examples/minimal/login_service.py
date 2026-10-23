@@ -13,6 +13,7 @@ import os
 import uvicorn
 from playwright.async_api import async_playwright
 
+from signin_window.browser import LAUNCH_ARGS, harden, policy_installed
 from signin_window.hosts import allowed, host_matches, host_resolver_rules, proxy_hosts
 from signin_window.service import Window, Windows, build_app
 
@@ -24,6 +25,8 @@ HOSTS = (SITE,)
 
 
 async def sign_in(window: Window) -> dict | None:
+    if not policy_installed():  # the image installs it (Dockerfile); without it, no window opens
+        raise RuntimeError("the managed Chromium policy is not installed")
     width, height = window.size
     async with async_playwright() as playwright:
         context = await playwright.chromium.launch_persistent_context(
@@ -37,8 +40,10 @@ async def sign_in(window: Window) -> dict | None:
                 "--window-position=0,0",
                 f"--window-size={width},{height}",
                 "--no-first-run",
+                *LAUNCH_ARGS,  # kiosk: no address bar, tabs or menus
             ],
         )
+        await harden(context)  # no passkey offers; Ctrl+T and Ctrl+N open nothing
 
         async def keep_on_site(route):
             if allowed(route.request.url, HOSTS):

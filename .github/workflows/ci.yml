@@ -40,8 +40,9 @@ jobs:
       - run: uv run --frozen playwright install --with-deps --only-shell chromium
       - run: uv run --frozen pytest tests/test_paste_dom.py
 
-  # A link, its live view, paste and a hand-over, with Xvfb, x11vnc, noVNC and a real Chromium (scripts/e2e.py), on
-  # Debian trixie: the base a login service image normally uses (Ubuntu 24.04's x11vnc injects no input on Xvfb).
+  # A link, its live view, paste and a hand-over, with Xvfb, x11vnc, noVNC and a real Chromium (scripts/e2e.py), then
+  # the locked-down browser (scripts/browser_check.py), on Debian trixie: the base a login service image normally
+  # uses (Ubuntu 24.04's x11vnc injects no input on Xvfb).
   e2e:
     runs-on: ubuntu-latest
     container: python:3.12-slim-trixie
@@ -51,9 +52,10 @@ jobs:
       NOVNC_SHA256: 5066103959ef4e9b10f37e5a148627360dd8414e4cf8a7db92bdbd022e728aaa
       UV_LINK_MODE: copy
     steps:
-      - name: Xvfb, x11vnc, noVNC and uv
+      - name: Xvfb, x11vnc, xdotool, noVNC and uv
         run: |
-          apt-get update -q && apt-get install -y -q --no-install-recommends ca-certificates curl git xvfb x11vnc
+          apt-get update -q && apt-get install -y -q --no-install-recommends ca-certificates curl git xvfb x11vnc \
+            xdotool x11-utils x11-apps netpbm
           curl --fail --silent --show-error --location \
             "https://github.com/novnc/noVNC/archive/refs/tags/v${NOVNC_VERSION}.tar.gz" -o /tmp/novnc.tar.gz
           printf '%s  /tmp/novnc.tar.gz\n' "$NOVNC_SHA256" | sha256sum --check --status
@@ -63,9 +65,14 @@ jobs:
       - run: uv sync --locked --group browser
       - run: uv run --frozen playwright install --with-deps chromium
       - run: E2E_SHOTS=/tmp/e2e-shots NOVNC_DIR=/tmp/novnc timeout 600 uv run --frozen python scripts/e2e.py
-      - if: failure()
+      - run: |
+          uv run --frozen python -m signin_window.browser install-policy
+          E2E_SHOTS=/tmp/e2e-shots timeout 300 uv run --frozen python scripts/browser_check.py
+      # The browser check's screenshots (no save-password offer after a form is sent) are kept every time.
+      - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-screenshots
           path: /tmp/e2e-shots
+          if-no-files-found: ignore
           retention-days: 7

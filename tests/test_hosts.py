@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from signin_window.hosts import allowed, host_matches, host_resolver_rules, proxy_hosts
+from types import SimpleNamespace
+
+from signin_window.hosts import allowed, host_matches, host_resolver_rules, proxy_hosts, top_level
 
 SITE = ("example.com", "login.example.net")
 
@@ -35,3 +37,24 @@ def test_proxy_hosts_come_from_the_environment():
     env = {"HTTPS_PROXY": "http://proxy.example:3128", "http_proxy": "proxy.example:3128", "ALL_PROXY": ""}
     assert proxy_hosts(env) == ["proxy.example"]
     assert proxy_hosts({}) == []
+
+
+class Request:
+    def __init__(self, navigation: bool, parent: object = None, popup: bool = False) -> None:
+        self.navigation, self.parent, self.popup = navigation, parent, popup
+
+    def is_navigation_request(self) -> bool:
+        return self.navigation
+
+    @property
+    def frame(self):
+        if self.popup:  # what Playwright does for a popup's first navigation
+            raise RuntimeError("Frame for this navigation request is not available")
+        return SimpleNamespace(parent_frame=self.parent)
+
+
+def test_top_level_is_a_page_document_including_a_popups_first_page():
+    assert top_level(Request(navigation=True))
+    assert top_level(Request(navigation=True, popup=True))
+    assert not top_level(Request(navigation=True, parent=object()))  # a frame inside the page
+    assert not top_level(Request(navigation=False))  # a script, image or fetch

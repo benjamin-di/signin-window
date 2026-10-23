@@ -27,8 +27,11 @@ RUN curl --fail --silent --show-error --location \
       "noVNC-${NOVNC_VERSION}/vnc.html" \
  && rm /tmp/novnc.tar.gz
 
+# The managed Chromium policy (signin_window.browser.POLICY): no offers to save passwords, no local files, downloads
+# or Chromium's own pages in a sign-in window.
 RUN pip install --no-cache-dir signin-window uvicorn playwright \
  && playwright install --with-deps chromium \
+ && python -m signin_window.browser install-policy \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --uid 1000 --home-dir /home/login --shell /usr/sbin/nologin login \
  && install -d -o 1000 -g 1000 -m 0700 /home/login

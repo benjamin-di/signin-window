@@ -1,6 +1,6 @@
 [project]
 name = "signin-window"
-version = "0.1.6"
+version = "0.2.0"
 description = "Let a person sign in to a website themselves, from their own browser, in a remote browser window your server runs (noVNC sign-in links for MCP servers and other headless services)"
 readme = "README.md"
 license = "MIT"
