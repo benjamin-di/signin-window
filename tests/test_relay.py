@@ -49,7 +49,8 @@ class FakeBackend:
         if self.states.get(window_id, {}).get("state") == "waiting":
             self.states[window_id] = {"state": "cancelled"}
 
-    def static(self, path: str) -> tuple[int, bytes, str]:
+    def static(self, path: str, window_id: str | None = None) -> tuple[int, bytes, str]:
+        self.static_for = window_id
         if path == "vnc.html":
             return 200, VNC_HTML, "text/html"
         if path == "core/rfb.js":
@@ -389,3 +390,10 @@ def test_a_viewer_that_already_loads_the_paste_add_on_keeps_one_tag():
     page = b"<html><head>" + relay_module.PASTE_TAG + b"</head></html>"
     assert relay_module.with_paste(page) == page
     assert relay_module.with_paste(b"<html><head></head></html>").count(relay_module.PASTE_TAG) == 1
+
+
+def test_the_viewers_files_are_asked_for_the_links_window(relay, http, backend):
+    link = relay.create("alice")
+    start(http, link)
+    http.get(path(link) + "/novnc/vnc.html")
+    assert backend.static_for == "window-0000000000"

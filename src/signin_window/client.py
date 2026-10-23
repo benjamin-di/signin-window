@@ -131,8 +131,9 @@ class LoginClient:
         except LoginUnavailable:
             pass
 
-    def static(self, path: str) -> tuple[int, bytes, str]:
-        """One of noVNC's files, for a person's viewer: (status, body, content type)."""
+    def static(self, path: str, window_id: str | None = None) -> tuple[int, bytes, str]:
+        """One of noVNC's files, for a person's viewer: (status, body, content type). The service serves the same files
+        for every window, so ``window_id`` (which window the viewer is for) is not needed here."""
         if not STATIC.match(path):
             return 404, b"", "text/plain"
         status, raw, content_type = self._raw("GET", f"/novnc/{path}", limit=MAX_STATIC)

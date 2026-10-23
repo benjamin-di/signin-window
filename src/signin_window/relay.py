@@ -91,7 +91,7 @@ class Backend(Protocol):
 
     def close(self, window_id: str) -> None: ...
 
-    def static(self, path: str) -> tuple[int, bytes, str]: ...
+    def static(self, path: str, window_id: str | None = None) -> tuple[int, bytes, str]: ...  # for the link's window
 
     async def bridge(self, window_id: str, view_token: str, ws: Any) -> None: ...
 
@@ -406,7 +406,7 @@ class Relay:
             path = request.path_params["path"]
             if path == "paste.js":
                 return Response(PASTE_JS, media_type="text/javascript", headers=HEADERS)
-            status, content, content_type = await anyio.to_thread.run_sync(self.backend.static, path)
+            status, content, content_type = await anyio.to_thread.run_sync(self.backend.static, path, link.window_id)
             if path == "vnc.html" and status == 200:
                 content = with_paste(content)
             headers = {**HEADERS, "X-Frame-Options": "SAMEORIGIN"}
