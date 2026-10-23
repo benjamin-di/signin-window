@@ -9,7 +9,7 @@ Both ways a runner starts Chromium: a persistent context (kiosk mode reaches its
 (``harden(context, browser)``). In each, against a stand-in site on localhost and with a route check like a runner's:
 
 - the window fills the display, with no address bar;
-- pages, a cross-origin frame and popups see no WebAuthn, so a site's passkey button falls back;
+- pages, a cross-origin frame and popups still see WebAuthn: nothing changes what a page sees of the browser;
 - typing an address after Ctrl+L goes nowhere, and Ctrl+T or Ctrl+N leaves no tab or window behind;
 - popups work (the route check knows a popup's first page), and Alt+Left leads back from a link the check stopped.
 
@@ -45,14 +45,10 @@ LOGIN = (
     "<input type=password name=password autocomplete=current-password value='Example-pass-1'>"
     "<button id=go>Sign in</button></form>"
     "<p><button id=pop onclick=\"window.open('/done.html','pop','width=500,height=600')\">popup</button> "
-    "<a id=away href='http://elsewhere.example.org/'>elsewhere</a> <button id=passkey>passkey</button></p>"
+    "<a id=away href='http://elsewhere.example.org/'>elsewhere</a></p>"
     "<iframe src='http://127.0.0.1:{port}/frame.html' width=400 height=60></iframe>"
     "<script>const d = document.documentElement.dataset; d.webauthn = typeof PublicKeyCredential;"
-    "addEventListener('message', e => d.frame = e.data);"
-    "document.getElementById('passkey').onclick = () => {"
-    "if (!window.PublicKeyCredential) { d.passkey = 'none'; return; }"
-    "navigator.credentials.get({publicKey: {challenge: new Uint8Array(16), rpId: location.hostname}})"
-    ".then(() => d.passkey = 'ok', e => d.passkey = e.name) };</script>"
+    "addEventListener('message', e => d.frame = e.data);</script>"
 )
 FRAME = "<!doctype html><body>frame<script>parent.postMessage(typeof PublicKeyCredential, '*')</script>"
 DONE = (
@@ -134,10 +130,8 @@ async def exercise(name: str, context, page, base: str) -> None:  # type: ignore
     await asyncio.sleep(1.5)
     seen = await page.evaluate("[innerHeight, {...document.documentElement.dataset}]")
     check(seen[0] >= H - 1, f"{name}: the window fills the display, no address bar (inner height {seen[0]})")
-    check(seen[1].get("webauthn") == "undefined", f"{name}: the page sees no WebAuthn")
-    check(seen[1].get("frame") == "undefined", f"{name}: a cross-origin frame sees no WebAuthn")
-    await page.click("#passkey")
-    check(await page.evaluate("document.documentElement.dataset.passkey") == "none", f"{name}: no passkey dialog")
+    check(seen[1].get("webauthn") == "function", f"{name}: the page sees WebAuthn, as Chrome has it")
+    check(seen[1].get("frame") == "function", f"{name}: so does a cross-origin frame")
     shot(f"{name}-1-login")
     await page.click("#go")
     await page.wait_for_url("**/done.html")
@@ -161,7 +155,7 @@ async def exercise(name: str, context, page, base: str) -> None:  # type: ignore
     popup = await popup_info.value
     await popup.wait_for_load_state("domcontentloaded")
     check(popup.url.endswith("/done.html"), f"{name}: a popup opens ({popup.url})")
-    check(await popup.evaluate("typeof PublicKeyCredential") == "undefined", f"{name}: a popup sees no WebAuthn")
+    check(await popup.evaluate("typeof PublicKeyCredential") == "function", f"{name}: so does a popup")
     shot(f"{name}-3-popup")
     await popup.close()
     await page.click("#away")

@@ -90,10 +90,10 @@ def test_cli_installs_and_checks(tmp_path, capsys):
     assert capsys.readouterr().out.strip() == str(tmp_path / "signin-window.json")
 
 
-def test_harden_hides_passkeys_and_closes_key_press_tabs():
+def test_harden_closes_key_press_tabs_and_changes_nothing_a_page_sees():
     context = Context()
     browser.harden_sync(context)
-    assert context.scripts == [browser.NO_PASSKEYS] and "PublicKeyCredential" in browser.NO_PASSKEYS
+    assert context.scripts == []  # no init script: the browser must not contradict itself (WebAuthn stays)
     [opened] = context.handlers
 
     new_tab = Page("chrome://new-tab-page/")
@@ -102,12 +102,14 @@ def test_harden_hides_passkeys_and_closes_key_press_tabs():
 
     blocked = Page("about:blank")  # Ctrl+N with the new tab page blocked: its first page is the error page
     opened(blocked)
+    blocked.navigate("about:blank")  # what a new tab commits before the page it opens
     assert not blocked.closed
     blocked.navigate("chrome-error://chromewebdata/")
     assert blocked.closed
 
     popup = Page("about:blank")  # a site's popup starts on the site, and stays open whatever it shows later
     opened(popup)
+    popup.navigate("about:blank")
     popup.navigate("https://www.example.com/oauth", frame=Frame(popup, ""))  # a frame of it: not its first page
     popup.navigate("https://www.example.com/oauth")
     popup.navigate("chrome-error://chromewebdata/")
@@ -122,7 +124,7 @@ def test_harden_async():
     async def run() -> None:
         context = AsyncContext()
         await browser.harden(context)
-        assert context.scripts == [browser.NO_PASSKEYS]
+        assert context.scripts == []
         [opened] = context.handlers
         new_tab, later = AsyncPage("chrome://new-tab-page/"), AsyncPage("about:blank")
         await opened(new_tab)

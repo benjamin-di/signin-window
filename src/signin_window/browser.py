@@ -11,12 +11,16 @@ Three parts, for a runner that starts Chromium with Playwright (or a fork such a
   browser sign-in or sync; its own pages (new tab, history, settings) and ``file:``, ``data:``, ``view-source:``
   addresses show "blocked". It leaves DevTools *availability* alone: Playwright drives the browser through the same
   protocol, and ``DeveloperToolsAvailability: 2`` stops it from starting at all.
-* ``harden(context)`` (``harden_sync`` for Playwright's sync API): hides passkeys from every page, so a site offers
-  its other ways to sign in instead of a passkey dialog that cannot work (there is no authenticator near the
-  server), and closes the tab or window a key press opens (Ctrl+T, Ctrl+N) so it cannot cover the sign-in. Kiosk
-  mode reaches only the windows of the browser's own profile (a persistent context): for ``browser.new_context()``
-  pass ``browser`` too, and each window is made full screen (which kiosk mode keeps it) and windows the person opens
-  outside the context are closed.
+* ``harden(context)`` (``harden_sync`` for Playwright's sync API): closes the tab or window a key press opens (Ctrl+T,
+  Ctrl+N) so it cannot cover the sign-in. Kiosk mode reaches only the windows of the browser's own profile (a
+  persistent context): for ``browser.new_context()`` pass ``browser`` too, and each window is made full screen (which
+  kiosk mode keeps it) and windows the person opens outside the context are closed.
+
+None of it changes what a page sees of the browser. Passkeys in particular stay: a site may offer one, and it cannot
+work here (no authenticator is near the server), so the person picks the site's other way. Removing WebAuthn from
+the pages would hide those offers, but a Chrome without it contradicts itself, and sign-in pages are where bot checks
+look hardest. The coherent alternative, DevTools' WebAuthn environment without an authenticator, makes
+``isConditionalMediationAvailable()`` answer false, and sites then show a "Sign in with a passkey" button instead.
 
 Keep a window on the site with request routing as well (``signin_window.hosts``): a link on the page can still lead
 elsewhere, and kiosk mode only removes the ways to type an address.
@@ -74,12 +78,6 @@ POLICY_DIRS = (
 )
 POLICY_NAME = "signin-window.json"
 
-# Runs before any of a page's own scripts, in every frame: without these interfaces a site sees no WebAuthn and
-# does not offer passkeys.
-NO_PASSKEYS = (
-    "for (const name of ['PublicKeyCredential', 'AuthenticatorResponse', 'AuthenticatorAttestationResponse',"
-    " 'AuthenticatorAssertionResponse']) { try { delete globalThis[name]; } catch (e) {} }"
-)
 # Where a tab or window opened by a key press lands: the new tab page, or the error page when that is blocked.
 _BROWSER_PAGES = ("chrome://", "chrome-error://", "chrome-untrusted://")
 
@@ -119,12 +117,11 @@ def _contains(installed: dict[str, Any], wanted: dict[str, Any]) -> bool:
 
 
 async def harden(context: Any, browser: Any = None) -> None:
-    """Hide passkeys from every page of ``context`` and close tabs and windows opened by a key press (async API).
+    """Close the tabs and windows a key press opens in ``context`` (async API).
 
     ``browser``: the browser ``context`` came from, when it is a ``browser.new_context()`` rather than a persistent
     context: its windows are made full screen and windows outside it are closed (the browser holds no other context).
     """
-    await context.add_init_script(NO_PASSKEYS)
 
     async def opened(page: Any) -> None:
         if _first_url_is_browser_page(page):
@@ -152,7 +149,6 @@ async def harden(context: Any, browser: Any = None) -> None:
 
 def harden_sync(context: Any, browser: Any = None) -> None:
     """``harden`` for Playwright's sync API."""
-    context.add_init_script(NO_PASSKEYS)
 
     def opened(page: Any) -> None:
         if _first_url_is_browser_page(page):
@@ -214,10 +210,11 @@ def _first_url_is_browser_page(page: Any) -> bool:
         return False
 
     def first(frame: Any) -> None:
-        if frame is not page.main_frame:
-            return
+        url = frame.url or ""
+        if frame is not page.main_frame or url in ("", "about:blank"):
+            return  # a new tab commits about:blank before the page it opens
         page.remove_listener("framenavigated", first)
-        if (frame.url or "").startswith(_BROWSER_PAGES):
+        if url.startswith(_BROWSER_PAGES):
             closing = page.close()
             if asyncio.iscoroutine(closing):
                 asyncio.ensure_future(closing)  # noqa: RUF006 - the page's own close; nothing waits for it

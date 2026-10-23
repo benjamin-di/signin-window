@@ -43,7 +43,7 @@ async def sign_in(window: Window) -> dict | None:
                 *LAUNCH_ARGS,  # kiosk: no address bar, tabs or menus
             ],
         )
-        await harden(context)  # no passkey offers; Ctrl+T and Ctrl+N open nothing
+        await harden(context)  # Ctrl+T and Ctrl+N open nothing
 
         async def keep_on_site(route):
             if allowed(route.request.url, HOSTS):

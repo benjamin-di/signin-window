@@ -84,11 +84,14 @@ nothing else.
   without it). Chromium does not offer to save passwords or fill addresses and cards, and opens no local files,
   file dialogs, downloads, printing, browser sign-in or sync; its own pages (new tab, history, settings) and `file:`,
   `data:` and `view-source:` addresses are blocked.
-- `harden(context)` (`harden_sync` for Playwright's sync API): hides WebAuthn from every page and frame, so a site
-  offers its other ways to sign in instead of a passkey dialog that cannot work (no authenticator is near the
-  server), and closes a tab or window opened with Ctrl+T or Ctrl+N. Kiosk mode reaches the windows of a persistent
-  context only: for `browser.new_context()`, call `harden(context, browser)`, which makes its windows full screen
-  (kiosk mode keeps them so) and closes windows opened outside it.
+- `harden(context)` (`harden_sync` for Playwright's sync API): closes a tab or window opened with Ctrl+T or Ctrl+N.
+  Kiosk mode reaches the windows of a persistent context only: for `browser.new_context()`, call
+  `harden(context, browser)`, which makes its windows full screen (kiosk mode keeps them so) and closes windows
+  opened outside it.
+
+None of this changes what a page sees of the browser, so a site may still offer a passkey, which cannot work in a
+remote window. Removing WebAuthn from the pages would hide the offer, but a Chrome without it contradicts itself where
+sign-in pages' bot checks look; DevTools' WebAuthn environment keeps it but makes sites show a passkey button instead.
 
 `scripts/browser_check.py` checks all of it in a real Chromium; CI runs it on every change. In your route check, tell
 the page's own address from what it loads with `hosts.top_level(request)`: Playwright has no frame yet for a popup's
@@ -184,8 +187,8 @@ for a login service of another shape.
   general browser. Lock the browser itself down too ("Locking the browser down"): no address bar, no Chromium pages,
   no local files.
 - A hand-over session leaves the login service once, to your server's hook, and is dropped if nobody takes it.
-- Passkeys do not work in a remote window (they need the person's own device nearby): `harden()` hides them, and
-  people sign in with a password and a code. Chromium never offers to keep the password (`POLICY`).
+- Passkeys do not work in a remote window (they need the person's own device nearby): people sign in with a
+  password and a code, and Chromium never offers to keep the password (`POLICY`).
 
 Report vulnerabilities privately ([SECURITY.md](SECURITY.md)).
 
