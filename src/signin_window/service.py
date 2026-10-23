@@ -479,18 +479,17 @@ poll();
 
 
 class BearerOnly:
-    """Every route but /health, /novnc and the person's view (its own token) needs the bearer, checked before any
-    WebSocket handshake too."""
+    """Every route but /health, /novnc and the person's direct view (its own token) needs the bearer, checked before
+    any WebSocket handshake too. Without the direct view, the live view needs the bearer as well as its token."""
 
-    def __init__(self, app: ASGIApp, token: str) -> None:
-        self.app, self.expected = app, f"Bearer {token}".encode()
+    def __init__(self, app: ASGIApp, token: str, direct_view: bool = True) -> None:
+        self.app, self.expected, self.direct_view = app, f"Bearer {token}".encode(), direct_view
 
-    @staticmethod
-    def _open(scope: Scope) -> bool:
+    def _open(self, scope: Scope) -> bool:
         path = scope.get("path") or ""
-        if scope["type"] == "websocket":
-            return path.startswith("/logins/") and path.endswith("/vnc")  # the view token is checked there
-        return path == "/health" or path.startswith(("/novnc/", "/view/"))
+        if scope["type"] == "websocket":  # the view token is checked there
+            return self.direct_view and path.startswith("/logins/") and path.endswith("/vnc")
+        return path == "/health" or path.startswith("/novnc/") or (self.direct_view and path.startswith("/view/"))
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] in ("http", "websocket") and not self._open(scope):
@@ -512,6 +511,7 @@ def build_app(
     start_params: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None,
     title: str = "Sign in",
     routes: Iterable[BaseRoute] = (),
+    direct_view: bool = True,
 ) -> Starlette:
     """The login service's API::
 
@@ -525,7 +525,9 @@ def build_app(
         GET    /health
 
     ``start_params(body)`` turns the start request into the window's ``params`` (raise ``ValueError`` to refuse it
-    with 400); without it, a start takes no parameters. ``routes`` adds your own (behind the bearer).
+    with 400); without it, a start takes no parameters. ``routes`` adds your own (behind the bearer). With
+    ``direct_view`` False there is no ``/view`` page, and the live view needs the bearer as well as the window's token
+    (only your server, through the relay, can open it).
     """
     if len(token) < 32:
         raise ValueError("the bearer token must have at least 32 characters")
@@ -605,11 +607,14 @@ def build_app(
         Route("/logins/{id}", state, methods=["GET"]),
         Route("/logins/{id}", close, methods=["DELETE"]),
         Route("/logins/{id}/result", result, methods=["POST"]),
-        Route("/view/{id}", view, methods=["GET"]),
-        Route("/view/{id}/state", view_state, methods=["GET"]),
         WebSocketRoute("/logins/{id}/vnc", vnc),
         *routes,
     ]
+    if direct_view:
+        all_routes += [
+            Route("/view/{id}", view, methods=["GET"]),
+            Route("/view/{id}/state", view_state, methods=["GET"]),
+        ]
     if novnc_dir.is_dir():
         all_routes.append(Mount("/novnc", app=StaticFiles(directory=novnc_dir)))
 
@@ -618,7 +623,8 @@ def build_app(
         yield
         await windows.close_all()  # on shutdown: runners stop, displays and profiles go
 
-    return Starlette(routes=all_routes, middleware=[Middleware(BearerOnly, token=token)], lifespan=lifespan)
+    middleware = [Middleware(BearerOnly, token=token, direct_view=direct_view)]
+    return Starlette(routes=all_routes, middleware=middleware, lifespan=lifespan)
 
 
 async def _pipe(ws: WebSocket, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
@@ -643,9 +649,9 @@ async def _pipe(ws: WebSocket, reader: asyncio.StreamReader, writer: asyncio.Str
         except (WebSocketDisconnect, ConnectionError, RuntimeError):
             return
 
-    async def watch() -> None:
+    async def watch() -> None:  # the view ends within a quarter second of the window leaving its sign-in page
         while still_open():
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.25)
 
     tasks = [asyncio.create_task(upstream()), asyncio.create_task(downstream()), asyncio.create_task(watch())]
     await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

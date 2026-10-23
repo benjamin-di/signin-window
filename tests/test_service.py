@@ -425,3 +425,16 @@ def test_close_key_closes_every_window_of_a_key(tmp_path):
         client.portal.call(windows.close_key, "a")
         poll(client, mine, "cancelled")
         assert client.get(f"/logins/{other}", headers=AUTH).json()["state"] == "waiting"
+
+
+def test_without_the_direct_view_the_live_view_needs_the_bearer_too(tmp_path):
+    app = app_for(no_display(Windows(waiting_until({}))), tmp_path, direct_view=False)
+    with TestClient(app) as client:
+        started = client.post("/logins", json={}, headers=AUTH).json()
+        poll(client, started["id"], "waiting")
+        assert client.get(f"/view/{started['id']}?t={started['view_token']}").status_code == 401
+        with (
+            pytest.raises(WebSocketDisconnect),
+            client.websocket_connect(f"/logins/{started['id']}/vnc?t={started['view_token']}"),
+        ):
+            pass  # the token alone opens nothing
