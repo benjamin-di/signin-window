@@ -291,7 +291,8 @@ class Relay:
             except LoginUnavailable:
                 link.state = "failed"
                 return
-            link.window_id, link.view_token, link.state, link.host = window["id"], window["view_token"], "starting", ""
+            link.window_id, link.state, link.host = window["id"], "starting", ""
+            link.view_token = str(window["view_token"]) if window.get("view_token") else None  # or in a later state
             log.info("%s opened a sign-in window", link.key)
 
     def advance(self, link: Link) -> None:
@@ -310,6 +311,8 @@ class Relay:
             state = str(window.get("state") or "")
             if state in ACTIVE:
                 link.state = state
+                if not link.view_token and window.get("view_token"):  # a backend that has it only once the view is up
+                    link.view_token = str(window["view_token"])
                 return
             window_id, link.window_id, link.view_token = link.window_id, None, None
             if state == "signed_in":
@@ -435,7 +438,8 @@ class Relay:
 
 
 def with_paste(page: bytes) -> bytes:
-    """noVNC's own vnc.html, unchanged but for the paste add-on (``static/paste.js``) loaded beside its UI."""
-    if b"</head>" not in page:
+    """noVNC's own vnc.html, unchanged but for the paste add-on (``static/paste.js``) loaded beside its UI (once: a
+    viewer that already loads it keeps its one tag, or each paste would be typed twice)."""
+    if b"</head>" not in page or PASTE_TAG in page:
         return page
     return page.replace(b"</head>", PASTE_TAG + b"\n</head>", 1)

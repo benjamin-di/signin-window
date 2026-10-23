@@ -370,3 +370,22 @@ def test_a_saving_window_is_followed_and_not_cancelled(relay, http, backend):
     assert backend.closed == [] and state(http, link)["state"] == "saving"
     backend.end("window-0000000000", "connected")
     assert state(http, link)["state"] == "connected"
+
+
+def test_a_view_token_that_comes_with_a_later_state_opens_the_live_view(relay, http, backend):
+    link = relay.create("alice")
+    backend.start = lambda layout="desktop", **params: {"id": "window-0000000000", "state": "starting"}
+    backend.states["window-0000000000"] = {"state": "starting"}
+    start(http, link)
+    with pytest.raises(WebSocketDisconnect), http.websocket_connect(path(link) + "/vnc"):
+        pass
+    backend.states["window-0000000000"] = {"state": "waiting", "view_token": "t" * 24}
+    state(http, link)
+    with http.websocket_connect(path(link) + "/vnc") as ws:
+        assert ws.receive_bytes() == b"RFB 003.008\n"
+
+
+def test_a_viewer_that_already_loads_the_paste_add_on_keeps_one_tag():
+    page = b"<html><head>" + relay_module.PASTE_TAG + b"</head></html>"
+    assert relay_module.with_paste(page) == page
+    assert relay_module.with_paste(b"<html><head></head></html>").count(relay_module.PASTE_TAG) == 1
