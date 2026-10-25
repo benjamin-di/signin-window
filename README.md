@@ -288,3 +288,28 @@ hand-over and closing the page; CI runs it on every change.
 ## License
 
 MIT
+
+
+### Shared authentication mechanics
+
+The optional `signin_window.automation.google.GoogleIdentityDriver` supplies a
+bounded Google sign-in flow through injected browser and secret-filler contracts.
+Configure its exact controls, observations, allowed origins and callback check;
+provide a narrowly scoped credential backend explicitly. It reports actions it
+actually observed. A completed identity callback never proves application access.
+
+`automation.secret_filler.OpSecretFiller` is an optional 1Password adapter. It
+checks the top-level origin before and after resolving each field and binds
+application to an exact frame/document. `automation.secrets.OpSecretReader` uses
+only the identity supplied by its caller; a failed read never obtains a different
+identity. No human window API imports these modules or reads credentials.
+
+For a maintenance process that owns a persistent Chromium profile, install
+`signin-window[chromium]` and run `patchright install --with-deps chromium`.
+`automation.runtime.virtual_display()` allocates an isolated Xvfb display.
+While holding the application's durable profile lease, use
+`automation.runtime.open_browser(profile, display=display)` for the browser's
+lifetime. Its facade supplies origin-bound fills, observations and native X11
+input. It preserves the profile, refuses foreign owners and uses a pidfd to bind
+shutdown to the exact browser it launched. An application still owns network
+allowlists, identity checks, holds, budgets, publication and scheduling.

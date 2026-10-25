@@ -29,7 +29,7 @@ class _ScreenTransform:
 class X11Pointer:
     """Send pointer events through XTest instead of the browser debug protocol."""
 
-    def __init__(self, page: Any) -> None:
+    def __init__(self, page: Any, *, display: str | None = None) -> None:
         try:
             self._x11 = ctypes.CDLL("libX11.so.6")
             self._xtst = ctypes.CDLL("libXtst.so.6")
@@ -37,7 +37,7 @@ class X11Pointer:
             raise NativePointerUnavailable("x11 libraries unavailable") from error
         _configure_libraries(self._x11, self._xtst)
 
-        display_name = os.environ.get("DISPLAY", "").strip()
+        display_name = (display if display is not None else os.environ.get("DISPLAY", "")).strip()
         if not display_name:
             raise NativePointerUnavailable("x11 display unavailable")
         self._display = self._x11.XOpenDisplay(os.fsencode(display_name))

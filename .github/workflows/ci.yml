@@ -63,7 +63,10 @@ jobs:
           pip install --quiet uv
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - run: uv sync --locked --group browser
-      - run: uv run --frozen playwright install --with-deps chromium
+      - run: |
+          uv run --frozen playwright install --with-deps chromium
+          uv run --frozen patchright install chromium
+          uv run --frozen pytest tests/test_automation_browser.py
       - run: E2E_SHOTS=/tmp/e2e-shots NOVNC_DIR=/tmp/novnc timeout 600 uv run --frozen python scripts/e2e.py
       - run: |
           uv run --frozen python -m signin_window.browser install-policy
