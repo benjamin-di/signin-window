@@ -1220,3 +1220,9 @@ def _hcaptcha_instruction(prompt: str) -> str:
         prompt=json.dumps(" ".join(prompt.split())[:240]),
         family=classify_prompt_family(prompt).value,
     )
+
+
+# Supported advanced integration seams; site policy remains with the caller.
+ChallengeActionBoundary = _ActionBoundary
+HCaptchaOutcomeObserver = _HCaptchaOutcomeObserver
+hcaptcha_instruction = _hcaptcha_instruction

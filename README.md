@@ -45,10 +45,12 @@ from signin_window.sessions import AttemptBudget, WarmFirst
 
 budget = AttemptBudget(Path("/private/state/example-account/attempts"))
 
+
 def sign_in_once():
     if not budget.reserve("example", limit=1):
         raise RuntimeError("sign-in budget exhausted")
     # Call the application's explicitly authorized sign-in adapter here.
+
 
 # Supply application callbacks and its positive signed-out exception:
 # flow = WarmFirst(refresh_and_verify, sign_in_once, signed_out=SignedOut)
@@ -134,10 +136,14 @@ from signin_window.service import Windows, build_app
 
 HOSTS = ("example.com",)
 
+
 async def sign_in(window):
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
-            window.temp_profile(), headless=False, env=window.env(), no_viewport=True,
+            window.temp_profile(),
+            headless=False,
+            env=window.env(),
+            no_viewport=True,
             args=[f"--host-resolver-rules={host_resolver_rules(HOSTS)}", "--window-position=0,0", *LAUNCH_ARGS],
         )
         await harden(context)
@@ -148,8 +154,9 @@ async def sign_in(window):
         while not window.cancelled.is_set():
             cookies = await context.cookies()
             if any(c["name"] == "session" for c in cookies):
-                return {"cookies": cookies}          # handed over to the server, once
+                return {"cookies": cookies}  # handed over to the server, once
             await asyncio.sleep(1)
+
 
 app = build_app(Windows(sign_in), token=TOKEN, novnc_dir="/opt/novnc")
 ```
@@ -215,9 +222,11 @@ from signin_window.client import LoginClient
 from signin_window.page import PageText
 from signin_window.relay import Relay
 
+
 def store(link, session):
     save_session(link.key, session["cookies"])  # yours
     return "connected"
+
 
 relay = Relay(
     LoginClient("http://login:8080", TOKEN),
@@ -225,9 +234,9 @@ relay = Relay(
     text=PageText(service="Example", secure_host=r"(^|\.)example\.com$"),
     on_signed_in=store,
 )
-app.routes.extend(relay.routes("/connect"))   # outside your server's bearer
+app.routes.extend(relay.routes("/connect"))  # outside your server's bearer
 
-link = relay.create(account_id)               # in your connect tool
+link = relay.create(account_id)  # in your connect tool
 return {"url": link.url, "expires_at": link.expires_at}
 ```
 
@@ -324,3 +333,36 @@ runtime settings to Chromium. Operator tokens, planner credentials and ambient
 proxy variables are excluded. An authorized maintenance runner can also reuse
 `automation.runtime.close_owned_browser` after capturing its own process; it
 never guesses ownership or deletes a profile.
+
+### Supported maintenance integration APIs
+
+Applications use `sessions.AttemptBudget`, `sessions.WarmFirst`, the public
+`leases` and `state` functions, and the optional `automation` modules. Names
+starting with an underscore are implementation details. Consumers should test
+against an installed release rather than importing those details.
+
+`automation.maintenance.MaintenanceStateStore` supplies atomic holds,
+compare-and-clear, escalating cooldown persistence and publication watermarks.
+Supply your existing state/hold/cooldown models, allowed keys, cooldown durations
+and error type. The application's schema and policy remain authoritative; loading
+an existing file never rewrites it or resets attempts or holds.
+
+`automation.secrets.CredentialReader` has two members: a side-effect-free
+`available: bool` property and `read_field(reference, *, field) -> str`, where
+`field` is `username`, `password` or `totp`. References are opaque to the generic
+layer. `automation.secret_filler.CredentialFiller(reader=...)` delivers fields
+just in time and checks the allowed origin both before and after resolution.
+Backend errors are redacted and never trigger a fallback to another identity.
+`OpCredentialReader` and `OpSecretFiller` retain the 1Password implementation.
+
+`configured_credential_filler("example_backend:create_reader")` loads an explicit
+zero-argument factory returning that interface. Treat the module as trusted
+operator-installed code; keep its credentials in runtime configuration. An empty
+factory retains the existing 1Password default. Imports and availability checks
+must not read a credential or contact a provider. Custom backends own field
+mapping, secret-store authentication, and generated TOTP values.
+
+Advanced challenge integrations may use the supported
+`automation.hcaptcha.ChallengeActionBoundary`, `HCaptchaOutcomeObserver` and
+`hcaptcha_instruction` seams. Applications still supply the planner and decide
+whether the resulting session or content is acceptable.

@@ -2,9 +2,48 @@
 
 from __future__ import annotations
 
+import importlib
 import math
 import os
 import subprocess
+from typing import Literal, Protocol
+
+SecretField = Literal["username", "password", "totp"]
+
+
+class CredentialReader(Protocol):
+    """Explicit, trusted backend; availability checks must not resolve secrets."""
+
+    @property
+    def available(self) -> bool: ...
+
+    def read_field(self, reference: str, *, field: SecretField) -> str: ...
+
+
+def validate_credential_reference(reference: str) -> str:
+    """Validate an opaque reference without interpreting a backend's syntax."""
+    if (
+        not isinstance(reference, str)
+        or not reference.strip()
+        or len(reference) > 2048
+        or any(c in reference for c in ("\r", "\n", "\x00", "{", "}"))
+    ):
+        raise SecretResolutionError("credential reference is invalid")
+    return reference
+
+
+def load_credential_reader(factory: str) -> CredentialReader:
+    """Load only an explicitly configured module:factory; never fall back."""
+    module, separator, name = factory.partition(":")
+    if not separator or not module or not name.isidentifier():
+        raise SecretResolutionError("credential reader must be module:factory")
+    try:
+        reader = getattr(importlib.import_module(module), name)()
+        if not callable(getattr(reader, "read_field", None)) or type(reader.available) is not bool:
+            raise ValueError("invalid reader")
+        return reader
+    except Exception:
+        raise SecretResolutionError("configured credential reader is unavailable") from None
 
 
 class SecretResolutionError(RuntimeError):
@@ -68,4 +107,32 @@ class OpSecretReader:
         return value
 
 
-__all__ = ["OpSecretReader", "SecretResolutionError"]
+class OpCredentialReader:
+    """1Password adapter for the backend-independent field reader contract."""
+
+    def __init__(self, *, service_account_token: str | None = None, read_timeout_seconds: float = 30):
+        self._reader = OpSecretReader(
+            service_account_token=service_account_token, read_timeout_seconds=read_timeout_seconds
+        )
+
+    @property
+    def available(self) -> bool:
+        return self._reader.has_token
+
+    def read_field(self, reference: str, *, field: SecretField) -> str:
+        validate_credential_reference(reference)
+        if not reference.startswith("op://") or field not in {"username", "password", "totp"}:
+            raise SecretResolutionError("1Password secret reference is invalid")
+        suffix = "one-time password?attribute=otp" if field == "totp" else field
+        return self._reader.read(f"{reference.rstrip('/')}/{suffix}")
+
+
+__all__ = [
+    "CredentialReader",
+    "OpCredentialReader",
+    "OpSecretReader",
+    "SecretField",
+    "SecretResolutionError",
+    "load_credential_reader",
+    "validate_credential_reference",
+]

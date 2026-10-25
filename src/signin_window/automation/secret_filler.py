@@ -4,33 +4,33 @@ from __future__ import annotations
 
 import re
 from contextlib import nullcontext
-from typing import Literal
 from urllib.parse import urlsplit
 
 from .auth import AuthBrowserSession as BrowserSession
 from .auth import SecretDeliveryError as LoginInfrastructureError
-from .secrets import OpSecretReader, SecretResolutionError
-
-SecretField = Literal["username", "password", "totp"]
+from .secrets import (
+    CredentialReader,
+    OpCredentialReader,
+    SecretField,
+    SecretResolutionError,
+    load_credential_reader,
+    validate_credential_reference,
+)
 
 _SECRET_FIELDS = frozenset({"username", "password", "totp"})
 
 
-class OpSecretFiller:
+class CredentialFiller:
     """Resolve one field just in time and pass it directly to the browser."""
 
     def __init__(
         self,
         *,
-        service_account_token: str | None = None,
-        read_timeout_seconds: float = 30,
+        reader: CredentialReader,
         step=None,
     ) -> None:
         self._step = step or (lambda name: nullcontext())
-        self._reader = OpSecretReader(
-            service_account_token=service_account_token,
-            read_timeout_seconds=read_timeout_seconds,
-        )
+        self._reader = reader
 
     def fill(
         self,
@@ -44,8 +44,8 @@ class OpSecretFiller:
     ) -> None:
         if _origin(browser.current_url) not in allowed_origins:
             raise LoginInfrastructureError("secret fill origin is not allowed")
-        if not self._reader.has_token:
-            raise LoginInfrastructureError("1Password service token is unavailable")
+        if not self._reader.available:
+            raise LoginInfrastructureError("credential reader is unavailable")
         with self._step("secret_resolve"):
             value = self._read(secret_ref=secret_ref, field=field)
         try:
@@ -107,27 +107,22 @@ class OpSecretFiller:
             del value
 
     def _read(self, *, secret_ref: str, field: SecretField) -> str:
-        base_reference = secret_ref.rstrip("/")
-        if (
-            field not in _SECRET_FIELDS
-            or not base_reference.startswith("op://")
-            or any(marker in base_reference for marker in ("\r", "\n", "{{", "}}"))
-        ):
-            raise LoginInfrastructureError("1Password secret reference is invalid")
-        # ``totp`` is the product's logical field name. 1Password exposes a
-        # Login item's generated OTP through its built-in field label.
-        reference_field = "one-time password?attribute=otp" if field == "totp" else field
-        reference = f"{base_reference}/{reference_field}"
         try:
-            value = self._reader.read(reference)
-        except SecretResolutionError as error:
-            raise LoginInfrastructureError(str(error)) from error
+            validate_credential_reference(secret_ref)
+            if field not in _SECRET_FIELDS:
+                raise SecretResolutionError("credential reference field is invalid")
+            value = self._reader.read_field(secret_ref, field=field)
+        except Exception:
+            # Backends may raise errors containing the reference or secret.
+            raise LoginInfrastructureError("credential reference resolution failed") from None
         return self._validate_field(value, field=field)
 
     @staticmethod
     def _validate_field(value: str, *, field: SecretField) -> str:
+        if not isinstance(value, str) or not value:
+            raise LoginInfrastructureError("credential field is empty")
         if field == "totp" and re.fullmatch(r"[0-9]{6,8}", value) is None:
-            raise LoginInfrastructureError("1Password did not return a generated one-time code")
+            raise LoginInfrastructureError("credential reader did not return a generated one-time code")
         return value
 
 
@@ -143,3 +138,22 @@ def _origin(url: str) -> str:
     default_port = (parsed.scheme == "https" and port == 443) or (parsed.scheme == "http" and port == 80)
     port_suffix = "" if port is None or default_port else f":{port}"
     return f"{parsed.scheme}://{host}{port_suffix}"
+
+
+class OpSecretFiller(CredentialFiller):
+    """Compatibility adapter using the existing 1Password identity and syntax."""
+
+    def __init__(self, *, service_account_token: str | None = None, read_timeout_seconds: float = 30, step=None):
+        super().__init__(
+            reader=OpCredentialReader(
+                service_account_token=service_account_token, read_timeout_seconds=read_timeout_seconds
+            ),
+            step=step,
+        )
+
+
+def configured_credential_filler(factory: str = "", *, step=None) -> CredentialFiller:
+    """Use an explicit backend, or the existing 1Password adapter by default."""
+    if factory:
+        return CredentialFiller(reader=load_credential_reader(factory), step=step)
+    return OpSecretFiller(step=step)
