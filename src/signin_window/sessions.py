@@ -9,16 +9,14 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
-import stat
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Generic, TypeVar
 
-from .state import PrivateStateError, atomic_private_write, exclusive_lock
+from .state import PrivateStateError, atomic_private_write, exclusive_lock, read_private_file
 
 _KEY = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 _MAX_BYTES = 64 * 1024
@@ -155,14 +153,7 @@ class AttemptBudget:
     def _load(self, key: str) -> list[datetime]:
         path = self._path(key)
         try:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
-            with os.fdopen(descriptor, "rb") as stream:
-                metadata = os.fstat(stream.fileno())
-                if not stat.S_ISREG(metadata.st_mode):
-                    raise self._error("must be a regular file")
-                if metadata.st_size > _MAX_BYTES:
-                    raise self._error("is oversized")
-                raw = stream.read(_MAX_BYTES + 1)
+            raw = read_private_file(path, max_bytes=_MAX_BYTES)
         except FileNotFoundError:
             return []
         except OSError as error:

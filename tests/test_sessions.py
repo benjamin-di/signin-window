@@ -137,3 +137,23 @@ def test_refresh_request_respects_failure_spacing():
 def test_unverified_session_waits_after_failure_then_is_due():
     assert not refresh_due(0, now=10, interval=100, failed_at=8, retry_after=20, unverified=True)
     assert refresh_due(0, now=30, interval=100, failed_at=8, retry_after=20, unverified=True)
+
+
+def test_pure_helpers_do_not_require_posix_locks():
+    import subprocess
+    import sys
+
+    program = """
+import importlib.abc
+import sys
+class NoPosixLock(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'fcntl':
+            raise ImportError('POSIX locks deliberately unavailable')
+sys.meta_path.insert(0, NoPosixLock())
+from signin_window.sessions import WarmFirst, refresh_due
+assert refresh_due(None, now=0, interval=60)
+assert WarmFirst(lambda: 'warm', lambda: None, signed_out=LookupError).run() == 'warm'
+assert 'fcntl' not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", program], check=True)

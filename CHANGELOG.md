@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.2
+
+- Add passive challenge detection and bounded resolver orchestration. Callers
+  still select permitted mechanics and verify application access themselves.
+- Expose a filtered Chromium environment for human and maintenance runners,
+  and reusable shutdown for explicitly owned browser processes.
+- Reject nonregular and oversized private state without blocking; importing
+  pure scheduling helpers no longer requires POSIX locks.
+
 ## 0.4.1
 
 - Add optional Google sign-in mechanics with configured controls, observations,

@@ -13,7 +13,9 @@ import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
+from ..browser import browser_environment as browser_environment
 from .browser import BrowserSession
 from .profiles import OwnedBrowserProcess, ProfileError, ProfileFailure, prepare_profile
 
@@ -27,6 +29,7 @@ def virtual_display(*, xvfb: str = "Xvfb") -> Iterator[str]:
         process = subprocess.Popen(
             [xvfb, "-displayfd", str(writer), "-screen", "0", "1280x900x24", "-nolisten", "tcp"],
             pass_fds=(writer,),
+            env=browser_environment(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -50,27 +53,6 @@ def virtual_display(*, xvfb: str = "Xvfb") -> Iterator[str]:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
-
-
-def browser_environment(environment: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Pass display/runtime settings, never account or planner credentials."""
-    source = environment if environment is not None else os.environ
-    allowed = (
-        "PATH",
-        "HOME",
-        "LANG",
-        "LC_ALL",
-        "TZ",
-        "SSL_CERT_DIR",
-        "SSL_CERT_FILE",
-        "XDG_CONFIG_HOME",
-        "XDG_CACHE_HOME",
-        "XDG_RUNTIME_DIR",
-        "DBUS_SESSION_BUS_ADDRESS",
-        "TMPDIR",
-        "FONTCONFIG_PATH",
-    )
-    return {key: source[key] for key in allowed if key in source}
 
 
 @contextmanager
@@ -124,36 +106,47 @@ def open_browser(
         primary_failure = True
         raise
     finally:
-        errors: list[BaseException] = []
+        close_owned_browser(context, manager, owned, primary_failure=primary_failure)
 
-        def stop_owned():
-            if owned is not None:
+
+def close_owned_browser(
+    context: Any, manager: Any, owned: OwnedBrowserProcess | None, *, primary_failure: bool = False
+) -> None:
+    """Close caller-owned resources, with a pidfd watchdog for Chromium only.
+
+    This is also usable by a human runner that launched and hardened its own
+    browser. It performs no page action or credential access.
+    """
+    errors: list[BaseException] = []
+
+    def stop_owned():
+        if owned is not None:
+            try:
+                owned.stop_if_alive()
+            except Exception as error:
+                errors.append(error)
+
+    watchdog = threading.Timer(10, stop_owned) if owned is not None else None
+    if watchdog is not None:
+        watchdog.daemon = True
+        watchdog.start()
+    try:
+        for resource, operation in ((context, "close"), (manager, "stop")):
+            if resource is not None:
                 try:
-                    owned.stop_if_alive()
+                    getattr(resource, operation)()
                 except Exception as error:
                     errors.append(error)
-
-        watchdog = threading.Timer(10, stop_owned) if owned is not None else None
+    finally:
         if watchdog is not None:
-            watchdog.daemon = True
-            watchdog.start()
-        try:
-            for resource, operation in ((context, "close"), (manager, "stop")):
-                if resource is not None:
-                    try:
-                        getattr(resource, operation)()
-                    except Exception as error:
-                        errors.append(error)
-        finally:
-            if watchdog is not None:
-                watchdog.cancel()
-                watchdog.join(timeout=5)
-            if owned is not None:
-                try:
-                    stop_owned()
-                    if owned.forced or not owned.exited():
-                        errors.append(ProfileError(ProfileFailure.BROWSER_CLEANUP_FAILED))
-                finally:
-                    owned.close()
-        if errors and not primary_failure:
-            raise ProfileError(ProfileFailure.BROWSER_CLEANUP_FAILED)
+            watchdog.cancel()
+            watchdog.join(timeout=5)
+        if owned is not None:
+            try:
+                stop_owned()
+                if owned.forced or not owned.exited():
+                    errors.append(ProfileError(ProfileFailure.BROWSER_CLEANUP_FAILED))
+            finally:
+                owned.close()
+    if errors and not primary_failure:
+        raise ProfileError(ProfileFailure.BROWSER_CLEANUP_FAILED)

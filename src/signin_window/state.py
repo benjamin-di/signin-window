@@ -7,7 +7,6 @@ must never be included in a package, test fixture or repository.
 from __future__ import annotations
 
 import errno
-import fcntl
 import os
 import stat
 import tempfile
@@ -34,6 +33,32 @@ def fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def read_private_file(path: Path, *, max_bytes: int) -> bytes:
+    """Read a bounded regular file without following a symlink or blocking on a FIFO.
+
+    A missing file remains FileNotFoundError so applications can adopt a new
+    ledger explicitly. Every other failure must remain closed to maintenance.
+    """
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise ValueError("private file limit must be a positive integer")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        with os.fdopen(descriptor, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise PrivateStateError("private state must be a regular file")
+            if metadata.st_size > max_bytes:
+                raise PrivateStateError("private state is oversized")
+            payload = stream.read(max_bytes + 1)
+        if len(payload) > max_bytes:
+            raise PrivateStateError("private state is oversized")
+        return payload
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise PrivateStateError("private state is unreadable") from error
 
 
 def atomic_private_write(path: Path, payload: bytes) -> None:
@@ -72,6 +97,10 @@ def exclusive_lock(path: Path, *, timeout_seconds: float) -> Iterator[None]:
     update landed.
     """
 
+    try:
+        import fcntl
+    except ImportError:
+        raise PrivateStateError("process locks require a POSIX host") from None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(path.parent, stat.S_IRWXU)
@@ -128,4 +157,5 @@ __all__ = [
     "atomic_private_write",
     "exclusive_lock",
     "fsync_directory",
+    "read_private_file",
 ]

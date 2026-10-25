@@ -33,9 +33,42 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
+
+
+def browser_environment(environment: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Pass display/runtime settings, never account or planner credentials."""
+    source = environment if environment is not None else os.environ
+    allowed = (
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "PATH",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "TMPDIR",
+        "FONTCONFIG_PATH",
+        "SYSTEMROOT",
+        "WINDIR",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+        "COMSPEC",
+        "PATHEXT",
+    )
+    return {key: source[key] for key in allowed if key in source}
+
 
 log = logging.getLogger(__name__)
 

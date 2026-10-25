@@ -68,7 +68,7 @@ lock. It retains interrupted and failed attempts. The default rolling window
 is 24 hours; files use `{"attempts": ["2030-01-01T00:00:00+00:00"]}`. Malformed
 or symlinked state fails closed. Keep each tenant/account's root separate and
 preserve its ledger during upgrades. `signin_window.state` provides atomic
-private writes; `signin_window.leases` provides ordered session, attempt and
+private writes and bounded regular-file reads; `signin_window.leases` provides ordered session, attempt and
 profile leases. All processes sharing a profile must use the same lease path.
 
 ## Optional challenge automation
@@ -85,6 +85,10 @@ account, credential store or implicit planner fallback.
   visible image grid; its result only says the challenge cleared.
 - `signin_window.automation.plans` validates bounded grid, point and drag plans.
   A slow planner cannot apply an action to a replaced challenge task.
+- `signin_window.automation.detection.detect_challenge` passively classifies
+  challenge surfaces. `automation.resolver.ChallengeResolver` dispatches only
+  the caller's configured mechanics, with explicit mode and deadline. A cleared
+  challenge still needs the application's independent access check.
 
 Keep human and automated runners separate. Credential entry, CAPTCHA handling,
 and application-content verification require their own explicit policy. The
@@ -313,3 +317,10 @@ lifetime. Its facade supplies origin-bound fills, observations and native X11
 input. It preserves the profile, refuses foreign owners and uses a pidfd to bind
 shutdown to the exact browser it launched. An application still owns network
 allowlists, identity checks, holds, budgets, publication and scheduling.
+
+Human runners that create their own context can use
+`signin_window.browser.browser_environment(window.env())` to pass only browser
+runtime settings to Chromium. Operator tokens, planner credentials and ambient
+proxy variables are excluded. An authorized maintenance runner can also reuse
+`automation.runtime.close_owned_browser` after capturing its own process; it
+never guesses ownership or deletes a profile.
