@@ -1,7 +1,7 @@
 [project]
 name = "signin-window"
-version = "0.3.0"
-description = "Let a person sign in to a website themselves, from their own browser, in a remote browser window your server runs (noVNC sign-in links for MCP servers and other headless services)"
+version = "0.4.0"
+description = "Human sign-in windows, durable session maintenance and optional bounded browser challenges for self-hosted services"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -27,12 +27,15 @@ dependencies = [
     "websockets>=13",
 ]
 
+[project.optional-dependencies]
+automation = ["pydantic>=2.11,<3"]
+
 [project.urls]
 Homepage = "https://github.com/benjamin-di/signin-window"
 Issues = "https://github.com/benjamin-di/signin-window/issues"
 
 [dependency-groups]
-dev = ["httpx>=0.27", "pytest>=8", "ruff>=0.14", "uvicorn>=0.30"]
+dev = ["httpx>=0.27", "pytest>=8", "ruff>=0.14", "uvicorn>=0.30", "pydantic>=2.11,<3"]
 # The paste add-on's browser test (tests/test_paste_dom.py): `uv sync --group browser`, then
 # `uv run playwright install chromium`.
 browser = ["playwright>=1.48"]

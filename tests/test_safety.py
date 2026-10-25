@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "signin_window"
-PYTHON = sorted(SRC.rglob("*.py"))
+PYTHON = sorted(p for p in SRC.rglob("*.py") if "automation" not in p.relative_to(SRC).parts)
 # Modules that open connections (urllib.parse, say, only parses).
 NETWORK = ("urllib.request", "http.client", "httpx", "requests", "aiohttp", "socket", "websockets")
 
@@ -33,6 +33,15 @@ def test_nothing_clicks_types_or_fills_a_page():
     )
     for path in PYTHON:
         assert not automation.search(path.read_text()), path.name
+
+
+def test_human_apis_do_not_import_optional_automation():
+    for path in PYTHON:
+        assert not any("automation" in name for name in imports(path)), path.name
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level:
+                assert not (node.module or "").startswith("automation"), path.name
 
 
 def test_only_the_client_reaches_the_network():

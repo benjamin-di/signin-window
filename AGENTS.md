@@ -15,9 +15,15 @@ it in a job of its own). Documentation-only changes need `git diff --check` and 
 
 ## Boundaries
 
-- `tests/test_safety.py` is the boundary: nothing in `src/` clicks, types or fills a page; only `client.py` opens
+- `tests/test_safety.py` is the boundary: human window/relay modules never import optional `automation`, and never
+  click, type or fill a page. Optional automation has separate contracts and must receive its planner explicitly.
+  Only `client.py` opens
   connections (to the login service); the VNC server listens on loopback; `static/paste.js` logs and keeps nothing.
   Changing any of these is a design change: argue it in the pull request.
+- Session helpers share durable accounting and warm-first mechanics. Applications
+  own site identity, entitlement, publication formats and maintenance policy.
+  Automation changes require synthetic browser evidence for acceptance, stale
+  task rejection and bounded failure; human APIs remain independent of them.
 - The login service's live view is open only while a window is `waiting` and only with its view token; a link's
   live view only while its window is `waiting`. A session crosses from the service to the server once
   (`POST /logins/{id}/result`) and is never part of a state, a page or a log line.

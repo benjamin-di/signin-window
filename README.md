@@ -1,5 +1,8 @@
 # signin-window
 
+Human sign-in windows, reusable session-maintenance primitives and optional
+bounded browser-challenge mechanics for self-hosted applications.
+
 Let a person sign in to a website **themselves**, from their own browser or phone, in a browser window that runs on
 your server. Your server keeps the session afterwards; the password, the one-time code and the site's checks stay
 with the person.
@@ -22,7 +25,84 @@ person's browser ──https──> your server (relay) ──private network─
   view, carried through to the login service. When the window ends, your hook stores the session.
 - **The paste add-on** lets the person paste into the remote page with Ctrl+V (Cmd+V), which noVNC alone does not.
 
-Nothing in the package clicks, types or fills anything: the person does every step of the sign-in.
+The human window and relay APIs never click, type or fill a page: the person
+does every step of the sign-in. They never import optional automation modules.
+
+Applications can also use the session-maintenance primitives and explicitly
+configured challenge mechanics described below. These are separate capabilities:
+enabling a human sign-in link never enables automated interaction.
+
+## Session maintenance
+
+`signin_window.sessions` supplies durable attempt accounting, warm-first upkeep
+and refresh scheduling without choosing a site's session format or policy.
+It starts no worker and reads no credentials. Applications own account checks,
+holds, schedules, session verification and publication.
+
+```python
+from pathlib import Path
+from signin_window.sessions import AttemptBudget, WarmFirst
+
+budget = AttemptBudget(Path("/private/state/example-account/attempts"))
+
+def sign_in_once():
+    if not budget.reserve("example", limit=1):
+        raise RuntimeError("sign-in budget exhausted")
+    # Call the application's explicitly authorized sign-in adapter here.
+
+# Supply application callbacks and its positive signed-out exception:
+# flow = WarmFirst(refresh_and_verify, sign_in_once, signed_out=SignedOut)
+# published_generation = flow.run()
+```
+
+`WarmFirst` calls `refresh` first. Only the supplied signed-out exception permits
+one sign-in and one subsequent refresh; transient failures, challenges and
+inconclusive evidence propagate without signing in. `SessionStillDead` means
+the new session remained signed out; the application should retain an operator
+hold. `refresh_due` coordinates regular checks, failure spacing and bounded
+early-refresh requests. No helper treats a successful sign-in as entitlement
+to application content.
+
+`AttemptBudget` records a reservation before dispatch under a process-safe
+lock. It retains interrupted and failed attempts. The default rolling window
+is 24 hours; files use `{"attempts": ["2030-01-01T00:00:00+00:00"]}`. Malformed
+or symlinked state fails closed. Keep each tenant/account's root separate and
+preserve its ledger during upgrades. `signin_window.state` provides atomic
+private writes; `signin_window.leases` provides ordered session, attempt and
+profile leases. All processes sharing a profile must use the same lease path.
+
+## Optional challenge automation
+
+Install `signin-window[automation]` for typed visual plans and bounded hCaptcha
+and reCAPTCHA image-grid mechanics. Importing these modules starts no browser
+or model request. The caller supplies the browser, a `VisionPlanner`, explicit
+authorization and site-specific acceptance checks. There is no built-in model
+account, credential store or implicit planner fallback.
+
+- `signin_window.automation.hcaptcha.HCaptchaVisualMechanic` accepts an explicit
+  planner and acceptance probe; only independently observed acceptance succeeds.
+- `signin_window.automation.recaptcha.RecaptchaImageSelectSolver` handles a
+  visible image grid; its result only says the challenge cleared.
+- `signin_window.automation.plans` validates bounded grid, point and drag plans.
+  A slow planner cannot apply an action to a replaced challenge task.
+
+Keep human and automated runners separate. Credential entry, CAPTCHA handling,
+and application-content verification require their own explicit policy. The
+mechanics never establish account identity or content access themselves. Private
+diagnostic images and session state must remain outside logs and repositories.
+
+Profile preparation and shutdown helpers in `signin_window.automation.profiles`
+refuse to steal a live or foreign browser's profile. `OwnedBrowserProcess`
+captures an owned child through a Linux pidfd, so cleanup cannot signal a reused
+PID. Hold the shared profile lease before preparation and through browser exit.
+These helpers and native pointer input require Linux; importing the base window
+and relay APIs does not import them.
+
+When adopting an existing maintenance system, retain its session formats,
+attempt-ledger files, holds and profile paths. Upgrade all processes sharing a
+profile together if their lease naming changes. Rehearse with synthetic state
+and test successful reuse, interrupted work, stale candidates and concurrent
+writers. No helper automatically acknowledges a hold or resets an attempt budget.
 
 ## Install
 
