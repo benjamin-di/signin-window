@@ -8,6 +8,8 @@ import socket
 import sys
 import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from starlette.testclient import TestClient
@@ -18,6 +20,38 @@ from signin_window.service import Windows, build_app
 
 TOKEN = "t" * 40
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
+
+@pytest.mark.parametrize("direction", ["input", "output"])
+def test_saving_revokes_an_existing_stream_before_the_periodic_watcher_runs(direction):
+    async def scenario():
+        viewable = True
+
+        async def pending():
+            await asyncio.Future()
+
+        async def after_saving(value):
+            nonlocal viewable
+            viewable = False
+            return value
+
+        ws = SimpleNamespace(
+            receive=(lambda: after_saving({"type": "websocket.receive", "bytes": b"late input"}))
+            if direction == "input"
+            else pending,
+            send_bytes=AsyncMock(),
+            close=AsyncMock(),
+        )
+        reader = SimpleNamespace(
+            read=(lambda size: after_saving(b"private pixels")) if direction == "output" else lambda size: pending()
+        )
+        writer = SimpleNamespace(write=Mock(), drain=AsyncMock(), close=Mock())
+        await service._pipe(ws, reader, writer, lambda: viewable)
+        writer.write.assert_not_called()
+        ws.send_bytes.assert_not_called()
+        ws.close.assert_awaited_once()
+
+    asyncio.run(scenario())
 
 
 class Clock:

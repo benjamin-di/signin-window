@@ -4,13 +4,14 @@ or failed child is stopped with its whole process group."""
 from __future__ import annotations
 
 import asyncio
+import io
 import sys
 import textwrap
 from pathlib import Path
 
 import pytest
 
-from signin_window.child import PREFIX, WindowFailed, emit, parse, python_module, run_child
+from signin_window.child import PREFIX, WindowFailed, begin_saving, emit, parse, python_module, run_child
 from signin_window.service import Window
 
 
@@ -116,3 +117,109 @@ def test_emit_and_parse_round_trip(capsys):
 
 def test_python_module_runs_this_interpreter():
     assert python_module("site_login.window", "example.de") == [sys.executable, "-m", "site_login.window", "example.de"]
+
+
+def test_a_child_cannot_begin_publication_after_the_parent_pipe_closes(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    with pytest.raises(WindowFailed, match="saving_not_acknowledged"):
+        begin_saving()
+    assert parse(capsys.readouterr().out.encode()) == {"state": "saving"}
+
+
+def test_a_kept_child_closes_control_before_publication_and_never_transfers_a_session(tmp_path):
+    argv = child(
+        tmp_path,
+        f"""
+        import json
+        print({PREFIX!r} + json.dumps({{"state": "waiting", "host": "accounts.example.com"}}), flush=True)
+        print({PREFIX!r} + json.dumps({{"state": "saving"}}), flush=True)
+        print({PREFIX!r} + json.dumps({{"state": "connected"}}), flush=True)
+    """,
+    )
+    w = window()
+    assert asyncio.run(run_child(w, argv, kept=True)) == {}
+    assert w.state == "saving" and w.result is None
+    assert w._outcome == ("connected", None)
+
+
+@pytest.mark.parametrize("exit_code, state", [(1, "connected"), (0, "waiting"), (0, "signed_in")])
+def test_a_kept_child_requires_explicit_completion_and_successful_exit(tmp_path, exit_code, state):
+    argv = child(
+        tmp_path,
+        f"""
+        import json, sys
+        print({PREFIX!r} + json.dumps({{"state": {state!r}}}), flush=True)
+        sys.exit({exit_code})
+    """,
+    )
+    w = window()
+    with pytest.raises(WindowFailed):
+        asyncio.run(run_child(w, argv, kept=True))
+    assert w._outcome is None and w.result is None
+
+
+@pytest.mark.parametrize("state", ["signed_in", "failed"])
+def test_a_kept_child_cannot_override_a_rejected_record_with_connected(tmp_path, state):
+    argv = child(
+        tmp_path,
+        f"""
+        import json
+        print({PREFIX!r} + json.dumps({{"state": {state!r}, "cookies": ["synthetic"]}}), flush=True)
+        print({PREFIX!r} + json.dumps({{"state": "connected"}}), flush=True)
+    """,
+    )
+    with pytest.raises(WindowFailed):
+        asyncio.run(run_child(window(), argv, kept=True))
+
+
+def test_kept_publication_waits_for_the_parent_to_revoke_control(tmp_path):
+    revoked = tmp_path / "revoked"
+    argv = child(
+        tmp_path,
+        f"""
+        import json, pathlib, sys
+        print({PREFIX!r} + json.dumps({{"state": "saving"}}), flush=True)
+        assert sys.stdin.readline() == "SIGNIN saving\\n"
+        assert pathlib.Path({str(revoked)!r}).read_text() == "saving"
+        print({PREFIX!r} + json.dumps({{"state": "connected"}}), flush=True)
+    """,
+    )
+
+    class ObservedWindow(Window):
+        def saving(self):
+            super().saving()
+            revoked.write_text(self.state)
+
+    w = ObservedWindow("w" * 24, "desktop", 3, 0.0, 60.0)
+    assert asyncio.run(run_child(w, argv, kept=True)) == {}
+
+
+def test_cancellation_waits_for_the_owned_child_to_restore_before_returning(tmp_path):
+    ready, restored = tmp_path / "ready", tmp_path / "restored"
+    argv = child(
+        tmp_path,
+        f"""
+        import pathlib, signal, time
+        def restore(*args):
+            time.sleep(0.2)
+            pathlib.Path({str(restored)!r}).write_text("restored")
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM, restore)
+        pathlib.Path({str(ready)!r}).touch()
+        time.sleep(60)
+    """,
+    )
+
+    async def scenario():
+        task = asyncio.create_task(run_child(window(), argv, kept=True, stop_seconds=2))
+        for _ in range(200):
+            if ready.exists():
+                break
+            await asyncio.sleep(0.02)
+        assert ready.exists()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert restored.read_text() == "restored"
+
+    asyncio.run(scenario())

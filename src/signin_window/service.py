@@ -89,6 +89,7 @@ class Window:
     info: dict[str, str] = field(default_factory=dict)
     result: dict[str, Any] | None = field(default=None, repr=False)
     result_at: float | None = None
+    saving_at: float | None = None
     ended_at: float | None = None
     procs: list[Any] = field(default_factory=list, repr=False)
     profiles: list[str] = field(default_factory=list, repr=False)
@@ -140,6 +141,7 @@ class Window:
         window no longer interrupts the runner (the sign-in is done)."""
         if self.state in ("starting", "waiting"):
             self.state = "saving"
+            self.saving_at = time.monotonic()
 
     def at(self, host: str) -> None:
         """The host the window shows now (the page tells the person where they are)."""
@@ -189,9 +191,16 @@ class Windows:
         display_base: int = 90,
         vnc_base: int = 5990,
         clock: Callable[[], float] = time.monotonic,
+        display: str | None = None,
+        save_seconds: float = 30,
     ) -> None:
         if slots < 1 or slots > 9:
             raise ValueError("slots must be 1 to 9")
+        if display is not None and (slots != 1 or not re.fullmatch(r":\d+", display)):
+            raise ValueError("an existing local display requires one slot and a :number address")
+        if save_seconds <= 0:
+            raise ValueError("save_seconds must be positive")
+        self.display, self.save_seconds = display, save_seconds
         self.runner, self.slots, self.limit = runner, slots, minutes * 60
         self.xvfb, self.x11vnc = xvfb, x11vnc
         self.lock, self.lock_wait = lock, lock_wait
@@ -266,6 +275,36 @@ class Windows:
     async def close_all(self) -> None:
         for window_id in list(self._windows):
             await self.close(window_id)
+        saving = [w for w in self._windows.values() if w.state == "saving" and w.task is not None]
+        if saving:
+            tasks = [w.task for w in saving]
+            _, pending = await asyncio.wait(tasks, timeout=self.save_seconds)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(self):
+        """Enforce deadlines without API traffic; drain owned work when the host stops.
+
+        Mount this once in an embedded application's lifespan. Synchronous runners must
+        cooperate with cancellation, or run as an owned child process.
+        """
+
+        async def supervise():
+            while True:
+                with self._guard:
+                    self._reap()
+                await asyncio.sleep(0.1)
+
+        watchdog = asyncio.create_task(supervise())
+        try:
+            yield self
+        finally:
+            watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog
+            await self.close_all()
 
     async def close_key(self, key: str) -> None:
         """Close every window of ``key`` (an account being removed, say)."""
@@ -273,6 +312,8 @@ class Windows:
             await self.close(window.id)
 
     def _cancel(self, window: Window) -> None:
+        if window.cancelled.is_set():
+            return  # repeated deadline checks must not interrupt a runner's cleanup
         window.cancelled.set()
         if window.task is not None and not window.task.done():
             window.task.cancel()
@@ -281,6 +322,13 @@ class Windows:
         """Windows past their time are stopped; untaken sessions and ended windows are dropped (hold ``_guard``)."""
         now = self._clock()
         for window in list(self._windows.values()):
+            if (
+                window.state == "saving"
+                and window.saving_at is not None
+                and time.monotonic() - window.saving_at > self.save_seconds
+            ):
+                self._cancel(window)
+                continue
             if window.state in ("starting", "waiting") and now > window.deadline:
                 self._cancel(window)
             elif window.state == "signed_in" and window.result_at is not None and now - window.result_at > RESULT_TTL:
@@ -332,6 +380,8 @@ class Windows:
         except asyncio.CancelledError:
             window.cancelled.set()
             await asyncio.wait({worker})
+            with contextlib.suppress(Exception):
+                worker.result()  # retrieve a cooperative runner's cancellation failure
             raise
 
     def _end(self, window: Window, state: str, error: str | None = None, result: dict[str, Any] | None = None) -> None:
@@ -359,9 +409,18 @@ class Windows:
         window's, or one a just-ended window has not released yet, are skipped), and wait until both are ready."""
         with self._guard:
             others = [w for w in self._windows.values() if w is not window and w.ended_at is None]
-            window.display_number = self._free_display({w.display_number for w in others})
+            window.display_number = (
+                int(self.display[1:])
+                if self.display is not None
+                else self._free_display({w.display_number for w in others})
+            )
             window.vnc_number = self._free_port({w.vnc_number for w in others})
         width, height = window.size
+        if self.display is None:
+            self._start_xvfb(window, width, height)
+        self._start_vnc(window)
+
+    def _start_xvfb(self, window: Window, width: int, height: int) -> None:
         window.procs.append(
             subprocess.Popen(
                 [self.xvfb, window.display, "-screen", "0", f"{width}x{height}x24", "-nolisten", "tcp"],
@@ -370,6 +429,8 @@ class Windows:
             )
         )
         self._wait(lambda: (self.x_tmp / ".X11-unix" / f"X{window.display_number}").exists(), window, "Xvfb")
+
+    def _start_vnc(self, window: Window) -> None:
         # Loopback only: the service's WebSocket bridge, behind the view token, is the one way in.
         window.procs.append(
             subprocess.Popen(
@@ -620,8 +681,8 @@ def build_app(
 
     @contextlib.asynccontextmanager
     async def lifespan(_: Starlette):  # type: ignore[no-untyped-def]
-        yield
-        await windows.close_all()  # on shutdown: runners stop, displays and profiles go
+        async with windows.lifespan():
+            yield
 
     middleware = [Middleware(BearerOnly, token=token, direct_view=direct_view)]
     return Starlette(routes=all_routes, middleware=middleware, lifespan=lifespan)
@@ -635,7 +696,8 @@ async def _pipe(ws: WebSocket, reader: asyncio.StreamReader, writer: asyncio.Str
         try:
             while True:
                 message = await ws.receive()
-                if message["type"] == "websocket.disconnect":
+                # Saving may begin while receive waits, before the periodic watcher runs.
+                if message["type"] == "websocket.disconnect" or not still_open():
                     return
                 writer.write(message.get("bytes") or (message.get("text") or "").encode())
                 await writer.drain()
@@ -645,6 +707,8 @@ async def _pipe(ws: WebSocket, reader: asyncio.StreamReader, writer: asyncio.Str
     async def downstream() -> None:
         try:
             while data := await reader.read(65536):
+                if not still_open():
+                    return
                 await ws.send_bytes(data)
         except (WebSocketDisconnect, ConnectionError, RuntimeError):
             return
@@ -654,12 +718,15 @@ async def _pipe(ws: WebSocket, reader: asyncio.StreamReader, writer: asyncio.Str
             await asyncio.sleep(0.25)
 
     tasks = [asyncio.create_task(upstream()), asyncio.create_task(downstream()), asyncio.create_task(watch())]
-    await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    for task in tasks:
-        task.cancel()
-    writer.close()
-    with contextlib.suppress(Exception):
-        await ws.close()
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        writer.close()
+        with contextlib.suppress(Exception):
+            await ws.close()
 
 
 def _escape(text: str) -> str:

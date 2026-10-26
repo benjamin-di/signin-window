@@ -32,6 +32,100 @@ Applications can also use the session-maintenance primitives and explicitly
 configured challenge mechanics described below. These are separate capabilities:
 enabling a human sign-in link never enables automated interaction.
 
+## Embedded human viewing
+
+An application can keep its browser, verification and session publication together
+and use the viewer without a separate HTTP login service:
+
+```python
+from signin_window.client import LocalBackend
+from signin_window.page import PageText
+from signin_window.relay import Relay
+from signin_window.service import Windows
+
+# Inside the host's async lifespan, on its event loop:
+windows = Windows(application_login_runner, save_seconds=45)
+relay = Relay(
+    LocalBackend(windows, "/opt/novnc"),
+    "https://mcp.example.com/connect",
+    text=PageText(service="Example", reconnect=True),
+)
+# Mount relay.routes("/connect"), then hold both contexts for the host lifetime:
+# async with windows.lifespan(), relay.lifespan():
+#     yield
+```
+
+The application runner calls `waiting(host)` when its login page is ready,
+`saving()` before verification/publication, then `finish("connected")` only after
+the application accepts the session. No session payload needs to cross the viewer
+boundary. `LocalBackend`'s synchronous methods run on worker threads; the relay
+dispatches them there. Browser children should receive the window's display in
+their own environment; never change the host process's `DISPLAY` for a login.
+
+`Windows(display=":99")` borrows an existing local display (one slot). It owns its
+VNC child, not that display, window manager, browser or persistent profile. The
+normal mode still creates an isolated Xvfb display per window.
+
+The window lifespan enforces expiry without requests and drains accepted saves
+on shutdown, within `save_seconds`. Synchronous runners must honor cancellation
+and bound their I/O; a Python thread cannot be forcibly stopped. The relay
+lifespan reconciles completion without page polling; `relay.app()` installs it
+automatically. When mounting routes, install it explicitly in the parent lifespan.
+
+`PageText(reconnect=True)` reattaches a reloaded page and provides explicit Cancel.
+Closing the page keeps the attempt until Cancel or its original deadline; it does
+not add an unbounded session or renew the deadline. The default retains the older
+page-close cancellation behavior. Accepted saving closes browser control and
+continues independently of the viewer. Applications own stale-attempt checks and
+publication locks.
+
+[`examples/amazon`](examples/amazon/README.md) demonstrates this boundary against
+a local synthetic provider and upstream Amazon tools. It requires the proposed
+upstream hooks described there; it is not a production deployment configuration.
+The existing HTTP handover protocol is unchanged: acknowledged remote transfer is
+separate work, and is not needed for the embedded kept-session integration.
+
+See the [roadmap](ROADMAP.md) for planned reliability, reconnect and maintenance
+improvements, including the scope of 1Password and passkey support.
+
+## Authenticated sign-in attempts
+
+Hosts with an existing browser session can protect sign-in links without adding
+an identity-provider dependency to this package. Supply `Relay(authorize=...)`
+and pass a private `AttemptContext(owner=..., requester=..., target=...)` to
+`create()`. The host assigns opaque references from verified identity, account
+bindings and application revisions, never from untrusted request fields. They
+are absent from public state, backend start parameters and the link's repr.
+
+`authorize(connection, link, operation)` returns exactly `True` to permit access;
+it may be async. Operations are `page`, `start`, `state`, `cancel`, `novnc` and
+`vnc`. The hook runs on every protected route, before forwarding either direction
+of a viewer stream, and periodically while a stream is idle. Denials close the
+stream and reveal no account label. Hook errors deny access and log only their
+exception type; async decisions have a five-second bound. Synchronous hooks must
+not block. The host owns login redirects, session expiry and current permissions.
+Authenticated POSTs and WebSockets require an exact same-origin `Origin` header
+matching the configured public URL; configure proxies to preserve it.
+
+The default capability-link mode remains available for existing applications.
+Once an authorization hook is configured, missing context or failed authentication
+never falls back to capability access. Missing owner context is refused at link
+creation. A GET preview never starts a browser.
+
+Use `PageText(reconnect=True, return_url="/connections/")` for reload recovery,
+explicit cancellation and local return navigation. Saving removes the live view
+and may complete after the page closes. A sign-in attempt is not a durable account
+connection: the host checks provider identity, entitlement and revision before
+publication and reads lasting connection health from its own backend. On restart,
+in-memory attempts are unavailable; the host reconciles saved application state
+and does not claim an unknown browser can be resumed. Remote result transfer keeps
+its existing contract and is not made transactional by authentication.
+
+The [existing-session example](examples/authenticated.py) illustrates the public
+boundary. The Google Photos application supplies a standard OIDC connection
+screen using the same hooks; issuer configuration, permissions and session data
+belong to that host. Ordinary applications can keep their own authentication.
+
 ## Session maintenance
 
 `signin_window.sessions` supplies durable attempt accounting, warm-first upkeep
@@ -203,6 +297,16 @@ A runner can be a plain function too (it runs in a thread and should watch `wind
 `signin_window.child.run_child(window, argv)` runs it on the window's display and follows its progress lines
 (`SIGNIN {"state": "waiting"}` ... `SIGNIN {"state": "signed_in", ...}`), which suits sign-in code that is
 synchronous or someone else's.
+
+For a child that keeps its own profile, use `run_child(window, argv, kept=True)`.
+The child calls `signin_window.child.begin_saving()` before publication: this
+blocks until the parent revokes remote control. After saving and confirmed
+browser cleanup, it emits `emit(state="connected")` and exits 0. Both are
+required; a `signed_in` payload is refused in this mode. No session crosses the
+pipe. Set `stop_seconds` (default 5) to allow the child to restore its profile
+after cancellation; set the host's save budget to cover its publication and
+cleanup. The optional [LinkedIn prototype](examples/linkedin/README.md) uses
+this boundary with upstream's existing display, profile lease and cookie format.
 
 `Windows` options: `slots` (windows at a time, each with its own display), `minutes` (time limit), `xvfb` and
 `x11vnc` (binaries), `lock` and `lock_wait`, `display_base` and `vnc_base` (window *n* uses display

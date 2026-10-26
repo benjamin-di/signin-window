@@ -32,6 +32,88 @@ class LoginBusy(LoginUnavailable):
     """Every window slot of the login service is in use."""
 
 
+class LocalBackend:
+    """Embed windows beside an application's login code, without an HTTP service.
+
+    Construct on the host's running event loop. Relay calls the synchronous methods
+    from worker threads; browser/profile ownership stays with the supplied runner.
+    Mount both ``windows.lifespan()`` and ``relay.lifespan()`` in the host.
+    """
+
+    def __init__(self, windows: Any, novnc_dir: str | Path) -> None:
+        self.windows = windows
+        self.novnc_dir = Path(novnc_dir).resolve()
+        self.loop = asyncio.get_running_loop()
+
+    def _run(self, operation):
+        # A synchronous call on the host loop would deadlock that same loop.
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        if current is self.loop:
+            operation.close()
+            raise RuntimeError("call LocalBackend from a worker thread")
+        return asyncio.run_coroutine_threadsafe(operation, self.loop).result()
+
+    def start(self, layout: str = "desktop", **params: Any) -> dict[str, Any]:
+        from .service import Busy
+
+        try:
+            window = self._run(self.windows.start(layout, params))
+        except Busy:
+            raise LoginBusy("busy") from None
+        except (OSError, RuntimeError, ValueError):
+            raise LoginUnavailable("could not start the local window") from None
+        return {**window.public(), "view_token": window.view_token}
+
+    def state(self, window_id: str) -> dict[str, Any]:
+        async def read():
+            window = self.windows.get(window_id)
+            return window.public() if window else {"state": "unknown"}
+
+        return self._run(read())
+
+    def result(self, window_id: str) -> dict[str, Any] | None:
+        async def take():
+            return self.windows.take(window_id)
+
+        return self._run(take())
+
+    def close(self, window_id: str) -> None:
+        self._run(self.windows.close(window_id))
+
+    def static(self, path: str, window_id: str | None = None) -> tuple[int, bytes, str]:
+        import mimetypes
+
+        if not STATIC.fullmatch(path):
+            return 404, b"", ""
+        file = (self.novnc_dir / path).resolve()
+        if not file.is_relative_to(self.novnc_dir) or not file.is_file():
+            return 404, b"", ""
+        try:
+            with file.open("rb") as stream:
+                data = stream.read(MAX_STATIC + 1)
+        except OSError:
+            return 404, b"", ""
+        if len(data) > MAX_STATIC:
+            return 404, b"", ""
+        return 200, data, mimetypes.guess_type(path)[0] or "application/octet-stream"
+
+    async def bridge(self, window_id: str, view_token: str, ws: Any) -> None:
+        from .service import _pipe
+
+        window = self.windows.get(window_id)
+        if window is None or not window.view_ok(view_token) or window.state != "waiting":
+            await ws.close(code=4404)
+            return
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", window.vnc_port)
+        except OSError:
+            raise LoginUnavailable("local viewer unavailable") from None
+        await _pipe(ws, reader, writer, lambda: window.state == "waiting")
+
+
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args: Any, **kwargs: Any) -> None:
         return None
@@ -168,8 +250,11 @@ class LoginClient:
                         await ws.send_bytes(data if isinstance(data, bytes) else data.encode())
 
                 tasks = [asyncio.create_task(to_window()), asyncio.create_task(to_person())]
-                await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for task in tasks:
-                    task.cancel()
+                try:
+                    await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
         except (OSError, WebSocketException, WebSocketDisconnect, RuntimeError):
             pass

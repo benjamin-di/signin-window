@@ -55,7 +55,7 @@ jobs:
       - name: Xvfb, x11vnc, xdotool, noVNC and uv
         run: |
           apt-get update -q && apt-get install -y -q --no-install-recommends ca-certificates curl git xvfb x11vnc \
-            xdotool x11-utils x11-apps netpbm
+            xdotool x11-utils x11-apps netpbm nodejs
           curl --fail --silent --show-error --location \
             "https://github.com/novnc/noVNC/archive/refs/tags/v${NOVNC_VERSION}.tar.gz" -o /tmp/novnc.tar.gz
           printf '%s  /tmp/novnc.tar.gz\n' "$NOVNC_SHA256" | sha256sum --check --status

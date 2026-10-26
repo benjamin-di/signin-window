@@ -5,7 +5,9 @@ The child reports progress on stdout, one line each, ``<PREFIX>{json}``; anythin
 
     {"state": "waiting"}                      the sign-in page is up (the live view opens)
     {"host": "accounts.example.com"}          the host the window shows now
+    {"state": "saving"}                       revoke control before publication
     {"state": "signed_in", ...the session}    done: the session to hand over
+    {"state": "connected"}                    kept mode: the child saved its session
     {"state": "failed", "error": "..."}       it gave up
 
 ``emit`` writes such a line from the child. ``run_child`` runs one in its own process group on the window's display,
@@ -31,6 +33,7 @@ from .service import Window
 
 PREFIX = "SIGNIN "
 MAX_LINE = 1024 * 1024  # the last line carries the session
+SAVING_ACK = "SIGNIN saving\n"
 
 
 class WindowFailed(Exception):
@@ -40,6 +43,17 @@ class WindowFailed(Exception):
 def emit(prefix: str = PREFIX, **fields: Any) -> None:
     """Print one progress line (in the child)."""
     print(prefix + json.dumps(fields), flush=True)
+
+
+def begin_saving() -> None:
+    """In a kept child, revoke remote control before publishing its session.
+
+    Blocks until ``run_child(kept=True)`` has moved the window to saving. EOF or
+    an unexpected acknowledgement aborts publication. Use the default prefix.
+    """
+    emit(state="saving")
+    if sys.stdin.readline() != SAVING_ACK:
+        raise WindowFailed("saving_not_acknowledged")
 
 
 def parse(line: bytes, prefix: str = PREFIX) -> dict[str, Any] | None:
@@ -60,11 +74,21 @@ async def run_child(
     *,
     env: Mapping[str, str] | None = None,
     prefix: str = PREFIX,
+    kept: bool = False,
+    stop_seconds: float = 5,
 ) -> dict[str, Any]:
-    """Run ``argv`` on the window's display (``env`` defaults to ``window.env()``) and return its session."""
+    """Run a child on the window's display and return its session.
+
+    ``kept=True`` instead requires ``connected`` and exit 0, then finishes the
+    window without transferring a session. ``saving`` closes control before
+    publication. ``stop_seconds`` gives an application's owned child time to
+    restore its profile after SIGTERM; cancellation never releases it early.
+    """
+    if stop_seconds <= 0:
+        raise ValueError("stop_seconds must be positive")
     process = await asyncio.create_subprocess_exec(
         *argv,
-        stdin=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.PIPE if kept else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
         env={**(env if env is not None else window.env()), "DISPLAY": window.display},
@@ -73,6 +97,8 @@ async def run_child(
     )
     window.procs.append(ProcessGroup(process.pid))
     session: dict[str, Any] | None = None
+    connected = False
+    unexpected_session = False
     assert process.stdout is not None
     try:
         while line := await process.stdout.readline():
@@ -84,17 +110,39 @@ async def run_child(
             state = message.get("state")
             if state == "waiting":
                 window.waiting()
+            elif state == "saving":
+                window.saving()
+                if kept:
+                    if window.state != "saving" or window.cancelled.is_set():
+                        raise WindowFailed("saving_not_acknowledged")
+                    assert process.stdin is not None
+                    process.stdin.write(SAVING_ACK.encode())
+                    await process.stdin.drain()
+            elif state == "connected" and kept:
+                connected = True
             elif state == "failed":
                 window.error = str(message.get("error") or "failed")[:100]
+                if kept:
+                    unexpected_session = True
             elif state == "signed_in":
-                session = {k: v for k, v in message.items() if k != "state"}
+                if kept:
+                    unexpected_session = True
+                else:
+                    session = {k: v for k, v in message.items() if k != "state"}
         await process.wait()
     finally:
+        if process.stdin is not None:
+            process.stdin.close()
         if process.returncode is None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(process.pid, signal.SIGTERM)
             with contextlib.suppress(Exception, asyncio.CancelledError):
-                await asyncio.wait_for(process.wait(), timeout=5)  # reap it: no zombie left behind
+                await asyncio.wait_for(process.wait(), timeout=stop_seconds)  # reap before releasing its profile
+    if kept:
+        if process.returncode != 0 or not connected or unexpected_session or window.cancelled.is_set():
+            raise WindowFailed(window.error or "kept_session_not_confirmed")
+        window.finish("connected")
+        return {}
     if session is None or process.returncode != 0:
         raise WindowFailed(window.error or f"exit {process.returncode}")
     return session

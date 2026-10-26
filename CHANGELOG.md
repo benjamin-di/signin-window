@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- Add provider-neutral authenticated attempts with private owner, requester and
+  target context, route authorization, same-origin mutations and continuously
+  authorized viewer streams. Existing capability links remain supported.
+- Reap viewer pipes on cancellation, remove control while saving, improve status
+  accessibility and provide safe local return navigation. Uncertain completion
+  no longer claims that nothing was saved.
+
+- Add retained-profile child completion, acknowledged control revocation before
+  publication, and configurable cancellation cleanup grace.
+- Add a synthetic LinkedIn adapter that preserves upstream browser launch,
+  profile leasing, rotation, cookie export and session restoration.
+
+- Add `LocalBackend` for embedded human viewers, and borrow an existing display
+  without taking ownership of it.
+- Add host lifespans for autonomous window expiry, bounded accepted saves and
+  completion reconciliation without page polls.
+- Add opt-in page reload recovery and explicit cancellation; retain legacy page
+  behavior by default. The remote result-transfer protocol remains unchanged.
+- Add an Amazon prototype using application-owned verification and publication,
+  with synthetic real-browser acceptance and prepared upstream hooks.
+
 ## 0.4.2
 
 - Add passive challenge detection and bounded resolver orchestration. Callers

@@ -4,7 +4,8 @@
 ``link_ttl`` and one successful sign-in. Its page (``signin_window.page``) shows the site's own sign-in page, running
 in a window of your login service (``signin_window.service``) and viewed through noVNC; this relay carries the
 viewer's files and its live view, so the login service never faces the internet. Nothing here is behind your
-server's bearer: the id is the credential. A newer link for the same key replaces the older one.
+server's MCP bearer. Without ``authorize`` the id is the credential; authenticated hosts also enforce
+their own session and policy on every operation. A newer link for the same key replaces the older one.
 
 When the window ends, one of your hooks says how it went, and the link takes that state:
 
@@ -33,7 +34,10 @@ Routes, under the prefix you mount them at::
 
 from __future__ import annotations
 
+import asyncio
 import collections
+import contextlib
+import inspect
 import logging
 import re
 import secrets
@@ -44,13 +48,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib import resources
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 import anyio.to_thread
 from starlette.applications import Starlette
-from starlette.requests import Request
+from starlette.requests import HTTPConnection, Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import BaseRoute, Route, WebSocketRoute
-from starlette.websockets import WebSocket
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from .client import LoginBusy, LoginUnavailable
 from .page import PageText, render
@@ -100,6 +105,19 @@ class LinkLimited(Exception):
     """Too many links for this key this hour."""
 
 
+@dataclass(frozen=True)
+class AttemptContext:
+    """Host-assigned opaque references, never public fields or backend parameters.
+
+    The host authenticates callers and interprets these references. Neither an
+    identity provider nor an account/permission model is imposed by the library.
+    """
+
+    owner: str
+    requester: str = ""
+    target: str = ""
+
+
 @dataclass
 class Link:
     id: str
@@ -117,6 +135,7 @@ class Link:
     starts: int = 0
     closed: bool = False  # replaced by a newer link or expired: it opens nothing any more
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    context: AttemptContext | None = field(default=None, repr=False)
 
     def show(self, **fields: object) -> None:
         """Public fields of the link's state, for its page (never a secret: the page is the id's holder's)."""
@@ -175,6 +194,7 @@ class Relay:
         max_starts: int = 4,
         client_address: Callable[[Request | WebSocket], str] = forwarded_for,
         clock: Callable[[], float] = time.time,
+        authorize: Callable[[HTTPConnection, Link, str], Any] | None = None,
     ) -> None:
         if not re.match(r"https?://[^/?#]+(/[^?#]*)?\Z", public_url):
             raise ValueError("public_url must be an http(s) URL without a query")
@@ -185,6 +205,9 @@ class Relay:
             link_ttl, max_links, links_per_hour, max_starts,
         )  # fmt: skip
         self._address, self._clock = client_address, clock
+        self._authorize = authorize
+        parts = urlsplit(public_url)
+        self._origin = f"{parts.scheme}://{parts.netloc}"
         self._links: dict[str, Link] = {}
         self._made: dict[str, collections.deque] = {}
         self._misses = Misses()
@@ -193,9 +216,42 @@ class Relay:
 
     # -- links ----------------------------------------------------------------------------------------------------
 
-    def create(self, key: str, *, params: dict[str, Any] | None = None, label: str | None = None) -> Link:
+    @contextlib.asynccontextmanager
+    async def lifespan(self):
+        """Reconcile completion and expiry without a connected page.
+
+        Mount once when using ``routes``; ``app`` installs this automatically.
+        Backends and hooks must honor their own bounded I/O timeouts.
+        """
+
+        stop = asyncio.Event()
+
+        async def follow():
+            while not stop.is_set():
+                await anyio.to_thread.run_sync(self.tick)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=0.1)
+
+        task = asyncio.create_task(follow())
+        try:
+            yield self
+        finally:
+            stop.set()
+            await task  # never abandon a completion hook in a worker during shutdown
+
+    def tick(self) -> None:
+        with self._lock:
+            self._expire(self._clock())
+            links = list(self._links.values())
+        for link in links:
+            self.advance(link)
+
+    def create(self, key: str, *, params: dict[str, Any] | None = None, label: str | None = None,
+               context: AttemptContext | None = None) -> Link:  # fmt: skip
         """A link for ``key`` (what it signs in: an account, a site); it replaces any open link of that key.
         ``params`` go to the login service with each start; ``label`` is what the page names (default: the key)."""
+        if self._authorize is not None and (context is None or not context.owner):
+            raise ValueError("authenticated links require a host-assigned owner")
         now = self._clock()
         with self._lock:
             made = self._made.setdefault(key, collections.deque())
@@ -217,6 +273,7 @@ class Relay:
             link = Link(link_id, key, now, now + self.link_ttl, f"{self.public_url}/{link_id}", dict(params or {}),
                         key if label is None else label)  # fmt: skip
             self._links[link.id] = link
+            link.context = context
         for old in replaced:
             threading.Thread(target=self._retire, args=(old,), daemon=True).start()
         log.info("a sign-in link for %s", key)
@@ -350,6 +407,24 @@ class Relay:
 
     # -- HTTP -----------------------------------------------------------------------------------------------------
 
+    async def _allowed(self, request: HTTPConnection, link: Link, operation: str) -> bool:
+        if self._authorize is None:
+            return True
+        if link.context is None:
+            return False
+        if (isinstance(request, WebSocket) or request.scope.get("method") == "POST") and (
+            request.headers.get("origin") != self._origin
+        ):
+            return False
+        try:
+            decision = self._authorize(request, link, operation)
+            if inspect.isawaitable(decision):
+                decision = await asyncio.wait_for(decision, timeout=5)
+            return decision is True
+        except Exception as exc:
+            log.warning("Attempt authorization failed: %s", type(exc).__name__)
+            return False
+
     def routes(self, prefix: str = "") -> list[BaseRoute]:
         """The link routes under ``prefix`` (e.g. ``/connect``; it must match ``public_url``'s path when mounted at
         the root). Keep them outside your server's bearer check."""
@@ -357,8 +432,10 @@ class Relay:
 
         async def lookup(request: Request) -> Link | Response:
             link = self.find(request.path_params["id"], self._address(request))
-            if isinstance(link, Link):
+            if isinstance(link, Link) and await self._allowed(request, link, request.scope["endpoint"].__name__):
                 return link
+            if isinstance(link, Link):
+                return JSONResponse({"state": "unavailable"}, status_code=404, headers=HEADERS)
             return JSONResponse({"state": link}, status_code=429 if link == "limited" else 404, headers=HEADERS)
 
         async def body(request: Request) -> dict[str, Any]:
@@ -373,6 +450,10 @@ class Relay:
 
         async def page(request: Request) -> Response:
             link = self.find(request.path_params["id"], self._address(request))
+            if isinstance(link, Link) and not await self._allowed(request, link, "page"):
+                return HTMLResponse(
+                    "<h1>This sign-in request is unavailable</h1>", status_code=404, headers=PAGE_HEADERS
+                )
             if not isinstance(link, Link) or not self.usable(link):
                 status = 429 if link == "limited" else 404
                 return HTMLResponse(render(self.text, None), status_code=status, headers=PAGE_HEADERS)
@@ -395,6 +476,8 @@ class Relay:
 
         async def cancel(request: Request) -> Response:
             link = await lookup(request)
+            if isinstance(link, Response) and self._authorize is not None:
+                return link
             if not isinstance(link, Response):
                 await anyio.to_thread.run_sync(self.cancel, link)
             return Response(status_code=204, headers=HEADERS)
@@ -417,11 +500,53 @@ class Relay:
             if not isinstance(link, Link) or link.state != "waiting" or not link.window_id or not link.view_token:
                 await ws.close(code=4404)
                 return
+            if not await self._allowed(ws, link, "vnc"):
+                await ws.close(code=4404)
+                return
             await ws.accept(subprotocol="binary" if "binary" in ws.scope.get("subprotocols", []) else None)
+
+            relay = self
+
+            class GuardedSocket:
+                def __getattr__(self, name):
+                    return getattr(ws, name)
+
+                async def receive(self):
+                    message = await ws.receive()
+                    if not await relay._allowed(ws, link, "vnc"):
+                        raise WebSocketDisconnect(4404)
+                    return message
+
+                async def send_bytes(self, data):
+                    if not await relay._allowed(ws, link, "vnc"):
+                        raise WebSocketDisconnect(4404)
+                    await ws.send_bytes(data)
+
+            async def watch():
+                while await self._allowed(ws, link, "vnc"):
+                    await asyncio.sleep(0.25)
+
+            tasks = []
             try:
-                await self.backend.bridge(link.window_id, link.view_token, ws)
-            except LoginUnavailable:
+                if self._authorize is None:
+                    await self.backend.bridge(link.window_id, link.view_token, ws)
+                else:
+                    tasks = [
+                        asyncio.create_task(self.backend.bridge(link.window_id, link.view_token, GuardedSocket())),
+                        asyncio.create_task(watch()),
+                    ]
+                    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        task.result()
+            except (LoginUnavailable, WebSocketDisconnect):
                 pass
+            finally:
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                with contextlib.suppress(Exception):
+                    await ws.close()
 
         return [
             Route(prefix + "/{id}", page, methods=["GET"]),
@@ -434,7 +559,13 @@ class Relay:
 
     def app(self) -> Starlette:
         """The routes as an app of their own, to mount where ``public_url`` points."""
-        return Starlette(routes=self.routes())
+
+        @contextlib.asynccontextmanager
+        async def lifespan(_app):
+            async with self.lifespan():
+                yield
+
+        return Starlette(routes=self.routes(), lifespan=lifespan)
 
 
 def with_paste(page: bytes) -> bytes:

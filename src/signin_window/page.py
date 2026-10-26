@@ -17,7 +17,10 @@ from dataclasses import dataclass, field
 DEFAULT_OUTCOMES = {
     "connected": "<p class=ok>✓</p><h1>Connected</h1><p>You can close this page and go back to your assistant.</p>",
     "busy": "<h1>Someone else is signing in right now</h1><p>Please try again in a few minutes.</p>",
-    "failed": "<h1>Something went wrong</h1><p>Nothing was saved.</p>",
+    "failed": (
+        "<h1>We couldn’t confirm the connection</h1><p>Check its status in your application before trying again.</p>"
+    ),
+    "unavailable": "<h1>This request is unavailable</h1><p>Return to your application to sign in or check access.</p>",
     "cancelled": "<h1>Cancelled</h1>",
     "expired": "<h1>This link has expired</h1><p>Sign-in links work once, for a short time. Ask for a new one.</p>",
     "limited": "<h1>Too many tries</h1><p>Please wait ten minutes and try again.</p>",
@@ -46,6 +49,19 @@ class PageText:
     starting: str = "Opening {service}…"
     waiting: str = "Sign in as you usually do. This page notices when you're in."
     saving: str = "Signed in. Saving…"
+    #: Keep an active attempt on reload. Requires the host's relay/window lifespans.
+    reconnect: bool = False
+    return_url: str = ""
+
+    def __post_init__(self):
+        if self.return_url and (
+            not self.return_url.startswith("/")
+            or self.return_url.startswith("//")
+            or "\\" in self.return_url
+            or any(ord(c) < 32 for c in self.return_url)
+        ):
+            raise ValueError("return_url must be a local absolute path")
+
     #: State -> HTML shown when the link ends in that state; your own final states go here too.
     outcomes: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_OUTCOMES))
     #: States whose message offers "Try again".
@@ -87,11 +103,14 @@ def render(text: PageText, label: str | None) -> str:
             "starting": text.plain(text.starting, label),
             "waiting": text.plain(text.waiting, label),
             "saving": text.plain(text.saving, label),
+            "checking": "Checking the connection…",
         },
         "outcomes": {state: text.html(message, label) for state, message in text.outcomes.items()},
         "noRetry": list(text.no_retry),
         "secureHost": text.secure_host,
         "frameTitle": text.plain(text.title, label),
+        "reconnect": text.reconnect,
+        "returnUrl": text.return_url,
     }
     # JSON in a script element: "</" would end it, so it is escaped.
     script = (
@@ -107,7 +126,7 @@ def render(text: PageText, label: str | None) -> str:
 
 _BODY = """<header><h1>{{HEADING}}</h1>
 <p>{{HELP}}</p>
-<div class=bar hidden><span id=host>{{HOST}}</span><span id=status></span></div></header>
+<div class=bar hidden><span id=host>{{HOST}}</span><span id=status role=status aria-live=polite></span></div></header>
 <main id=intro class=msg><p>{{INTRO}}</p>
 <button id=go>{{BUTTON}}</button></main>
 <div id=view></div>
@@ -160,6 +179,12 @@ function finish(html) {
   $("intro").hidden = true;
   document.querySelector("header .bar").hidden = true;
   const done = $("done"); done.innerHTML = html; done.hidden = false;
+  if (CONFIG.returnUrl) {
+    const back = document.createElement("a"); back.href = CONFIG.returnUrl;
+    back.textContent = "Back to connections"; done.appendChild(back);
+  }
+  const heading = done.querySelector("h1");
+  if (heading) { heading.tabIndex = -1; heading.focus(); }
 }
 let viewer = false, over = false;
 function show(s) {
@@ -171,6 +196,7 @@ function show(s) {
   }
   if (s.host) $("host").textContent = (secure && secure.test(s.host) ? "🔒 " : "") + s.host;
   $("status").textContent = CONFIG.text[s.state] || "";
+  if (s.state === "saving") { $("view").replaceChildren(); viewer = false; }
   if (s.state === "waiting" && !viewer) {
     viewer = true;
     const frame = document.createElement("iframe");
@@ -187,7 +213,7 @@ async function poll() {
   try {
     const r = await fetch(`${base}/state`, {cache: "no-store"});
     if (show(await r.json())) return;
-  } catch (e) {}
+  } catch (e) { $("status").textContent = "Connection interrupted. Reconnecting…"; }
   setTimeout(poll, 1500);
 }
 async function begin() {
@@ -202,5 +228,27 @@ async function begin() {
   poll();
 }
 $("go").addEventListener("click", begin);
-addEventListener("pagehide", () => { if (!over && navigator.sendBeacon) navigator.sendBeacon(`${base}/cancel`); });
+const cancel = document.createElement("button");
+cancel.textContent = "Cancel";
+cancel.hidden = true;
+document.querySelector("header").appendChild(cancel);
+cancel.addEventListener("click", async () => {
+  await fetch(`${base}/cancel`, {method: "POST"});
+  show(await (await fetch(`${base}/state`, {cache: "no-store"})).json());
+});
+if (CONFIG.reconnect) {
+  (async () => {
+    const s = await (await fetch(`${base}/state`, {cache: "no-store"})).json();
+    if (s.state !== "ready") {
+      $("intro").hidden = true;
+      document.querySelector("header .bar").hidden = false;
+      if (!show(s)) poll();
+    }
+  })().catch(() => {});
+  setInterval(() => {
+    cancel.hidden = over || $("intro").hidden === false || $("status").textContent === CONFIG.text.saving;
+  }, 250);
+} else {
+  addEventListener("pagehide", () => { if (!over && navigator.sendBeacon) navigator.sendBeacon(`${base}/cancel`); });
+}
 </script>"""
