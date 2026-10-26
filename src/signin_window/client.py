@@ -15,6 +15,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from anyio import CancelScope
+
 WINDOW_ID = re.compile(r"[A-Za-z0-9_-]{16,40}\Z")
 VIEW_TOKEN = re.compile(r"[A-Za-z0-9_-]{16,64}\Z")
 # noVNC's files: up to five path segments, none starting with a dot (so never "..").
@@ -255,6 +257,7 @@ class LoginClient:
                 finally:
                     for task in tasks:
                         task.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                    with CancelScope(shield=True):
+                        await asyncio.gather(*tasks, return_exceptions=True)
         except (OSError, WebSocketException, WebSocketDisconnect, RuntimeError):
             pass

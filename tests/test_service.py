@@ -357,6 +357,45 @@ def test_slots_are_bounded():
         Windows(waiting_until({}), slots=10)
 
 
+def test_parent_cancellation_drains_stream_and_closes_real_vnc_socket():
+    from anyio import CancelScope
+
+    async def exercise():
+        closed = asyncio.Event()
+
+        async def vnc(reader, writer):
+            try:
+                await reader.read()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                closed.set()
+
+        class Browser:
+            ended = False
+
+            async def receive(self):
+                await asyncio.Event().wait()
+
+            async def close(self):
+                self.ended = True
+
+        server = await asyncio.start_server(vnc, "127.0.0.1", 0)
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1])
+        browser = Browser()
+        try:
+            with CancelScope() as scope:
+                asyncio.get_running_loop().call_soon(scope.cancel)
+                await service._pipe(browser, reader, writer, lambda: True)
+            await asyncio.wait_for(closed.wait(), 1)
+            assert writer.is_closing() and browser.ended
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(exercise())
+
+
 def fake_x(tmp_path):
     """Stand-ins for Xvfb (makes its socket, then waits) and x11vnc (listens on -rfbport, then waits)."""
     xvfb, x11vnc = tmp_path / "Xvfb", tmp_path / "x11vnc"

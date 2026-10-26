@@ -66,6 +66,13 @@ def test_the_paste_add_on_types_without_logging_or_keeping_the_text():
     assert "stopPropagation()" in keydown and "preventDefault()" not in keydown  # the browser must still paste
 
 
+def test_only_optional_oidc_module_imports_identity_protocol_client():
+    for path in PYTHON:
+        identity = {name for name in imports(path) if name.startswith("authlib")}
+        assert not identity or path.name == "oidc.py", (path.name, identity)
+    assert "authlib.integrations.starlette_client" in imports(SRC / "oidc.py")
+
+
 def test_the_vnc_server_listens_on_loopback_only_without_a_password_prompt():
     service = (SRC / "service.py").read_text()
     assert '"-localhost"' in service and '"-nolisten", "tcp"' in service

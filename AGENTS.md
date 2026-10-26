@@ -18,7 +18,10 @@ it in a job of its own). Documentation-only changes need `git diff --check` and 
 - `tests/test_safety.py` is the boundary: human window/relay modules never import optional `automation`, and never
   click, type or fill a page. Optional automation has separate contracts and must receive its planner explicitly.
   Only `client.py` opens
-  connections (to the login service); the VNC server listens on loopback; `static/paste.js` logs and keeps nothing.
+  connections to the login service. Optional `oidc.py` uses Authlib for the configured
+  identity provider only; applications own identity-to-account mapping and all account
+  controls. Human window/relay imports never require the OIDC extra. The VNC server
+  listens on loopback; `static/paste.js` logs and keeps nothing.
   Changing any of these is a design change: argue it in the pull request.
 - Session helpers share durable accounting and warm-first mechanics. Applications
   own site identity, entitlement, publication formats and maintenance policy.

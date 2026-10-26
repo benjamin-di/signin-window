@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add optional, provider-neutral OIDC browser sessions through Authlib, with
+  code/PKCE/nonce validation, one-use callbacks, secure opaque cookies, and
+  explicit fresh-authentication support. Applications retain account ownership,
+  permission checks, credential publication and durable disconnect controls.
+
 - Add provider-neutral authenticated attempts with private owner, requester and
   target context, route authorization, same-origin mutations and continuously
   authorized viewer streams. Existing capability links remain supported.

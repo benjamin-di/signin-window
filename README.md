@@ -470,3 +470,70 @@ Advanced challenge integrations may use the supported
 `automation.hcaptcha.ChallengeActionBoundary`, `HCaptchaOutcomeObserver` and
 `hcaptcha_instruction` seams. Applications still supply the planner and decide
 whether the resulting session or content is acceptable.
+
+## Optional browser identity
+
+`pip install 'signin-window[oidc]'` adds a provider-neutral Authlib integration for
+Starlette applications. The window and relay still need only the core package.
+This integration can also protect native pairing and device-code pages without
+opening a remote browser. Hosted browser session storage requires a POSIX host
+with private file permissions; it is independent of an application's local stdio
+support on other operating systems.
+
+```python
+from pathlib import Path
+
+from signin_window.oidc import BrowserAuth, OIDCConfig
+from starlette.applications import Starlette
+
+auth = BrowserAuth(OIDCConfig(
+    issuer="https://identity.example.com",
+    client_id="example-connections",
+    public_url="https://connections.example.com",
+    state_dir=Path("/private/browser-sessions"),
+    cookie_name="__Host-example-connections",
+    required_group="example-users",
+    claim_names=("account_alias",),
+))
+app = auth.middleware(Starlette(routes=auth.routes()))
+```
+
+Register exactly `<public_url>/connections/callback` with the provider and add
+your application's home/status/start/disconnect routes. Configure `client_secret`
+from protected runtime configuration for a confidential client; omitting it uses
+public-client PKCE. Every exchange also validates state, nonce, issuer, audience
+and expiry. Callbacks are single-use even across application workers.
+
+`auth.identity(request)` returns `None` or a verified dictionary containing
+`issuer`, `sub`, `name`, `groups`, `claims` and `expires`. Only explicitly selected
+custom claims are retained. Map that identity to an existing account in your
+application; groups alone do not confer ownership. Neither browser input nor a
+forwarded header establishes a connection owner. Supply that policy through
+`Relay(authorize=...)`, protecting every route and the live viewer.
+
+The browser holds an opaque Secure/HttpOnly/SameSite cookie with no Domain
+attribute. Private server-side sessions last at most 15 minutes. Provider
+tokens are discarded after callback verification. Sign-out is an exact-origin
+POST and ends this local browser session; it does not revoke provider credentials
+or agent permissions. Use separate origins for applications with different trust
+boundaries; cookie names and URL paths do not provide browser-origin isolation.
+
+For account replacement, `/connections/login?reauth=1` requests fresh provider
+authentication. A successful, verified fresh `auth_time` produces a server-owned
+`reauthenticated_at` value in the identity. Applications decide how recently that
+must have occurred before a sensitive action. Safe `next` destinations are the
+connections home or a local `/connect/<id>` attempt, including a configured base
+path. Test-only loopback HTTP must be explicitly enabled in `OIDCConfig`; it uses
+a different cookie name.
+
+Connections responses receive a restrictive default Content Security Policy.
+An application redirecting a submitted form to its native provider may supply its
+own complete policy, allowing only that fixed provider origin in `form-action`.
+The middleware preserves that policy without appending a conflicting second one;
+it still supplies no-store and the other browser safety headers. Never derive a
+policy from browser input.
+
+Applications retain credential publication, provider-account verification and
+durable disconnect controls. Keep those controls independent of browser sessions
+and check them in actual credential writers and maintenance workers, including
+after restart or removal of the browser UI configuration.

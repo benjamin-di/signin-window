@@ -1,6 +1,6 @@
 [project]
 name = "signin-window"
-version = "0.4.5"
+version = "0.4.7"
 description = "Human sign-in windows, durable session maintenance and optional bounded browser challenges for self-hosted services"
 readme = "README.md"
 license = "MIT"
@@ -28,6 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+oidc = ["authlib>=1.8,<2", "httpx2>=2.13,<3"]
 automation = ["pydantic>=2.11,<3"]
 chromium = ["pydantic>=2.11,<3", "patchright>=1.52,<2"]
 
@@ -36,7 +37,7 @@ Homepage = "https://github.com/benjamin-di/signin-window"
 Issues = "https://github.com/benjamin-di/signin-window/issues"
 
 [dependency-groups]
-dev = ["httpx>=0.27", "pytest>=8", "ruff>=0.14", "uvicorn>=0.30", "pydantic>=2.11,<3"]
+dev = ["httpx>=0.27", "pytest>=8", "ruff>=0.14", "uvicorn>=0.30", "pydantic>=2.11,<3", "authlib>=1.8,<2", "httpx2>=2.13,<3"]
 # The paste add-on's browser test (tests/test_paste_dom.py): `uv sync --group browser`, then
 # `uv run playwright install chromium`.
 browser = ["playwright>=1.48", "patchright>=1.52,<2"]

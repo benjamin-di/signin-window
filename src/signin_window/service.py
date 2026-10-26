@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from anyio import CancelScope
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
@@ -723,10 +724,16 @@ async def _pipe(ws: WebSocket, reader: asyncio.StreamReader, writer: asyncio.Str
     finally:
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
         writer.close()
-        with contextlib.suppress(Exception):
-            await ws.close()
+        # An ASGI cancellation may arrive while the two byte directions are
+        # draining. Preserve its cancellation scope instead of replacing it
+        # with a second cancellation from gather, and always close the socket.
+        with CancelScope(shield=True):
+            await asyncio.gather(*tasks, return_exceptions=True)
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            with contextlib.suppress(Exception):
+                await ws.close()
 
 
 def _escape(text: str) -> str:
