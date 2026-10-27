@@ -174,6 +174,7 @@ def test_configuration_refuses_unsafe_origins_and_state_storage(tmp_path):
     with pytest.raises(ValueError):
         replace(config, cookie_name="shared-cookie")
     (tmp_path / "wide").mkdir(mode=0o755)
+    (tmp_path / "wide").chmod(0o755)  # Exercise an unsafe directory even under a private export umask.
     with pytest.raises(ValueError):
         BrowserStore(tmp_path / "wide")
     (tmp_path / "link").symlink_to(tmp_path / "wide", target_is_directory=True)

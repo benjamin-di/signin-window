@@ -90,6 +90,10 @@ improvements, including the scope of 1Password and passkey support.
 
 ## Authenticated sign-in attempts
 
+The [permissions model](PERMISSIONS.md) separates browser identity, attempt
+ownership, provider-account management and an agent's API access. Applications
+own those policies; using a sign-in window grants no agent permission.
+
 Hosts with an existing browser session can protect sign-in links without adding
 an identity-provider dependency to this package. Supply `Relay(authorize=...)`
 and pass a private `AttemptContext(owner=..., requester=..., target=...)` to
