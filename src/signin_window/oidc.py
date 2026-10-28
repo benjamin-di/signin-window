@@ -8,6 +8,7 @@ never belong in this browser session store.
 from __future__ import annotations
 
 import hashlib
+import html
 import math
 import os
 import re
@@ -22,12 +23,14 @@ from urllib.parse import urlsplit
 
 from authlib.integrations.starlette_client import OAuth
 from starlette.requests import HTTPConnection, Request
-from starlette.responses import RedirectResponse, Response
+from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
 _SID = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _CLAIM = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 _MAX_AGE = 900
+#: A sign-in whose verified ``auth_time`` is at most this old already counts as a fresh confirmation.
+RECENT_AUTHENTICATION_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -273,6 +276,13 @@ class BrowserAuth:
                 or authenticated > self.store.clock() + 5
             ):
                 raise ValueError("fresh authentication was not verified")
+            now = self.store.clock()
+            recent = (
+                isinstance(authenticated, int | float)
+                and not isinstance(authenticated, bool)
+                and math.isfinite(authenticated)
+                and now - RECENT_AUTHENTICATION_SECONDS <= authenticated <= now + 5
+            )
             request.session.clear()
             request.session.update(
                 issuer=self.config.issuer,
@@ -282,7 +292,8 @@ class BrowserAuth:
                 expires=expires,
                 claims={name: info[name] for name in self.config.claim_names if name in info},
                 auth_time=authenticated,
-                reauthenticated_at=self.store.clock() if reauth_started is not None else None,
+                # A step-up proves now; otherwise a provider-verified recent authentication counts from its own time.
+                reauthenticated_at=now if reauth_started is not None else (min(authenticated, now) if recent else None),
             )
             request.scope["rotate_browser_session"] = True
             return RedirectResponse(destination, status_code=303)
@@ -294,7 +305,12 @@ class BrowserAuth:
         if not self.origin_ok(request):
             return Response("Request refused", status_code=403)
         request.session.clear()
-        return RedirectResponse(self.home, status_code=303)
+        # Not the home page: a host that sends signed-out visitors straight to sign-in would sign them back in.
+        return HTMLResponse(
+            "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>Signed out</title><p>You are signed out of this page.</p>"
+            f'<p><a href="{html.escape(self.prefix)}/connections/login">Sign in again</a></p>'
+        )
 
     def routes(self, prefix="/connections"):
         return [

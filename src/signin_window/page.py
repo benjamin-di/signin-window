@@ -51,6 +51,9 @@ class PageText:
     saving: str = "Signed in. Saving…"
     #: Keep an active attempt on reload. Requires the host's relay/window lifespans.
     reconnect: bool = False
+    #: Open the window as the page loads, without the intro and its button. Only for a link the host has already
+    #: bound to the signed-in person, who has just asked for it; a link handed to someone keeps the intro.
+    auto_start: bool = False
     return_url: str = ""
 
     def __post_init__(self):
@@ -110,6 +113,7 @@ def render(text: PageText, label: str | None) -> str:
         "secureHost": text.secure_host,
         "frameTitle": text.plain(text.title, label),
         "reconnect": text.reconnect,
+        "autoStart": text.auto_start,
         "returnUrl": text.return_url,
     }
     # JSON in a script element: "</" would end it, so it is escaped.
@@ -243,12 +247,13 @@ if (CONFIG.reconnect) {
       $("intro").hidden = true;
       document.querySelector("header .bar").hidden = false;
       if (!show(s)) poll();
-    }
+    } else if (CONFIG.autoStart) begin();
   })().catch(() => {});
   setInterval(() => {
     cancel.hidden = over || $("intro").hidden === false || $("status").textContent === CONFIG.text.saving;
   }, 250);
 } else {
   addEventListener("pagehide", () => { if (!over && navigator.sendBeacon) navigator.sendBeacon(`${base}/cancel`); });
+  if (CONFIG.autoStart) begin();
 }
 </script>"""

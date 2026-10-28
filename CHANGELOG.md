@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A sign-in the provider authenticated within the last five minutes now counts
+  as a fresh confirmation (`reauthenticated_at` is its verified `auth_time`), so
+  a sensitive action straight after sign-in needs no second authentication.
+- Sign-out answers with a signed-out page instead of redirecting home.
+- Add `PageText(auto_start=True)` for owner-bound links: the window opens on load.
+
 - Add optional, provider-neutral OIDC browser sessions through Authlib, with
   code/PKCE/nonce validation, one-use callbacks, secure opaque cookies, and
   explicit fresh-authentication support. Applications retain account ownership,

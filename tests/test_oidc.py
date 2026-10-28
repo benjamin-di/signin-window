@@ -51,7 +51,8 @@ def test_real_pkce_claims_and_opaque_cookie_without_provider_tokens(system):
     response = client.get("/connections/status")
     assert response.json()["claims"] == {"person_id": "first"}
     assert response.json()["issuer"] == provider.issuer and response.json()["sub"] == "subject-one"
-    assert response.json()["reauthenticated_at"] is None
+    # The provider authenticated the person just now, so this sign-in already counts as a fresh confirmation.
+    assert response.json()["reauthenticated_at"] == response.json()["auth_time"]
     assert response.headers["cache-control"] == "no-store"
     cookie = client.cookies[auth.cookie]
     assert len(cookie) == 43 and "subject-one" not in cookie
@@ -117,7 +118,8 @@ def test_logout_and_expiry_remove_cookie_authority(system):
         client.post("/connections/logout", headers=[("origin", auth.origin), ("origin", auth.origin)]).status_code
         == 403
     )
-    assert client.post("/connections/logout", headers={"origin": auth.origin}).status_code == 303
+    signed_out = client.post("/connections/logout", headers={"origin": auth.origin})
+    assert signed_out.status_code == 200 and 'href="/connections/login"' in signed_out.text
     assert client.get("/connections/status").status_code == 401
     assert sign_in(provider, client).status_code == 303
     auth.store.clock = lambda: time.time() + 901
@@ -225,3 +227,27 @@ def test_application_can_supply_one_fixed_provider_form_policy_without_duplicate
         response = client.post("/connections/start")
         assert response.headers.get_list("content-security-policy") == [policy]
         assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.parametrize("age", [301, 3600])
+def test_an_older_provider_session_signs_in_but_is_not_a_fresh_confirmation(system, age):
+    _, provider, client = system
+    provider.tamper = {"auth_time": int(time.time()) - age}
+    assert sign_in(provider, client).status_code == 303
+    identity = client.get("/connections/status").json()
+    assert identity["auth_time"] == provider.tamper["auth_time"] and identity["reauthenticated_at"] is None
+
+
+@pytest.mark.parametrize("authenticated", [None, True, int(time.time()) + 3600])
+def test_an_unverifiable_auth_time_is_never_a_fresh_confirmation(system, authenticated):
+    _, provider, client = system
+    provider.tamper = {"auth_time": authenticated}
+    assert sign_in(provider, client).status_code == 303
+    assert client.get("/connections/status").json()["reauthenticated_at"] is None
+
+
+def test_a_recent_confirmation_counts_from_the_providers_authentication_time(system):
+    _, provider, client = system
+    provider.tamper = {"auth_time": int(time.time()) - 200}
+    assert sign_in(provider, client).status_code == 303
+    assert client.get("/connections/status").json()["reauthenticated_at"] == provider.tamper["auth_time"]

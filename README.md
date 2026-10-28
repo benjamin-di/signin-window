@@ -370,6 +370,9 @@ Hooks run one at a time, in a worker thread:
 `help_html`, `intro_html`, `button`, `secure_host` (a host it matches gets a padlock), `starting`, `waiting`, `saving`, `outcomes` (state ->
 message; `with_outcomes(...)` adds your own) and `script_extra` (it may define `window.signinBeforeStart`, an async
 function that must return true before a window opens, for an invite code the person enters first, say).
+`auto_start=True` opens the window as the page loads, without the intro and its button (a reloaded `reconnect` page
+still resumes its attempt). Use it only for a link the host has bound to the signed-in person who just asked for it;
+a link handed to someone keeps the intro, which tells them whose account it connects.
 
 The relay talks to the login service through `LoginClient`; any object with the same methods (`Backend`) works,
 for a login service of another shape.
@@ -519,12 +522,17 @@ The browser holds an opaque Secure/HttpOnly/SameSite cookie with no Domain
 attribute. Private server-side sessions last at most 15 minutes. Provider
 tokens are discarded after callback verification. Sign-out is an exact-origin
 POST and ends this local browser session; it does not revoke provider credentials
-or agent permissions. Use separate origins for applications with different trust
+or agent permissions. It answers with a signed-out page rather than the connections
+home, so a host that sends signed-out visitors straight to sign-in does not sign
+them back in through the provider's own session. Use separate origins for applications with different trust
 boundaries; cookie names and URL paths do not provide browser-origin isolation.
 
 For account replacement, `/connections/login?reauth=1` requests fresh provider
 authentication. A successful, verified fresh `auth_time` produces a server-owned
-`reauthenticated_at` value in the identity. Applications decide how recently that
+`reauthenticated_at` value in the identity. An ordinary sign-in whose verified
+`auth_time` is at most `RECENT_AUTHENTICATION_SECONDS` (300) old sets it to that
+`auth_time`, so a person who has just authenticated is not asked again; an older
+provider session, or a missing or future `auth_time`, leaves it unset. Applications decide how recently that
 must have occurred before a sensitive action. Safe `next` destinations are the
 connections home or a local `/connect/<id>` attempt, including a configured base
 path. Test-only loopback HTTP must be explicitly enabled in `OIDCConfig`; it uses
