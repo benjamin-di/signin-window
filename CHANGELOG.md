@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The 1Password reader now passes `OP_CONFIG_DIR` to `op`. Without it, `op`
+  failed to create its configuration directory in read-only containers, so
+  every credential read failed.
 - A sign-in the provider authenticated within the last five minutes now counts
   as a fresh confirmation (`reauthenticated_at` is its verified `auth_time`), so
   a sensitive action straight after sign-in needs no second authentication.

@@ -91,6 +91,9 @@ class OpSecretReader:
             "OP_SERVICE_ACCOUNT_TOKEN": token,
             "PATH": os.environ.get("PATH", os.defpath),
         }
+        # op writes its configuration on every call; a hardened container points it at a writable directory.
+        if config_dir := os.environ.get("OP_CONFIG_DIR"):
+            environment["OP_CONFIG_DIR"] = config_dir
         completed = subprocess.run(
             ["op", "inject"],
             check=True,

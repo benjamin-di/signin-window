@@ -98,6 +98,26 @@ def test_secret_failure_never_switches_identity(monkeypatch):
     assert calls[0]["capture_output"] is True
 
 
+def test_secret_read_keeps_only_the_configured_op_directory(monkeypatch):
+    calls = []
+
+    def resolved(args, **kwargs):
+        calls.append(kwargs)
+        return type("Completed", (), {"stdout": "synthetic-value\n"})()
+
+    monkeypatch.setattr("signin_window.automation.secrets.subprocess.run", resolved)
+    monkeypatch.setenv("OP_CONFIG_DIR", "/tmp/operator-cli")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com")
+    reader = OpSecretReader(service_account_token="synthetic-authority")
+    assert reader.read("op://Example/Item/password") == "synthetic-value"
+    assert set(calls[0]["env"]) == {"OP_SERVICE_ACCOUNT_TOKEN", "PATH", "OP_CONFIG_DIR"}
+    assert calls[0]["env"]["OP_CONFIG_DIR"] == "/tmp/operator-cli"
+
+    monkeypatch.delenv("OP_CONFIG_DIR")
+    reader.read("op://Example/Item/password")
+    assert set(calls[1]["env"]) == {"OP_SERVICE_ACCOUNT_TOKEN", "PATH"}
+
+
 def test_browser_child_never_inherits_operator_or_planner_credentials():
     from signin_window.automation.runtime import browser_environment
 
