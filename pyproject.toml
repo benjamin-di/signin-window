@@ -1,6 +1,6 @@
 [project]
 name = "signin-window"
-version = "0.4.16"
+version = "0.4.17"
 description = "Human sign-in windows, durable session maintenance and optional bounded browser challenges for self-hosted services"
 readme = "README.md"
 license = "MIT"

@@ -11,7 +11,7 @@ comes in time, from ``navigator.clipboard.readText()``, stubbed here. Synthetic
 key events have no default action, so a paste event fires only where a case
 dispatches one. Skipped without Playwright or its Chromium: ``uv sync --group
 browser``, ``uv run playwright install chromium``, then ``uv run pytest
-tests/test_paste_dom.py`` (CI runs it in a job of its own).
+tests/test_paste_dom.py`` (CI runs it in the ``test`` job after ``make check``).
 """
 
 from __future__ import annotations

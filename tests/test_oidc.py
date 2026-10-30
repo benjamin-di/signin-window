@@ -190,6 +190,18 @@ def test_identity_failure_does_not_leak_protocol_values(system, caplog):
     response = sign_in(provider, client)
     assert response.status_code == 403
     assert "synthetic-access-token" not in response.text + caplog.text
+    assert "Back to Connections" in response.text
+
+
+def test_connection_pages_allow_only_the_reviewed_enhancement_script(system):
+    from signin_window.connections import SCRIPT_SOURCE
+
+    _, _, client = system
+    response = client.get("/connections/status")
+    policy = response.headers["content-security-policy"]
+    assert f"script-src {SCRIPT_SOURCE};" in policy
+    assert "script-src 'self'" not in policy and "script-src 'unsafe-inline'" not in policy
+    assert "frame-ancestors 'none'" in policy and "form-action 'self'" in policy
 
 
 def test_confidential_client_authentication_still_uses_pkce_and_private_tokens(tmp_path):

@@ -92,7 +92,7 @@ def interact(page, url, *, reload=False):
     page.locator("#go").click()
     frame = page.frame_locator("iframe")
     frame.locator("canvas").wait_for(timeout=15000)
-    page.wait_for_function("document.querySelector('#status').textContent.includes('Sign in')")
+    page.locator("#status").filter(has_text="Finish signing in").wait_for()
     if reload:
         page.reload()
         frame = page.frame_locator("iframe")
@@ -118,7 +118,7 @@ def test_real_viewer_reload_sign_in_and_existing_mcp_tools(host):
         wait_for(lambda: next(iter(app.state.connect.relay._links.values())).state == "connected")
         assert provider.requests.count("/signin") == 1
         page.locator("#done").wait_for(state="visible", timeout=15000)
-        assert "Connected" in page.locator("#done").inner_text()
+        assert "Connection saved" in page.locator("#done").inner_text()
         browser.close()
     result = rpc(origin, "tools/call", {"name": "check_session", "arguments": {}})
     assert not result.get("isError"), result
@@ -167,7 +167,7 @@ def test_explicit_cancel_closes_the_browser_without_saving(host):
         page.goto(url)
         page.locator("#go").click()
         page.frame_locator("iframe").locator("html.noVNC_connected").wait_for(timeout=15000)
-        page.get_by_role("button", name="Cancel", exact=True).click()
+        page.get_by_role("button", name="Cancel sign-in", exact=True).click()
         wait_for(lambda: all(w.state == "cancelled" for w in app.state.windows._windows.values()))
         browser.close()
     assert not jar.exists()

@@ -480,6 +480,33 @@ Advanced challenge integrations may use the supported
 `hcaptcha_instruction` seams. Applications still supply the planner and decide
 whether the resulting session or content is acceptable.
 
+## Connection page helpers
+
+`signin_window.connections.page(title, body, intro="", refresh=False,`
+`login_url="/connections/login")` renders a
+responsive connection screen with keyboard focus styles and light/dark colors.
+`title` and `intro` are plain text; `body` is trusted application HTML. Escape all
+account and request values before interpolating them. Applications still own
+forms, CSRF checks, account mapping and connection authority. Supply the fixed
+application login URL explicitly when using a base prefix or a different login
+route; recovery links use this URL even on nested pages.
+
+Use `disconnect_confirmation(form, service, effect)` to put an existing form
+behind an expandable explanation, and `timestamp(value, label="Last checked")`
+for readable UTC times. These helpers do not perform or authorize actions.
+
+With `refresh=True`, a fixed script fetches the current HTML page while work is
+in progress. It preserves focus and defers updates around edited controls, open
+confirmations and text selections. Network or authentication failures expose a
+recovery link. Without JavaScript, the page offers a manual refresh link. The
+script never submits a form or starts a sign-in. An explicit
+`<button type="button" data-copy-code="code-id">Copy code</button>` copies the
+text of that code element on click, with a manual-selection fallback.
+
+The OIDC middleware's default CSP permits only this script's exact hash.
+Applications with their own CSP must include `SCRIPT_SOURCE` from this module in
+`script-src`; neither `unsafe-inline` nor `unsafe-eval` is needed for scripts.
+
 ## Optional browser identity
 
 `pip install 'signin-window[oidc]'` adds a provider-neutral Authlib integration for

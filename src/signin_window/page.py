@@ -15,15 +15,18 @@ import json
 from dataclasses import dataclass, field
 
 DEFAULT_OUTCOMES = {
-    "connected": "<p class=ok>✓</p><h1>Connected</h1><p>You can close this page and go back to your assistant.</p>",
-    "busy": "<h1>Someone else is signing in right now</h1><p>Please try again in a few minutes.</p>",
+    "connected": (
+        "<p class=ok>✓</p><h1>Connection saved</h1><p>You can close this page and return to your assistant.</p>"
+    ),
+    "busy": "<h1>A sign-in is already open</h1><p>Continue that sign-in, or try again in a few minutes.</p>",
     "failed": (
-        "<h1>We couldn’t confirm the connection</h1><p>Check its status in your application before trying again.</p>"
+        "<h1>We could not confirm the connection</h1>"
+        "<p>Check the connection status before starting another sign-in.</p>"
     ),
     "unavailable": "<h1>This request is unavailable</h1><p>Return to your application to sign in or check access.</p>",
-    "cancelled": "<h1>Cancelled</h1>",
-    "expired": "<h1>This link has expired</h1><p>Sign-in links work once, for a short time. Ask for a new one.</p>",
-    "limited": "<h1>Too many tries</h1><p>Please wait ten minutes and try again.</p>",
+    "cancelled": "<h1>Sign-in cancelled</h1><p>Return to your connections to check the current status.</p>",
+    "expired": "<h1>This link has expired</h1><p>Return to your connections to start a new sign-in.</p>",
+    "limited": "<h1>Too many sign-in attempts</h1><p>Wait before starting another sign-in.</p>",
 }
 NO_RETRY = ("connected", "expired", "limited")
 
@@ -35,20 +38,17 @@ class PageText:
     service: str = "the site"
     title: str = "Connect your {service} account"
     help_html: str = (
-        "Sign in on {service}'s own page below, as you usually do (passkeys do not work in this window). Pasting "
-        "works too. The page runs in a browser on the server your assistant uses."
+        "Sign in to {service} in the remote browser below. Use a password or verification code; device passkeys "
+        "do not work in this window. You can paste text with Ctrl+V or Cmd+V."
     )
-    intro_html: str = (
-        "This link connects {service} for <b>{label}</b>. Continue only if that is you: whoever signs in here, their "
-        "account is the one that will be used."
-    )
+    intro_html: str = "Connect {service} for <b>{label}</b>. Sign in to the account you want this application to use."
     button: str = "Continue to {service}'s sign-in"
     #: A JavaScript regular expression: a host it matches is shown with a padlock.
     secure_host: str = ""
     host_label: str = ""
     starting: str = "Opening {service}…"
-    waiting: str = "Sign in as you usually do. This page notices when you're in."
-    saving: str = "Signed in. Saving…"
+    waiting: str = "Finish signing in below. We will check when you are done."
+    saving: str = "Sign-in complete. Saving your connection…"
     #: Keep an active attempt on reload. Requires the host's relay/window lifespans.
     reconnect: bool = False
     #: Open the window as the page loads, without the intro and its button. Only for a link the host has already
@@ -91,7 +91,12 @@ class PageText:
 def render(text: PageText, label: str | None) -> str:
     """The link's page; ``label`` None is the expired page."""
     if label is None:
-        body = f"<main class=msg>{text.html(text.outcomes.get('expired', DEFAULT_OUTCOMES['expired']))}</main>"
+        back = (
+            f'<p><a class=button href="{html.escape(text.return_url, quote=True)}">Back to Connections</a></p>'
+            if text.return_url
+            else "<p>Ask your application for a new sign-in link.</p>"
+        )
+        body = f"<main class=msg>{text.html(text.outcomes.get('expired', DEFAULT_OUTCOMES['expired']))}{back}</main>"
         title = text.plain(text.title.replace(" {label}", "")).strip()  # no link, no label
         return _PAGE.replace("{{TITLE}}", html.escape(title)).replace("{{BODY}}", body).replace("{{SCRIPT}}", "")
     body = (
@@ -134,6 +139,7 @@ _BODY = """<header><h1>{{HEADING}}</h1>
 <main id=intro class=msg><p>{{INTRO}}</p>
 <button id=go>{{BUTTON}}</button></main>
 <div id=view></div>
+<p id=recovery role=status hidden></p>
 <main id=done class=msg hidden></main>"""
 
 _PAGE = """<!doctype html><html lang=en><meta charset=utf-8>
@@ -146,19 +152,23 @@ html,body{margin:0;height:100%;background:#f4f4f4}
 body{display:flex;flex-direction:column}
 header{padding:12px 16px 8px;background:#fff;border-bottom:1px solid #ddd}
 h1{font-size:18px;margin:0 0 4px}
-header p{margin:0 0 8px;font-size:13px;color:#4b4b4b;max-width:62em}
+header p{margin:0 0 8px;font-size:14px;color:#4b4b4b;max-width:62em}
 .bar{display:flex;justify-content:space-between;gap:12px;font-size:13px}
 #host{color:#1a7f37;font-weight:600}#status{color:#4b4b4b;text-align:right}
 #view{flex:1;min-height:0;display:flex}
 #view iframe{flex:1;border:0;width:100%;height:100%;background:#fff}
 .msg{margin:auto;padding:28px 20px;text-align:center;max-width:26em;width:100%;box-sizing:border-box}
 .msg h1{font-size:22px}.ok{font-size:44px;color:#1a7f37;margin:0}
-button{font:inherit;font-weight:600;margin-top:14px;width:100%;padding:12px 18px;border-radius:8px;
+button,.button{font:inherit;font-weight:600;margin-top:14px;min-height:44px;padding:12px 18px;border-radius:8px;
  border:1px solid #141414;background:#141414;color:#fff}
+.msg button,.msg .button{display:inline-block;width:100%;box-sizing:border-box;text-decoration:none}
+header button{font-size:14px;margin:8px 0}
+a:focus-visible,button:focus-visible{outline:3px solid #a35d00;outline-offset:3px}
+#recovery{margin:0;padding:12px 16px;background:#fff3d9;color:#5d400a}#recovery button{margin:4px 8px;font-size:14px}
 input{font:inherit;width:100%;box-sizing:border-box;padding:10px;margin-top:10px;border:1px solid #999;
  border-radius:6px}
 [hidden]{display:none!important}
-@media (max-width:600px){header p{font-size:12px}}
+@media (max-width:600px){header p{font-size:14px}.bar{flex-wrap:wrap}#status{text-align:left}}
 </style>
 {{BODY}}
 {{SCRIPT}}
@@ -168,35 +178,89 @@ _SCRIPT = """<script>
 const base = location.pathname.replace(/\\/+$/, "");
 const $ = id => document.getElementById(id);
 const esc = t => String(t ?? "").replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
-const post = (path, data) => fetch(`${base}/${path}`, {method: "POST", headers: {"content-type": "application/json"},
-                                                      body: JSON.stringify(data || {})}).then(r => r.json());
+async function request(path, options = {}, allowEmpty = false) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch(`${base}/${path}`, {...options, cache: 'no-store', redirect: 'manual',
+                                                   signal: controller.signal});
+    // Application refusals carry useful, finite outcomes too (for example limited or unavailable).
+    if ([401, 403].includes(response.status) || response.type === 'opaqueredirect') {
+      const error = new Error('request'); error.status = response.status;
+      if (response.type === 'opaqueredirect') error.status = 401;
+      throw error;
+    }
+    if (allowEmpty && response.status === 204) return null;
+    let result;
+    try { result = await response.json(); }
+    catch (_) { const error = new Error('response'); error.status = response.status; throw error; }
+    if (!result || typeof result.state !== 'string' ||
+        !['ready', 'new', 'starting', 'waiting', 'saving', 'checking'].includes(result.state) &&
+        !Object.hasOwn(CONFIG.outcomes, result.state)) throw new Error('state');
+    if (!response.ok && !Object.hasOwn(CONFIG.outcomes, result.state)) throw new Error('response');
+    return result;
+  } finally { clearTimeout(timeout); }
+}
+const post = (path, data) => request(path, {method: "POST", headers: {"content-type": "application/json"},
+                                         body: JSON.stringify(data || {})});
 const AGAIN = `<button onclick="location.reload()">Try again</button>`;
 const secure = CONFIG.secureHost ? new RegExp(CONFIG.secureHost) : null;
 function outcome(s) {
+  if (!Object.hasOwn(CONFIG.outcomes, s.state)) return null;
   const template = CONFIG.outcomes[s.state];
-  if (template === undefined) return null;
   const filled = template.replace(/\\{([a-z_][a-z0-9_]*)\\}/g, (m, name) => esc(s[name]));
   return filled + (CONFIG.noRetry.includes(s.state) ? "" : AGAIN);
 }
 function finish(html) {
+  if (over) return;
+  over = true;
+  clearTimeout(pollTimer);
+  $("recovery").hidden = true;
   $("view").hidden = true;
   $("intro").hidden = true;
   document.querySelector("header .bar").hidden = true;
   const done = $("done"); done.innerHTML = html; done.hidden = false;
   if (CONFIG.returnUrl) {
     const back = document.createElement("a"); back.href = CONFIG.returnUrl;
-    back.textContent = "Back to connections"; done.appendChild(back);
+    back.textContent = "Back to Connections"; back.className = "button"; done.appendChild(back);
   }
   const heading = done.querySelector("h1");
   if (heading) { heading.tabIndex = -1; heading.focus(); }
 }
-let viewer = false, over = false;
+let viewer = false, over = false, failures = 0, pollTimer, cancellationUncertain = false;
+function recover(error) {
+  if (over) return true;
+  if ([401, 403].includes(error.status)) {
+    finish('<h1>Sign in to Connections again</h1><p>Your browser sign-in expired or no longer has access. '
+           + 'Return to your connections to check the sign-in status.</p>');
+    return true;
+  }
+  if ([404, 410].includes(error.status)) {
+    finish(CONFIG.outcomes.expired); return true;
+  }
+  return false;
+}
+function pause(message, cancellation = false) {
+  if (over || cancellationUncertain && !cancellation) return;
+  cancellationUncertain = cancellation;
+  const area = $("recovery"); area.replaceChildren(document.createTextNode(message + ' ')); area.hidden = false;
+  const retry = document.createElement('button'); retry.textContent = 'Check sign-in status';
+  retry.addEventListener('click', () => {
+    failures = 0; cancellationUncertain = false; area.hidden = true; clearTimeout(pollTimer); poll();
+  });
+  area.appendChild(retry);
+}
 function show(s) {
+  if (over) return true;
+  if (!cancellationUncertain) $("recovery").hidden = true;
   const ended = outcome(s);
   if (ended !== null) {
-    over = true;
     finish(ended);
     return true;
+  }
+  if (s.state !== 'ready' && s.state !== 'new') {
+    $("intro").hidden = true;
+    document.querySelector("header .bar").hidden = false;
   }
   if (s.host) $("host").textContent = (secure && secure.test(s.host) ? "🔒 " : "") + s.host;
   $("status").textContent = CONFIG.text[s.state] || "";
@@ -214,11 +278,21 @@ function show(s) {
   return false;
 }
 async function poll() {
+  clearTimeout(pollTimer);
+  if (over) return;
   try {
-    const r = await fetch(`${base}/state`, {cache: "no-store"});
-    if (show(await r.json())) return;
-  } catch (e) { $("status").textContent = "Connection interrupted. Reconnecting…"; }
-  setTimeout(poll, 1500);
+    if (show(await request('state'))) return;
+    failures = 0;
+  } catch (error) {
+    if (recover(error)) return;
+    failures += 1;
+    $("status").textContent = 'We could not check your progress. Trying again…';
+    if (failures >= 3) {
+      pause('We cannot check your progress right now. Your sign-in may still be running.');
+      return;
+    }
+  }
+  pollTimer = setTimeout(poll, Math.min(1500 * 2 ** failures, 6000));
 }
 async function begin() {
   if (window.signinBeforeStart && !(await window.signinBeforeStart())) return;
@@ -228,27 +302,37 @@ async function begin() {
   const layout = Math.min(innerWidth, screen.width) < 700 ? "phone" : "desktop";
   try {
     if (show(await post("start", {layout}))) return;
-  } catch (e) {}
+  } catch (error) { if (recover(error)) return; }
   poll();
 }
 $("go").addEventListener("click", begin);
 const cancel = document.createElement("button");
-cancel.textContent = "Cancel";
+cancel.textContent = "Cancel sign-in";
 cancel.hidden = true;
 document.querySelector("header").appendChild(cancel);
 cancel.addEventListener("click", async () => {
-  await fetch(`${base}/cancel`, {method: "POST"});
-  show(await (await fetch(`${base}/state`, {cache: "no-store"})).json());
+  cancel.disabled = true;
+  try {
+    const result = await request('cancel', {method: 'POST'}, true);
+    if (over || (result && show(result))) return;
+    const state = await request('state');
+    if (!over && !show(state)) poll();
+  } catch (error) {
+    if (!over && !recover(error))
+      pause('We could not confirm the cancellation. Check the sign-in status before trying again.', true);
+  } finally { cancel.disabled = false; }
 });
 if (CONFIG.reconnect) {
   (async () => {
-    const s = await (await fetch(`${base}/state`, {cache: "no-store"})).json();
+    const s = await request('state');
     if (s.state !== "ready") {
       $("intro").hidden = true;
       document.querySelector("header .bar").hidden = false;
       if (!show(s)) poll();
     } else if (CONFIG.autoStart) begin();
-  })().catch(() => {});
+  })().catch(error => {
+    if (!recover(error)) pause('We could not load your sign-in status. Check its status before starting again.');
+  });
   setInterval(() => {
     cancel.hidden = over || $("intro").hidden === false || $("status").textContent === CONFIG.text.saving;
   }, 250);

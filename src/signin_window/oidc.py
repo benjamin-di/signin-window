@@ -26,6 +26,8 @@ from starlette.requests import HTTPConnection, Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
+from .connections import SCRIPT_SOURCE, page
+
 _SID = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _CLAIM = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 _MAX_AGE = 900
@@ -240,8 +242,13 @@ class BrowserAuth:
             )
         except Exception:
             request.session.clear()
-            return Response(
-                "Identity provider could not be verified. Return to connections and try again.", status_code=503
+            return HTMLResponse(
+                page(
+                    "Sign-in is unavailable",
+                    "<p>We could not reach a trusted sign-in service. Try signing in to Connections again.</p>"
+                    f'<p><a class="button" href="{html.escape(self.home, quote=True)}">Back to Connections</a></p>',
+                ),
+                status_code=503,
             )
 
     async def callback(self, request: Request):
@@ -299,7 +306,15 @@ class BrowserAuth:
             return RedirectResponse(destination, status_code=303)
         except Exception:
             request.session.clear()
-            return Response("Sign-in could not be verified. Return to connections and try again.", status_code=403)
+            return HTMLResponse(
+                page(
+                    "We could not confirm your sign-in",
+                    "<p>Sign in to Connections again. If this keeps happening, ask your administrator to check "
+                    "that this account has access.</p>"
+                    f'<p><a class="button" href="{html.escape(self.home, quote=True)}">Back to Connections</a></p>',
+                ),
+                status_code=403,
+            )
 
     async def logout(self, request: Request):
         if not self.origin_ok(request):
@@ -307,9 +322,12 @@ class BrowserAuth:
         request.session.clear()
         # Not the home page: a host that sends signed-out visitors straight to sign-in would sign them back in.
         return HTMLResponse(
-            "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<title>Signed out</title><p>You are signed out of this page.</p>"
-            f'<p><a href="{html.escape(self.prefix)}/connections/login">Sign in again</a></p>'
+            page(
+                "You are signed out of Connections",
+                "<p>Signing out does not disconnect your saved accounts.</p>"
+                f'<p><a class="button" href="{html.escape(self.prefix)}/connections/login">'
+                "Sign in to Connections</a></p>",
+            )
         )
 
     def routes(self, prefix="/connections"):
@@ -363,8 +381,10 @@ class BrowserAuth:
                             headers.append(
                                 (
                                     b"content-security-policy",
-                                    b"default-src 'self'; script-src 'none'; style-src 'self' "
-                                    b"'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+                                    (
+                                        f"default-src 'self'; script-src {SCRIPT_SOURCE}; style-src 'self' "
+                                        "'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+                                    ).encode(),
                                 )
                             )
                 await send(message)

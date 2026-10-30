@@ -11,7 +11,8 @@ commit messages alike.
 
 `make bootstrap`, then `make check`: ruff, the format check and pytest. The paste add-on's browser test runs with
 `uv sync --group browser`, `uv run playwright install chromium` and `uv run pytest tests/test_paste_dom.py` (CI runs
-it in a job of its own). Documentation-only changes need `git diff --check` and link checks.
+it in the `test` job after `make check`; the `e2e` job runs in the prebuilt `signin-window-e2e` image).
+Documentation-only changes need `git diff --check` and link checks.
 
 ## Boundaries
 

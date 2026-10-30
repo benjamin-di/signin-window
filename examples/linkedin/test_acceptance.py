@@ -162,7 +162,7 @@ def test_cancel_restores_the_previous_generation_and_releases_the_profile(host):
         first.close()
         second = browser.new_page()
         open_view(second, link(origin))
-        second.get_by_role("button", name="Cancel", exact=True).click()
+        second.get_by_role("button", name="Cancel sign-in", exact=True).click()
         wait_for(lambda: all(not w.procs for w in app.state.windows._windows.values()), seconds=45)
         browser.close()
     assert load_source_state(profile).login_generation == generation

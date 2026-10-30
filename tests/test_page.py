@@ -35,6 +35,12 @@ def test_the_expired_page_has_no_script():
     assert "This link has expired" in page and "<script" not in page
 
 
+def test_expired_hosted_link_returns_to_connections_without_starting_an_attempt():
+    page = render(PageText(return_url="/application/connections/"), None)
+    assert 'href="/application/connections/"' in page and "Back to Connections" in page
+    assert "<script" not in page and "<form" not in page
+
+
 def test_extra_script_comes_before_the_page_script():
     page = render(PageText(script_extra="window.signinBeforeStart = async () => true;"), "jane")
     assert page.index("window.signinBeforeStart = async") < page.index("const CONFIG")

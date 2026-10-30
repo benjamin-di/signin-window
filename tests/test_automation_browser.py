@@ -9,6 +9,8 @@ pytest.importorskip("patchright.sync_api")
 if not shutil.which("Xvfb"):
     pytest.skip("native automation needs Xvfb", allow_module_level=True)
 
+from patchright.sync_api import expect
+
 from signin_window.automation.runtime import open_browser, virtual_display
 
 
@@ -35,7 +37,8 @@ def test_profile_reopens_after_owned_browser_cleanup(tmp_path):
                 )
             assert browser.page.locator("#password").input_value() == ""
             browser.native_click(("#submit",))
-            assert browser.page.locator("#submit").inner_text() == "accepted"
+            # The native click reaches the page asynchronously; wait for its handler instead of reading at once.
+            expect(browser.page.locator("#submit")).to_have_text("accepted", timeout=5000)
             browser.context.add_cookies(
                 [
                     {
