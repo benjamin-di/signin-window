@@ -426,7 +426,9 @@ actually observed. A completed identity callback never proves application access
 checks the top-level origin before and after resolving each field and binds
 application to an exact frame/document. `automation.secrets.OpSecretReader` uses
 only the identity supplied by its caller; a failed read never obtains a different
-identity. No human window API imports these modules or reads credentials.
+identity. Without an explicit token it uses the environment's: a 1Password
+Connect server (`OP_CONNECT_HOST` and `OP_CONNECT_TOKEN`, which `op` prefers)
+or else `OP_SERVICE_ACCOUNT_TOKEN`, and passes `op` only that identity. No human window API imports these modules or reads credentials.
 
 For a maintenance process that owns a persistent Chromium profile, install
 `signin-window[chromium]` and run `patchright install --with-deps chromium`.

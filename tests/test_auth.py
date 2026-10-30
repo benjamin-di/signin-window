@@ -139,3 +139,34 @@ def test_explicit_empty_secret_identity_never_uses_ambient_authority(monkeypatch
     assert not reader.has_token
     with pytest.raises(SecretResolutionError, match="unavailable"):
         reader.read("op://Example/Item/password")
+
+
+def test_ambient_connect_identity_is_passed_to_op_alone(monkeypatch):
+    calls = []
+
+    def resolved(args, **kwargs):
+        calls.append(kwargs)
+        return type("Completed", (), {"stdout": "synthetic-value\n"})()
+
+    monkeypatch.setattr("signin_window.automation.secrets.subprocess.run", resolved)
+    monkeypatch.delenv("OP_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "synthetic-authority")
+    monkeypatch.setenv("OP_CONNECT_HOST", "http://connect.example.com:8080")
+    monkeypatch.setenv("OP_CONNECT_TOKEN", "synthetic-connect")
+    reader = OpSecretReader()
+    assert reader.has_token
+    assert reader.read("op://Example/Item/password") == "synthetic-value"
+    assert calls[0]["env"] == {
+        "OP_CONNECT_HOST": "http://connect.example.com:8080",
+        "OP_CONNECT_TOKEN": "synthetic-connect",
+        "PATH": calls[0]["env"]["PATH"],
+    }
+
+    # An explicit service-account token is the only identity, never the ambient Connect server.
+    OpSecretReader(service_account_token="synthetic-explicit").read("op://Example/Item/password")
+    assert set(calls[1]["env"]) == {"OP_SERVICE_ACCOUNT_TOKEN", "PATH"}
+
+    # A Connect host without a token is no identity of its own.
+    monkeypatch.delenv("OP_CONNECT_TOKEN")
+    OpSecretReader().read("op://Example/Item/password")
+    assert set(calls[2]["env"]) == {"OP_SERVICE_ACCOUNT_TOKEN", "PATH"}

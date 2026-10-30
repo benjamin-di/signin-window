@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The 1Password reader accepts a 1Password Connect server from the
+  environment (`OP_CONNECT_HOST` and `OP_CONNECT_TOKEN`), which takes
+  precedence over `OP_SERVICE_ACCOUNT_TOKEN` as in `op` and is passed to `op`
+  alone. An explicit `service_account_token` remains the only identity.
 - The 1Password reader now passes `OP_CONFIG_DIR` to `op`. Without it, `op`
   failed to create its configuration directory in read-only containers, so
   every credential read failed.
