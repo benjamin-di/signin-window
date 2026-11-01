@@ -1,6 +1,38 @@
 # Changelog
 
-## Unreleased
+## [0.5.1] - 2026-11-01
+
+### Fixed
+
+- Sign private-key client assertions for the configured issuer with a fresh assertion identifier for every exchange, refresh and revocation.
+- Keep the unsafe-activity-link fixture aligned with the reviewed synthetic credential fixture so the public export can publish the optional delegation and connection controls (#2).
+
+### Upgrade
+
+- Action required: none.
+- Rollback: compatible with 0.5.0; use 0.5.1 for public package installation.
+
+## [0.5.0] - 2026-11-01
+
+_Yanked: public package publication was blocked by a synthetic test fixture; use 0.5.1._
+
+_Releases 0.4.3–0.4.17 were not recorded by version here; see their tags._
+
+### Added
+
+- Add the optional `delegation` extra with `OAuthConfig` and `OAuthManager` for encrypted per-owner grants, PKCE connection tickets, serialized refresh, durable disconnect and private-key client authentication (8fe8348).
+- Add `DirectOAuthManager` for single-consent entry before the owner is known, with signed identity validation, resource owner proof and durable reconnection barriers (214039f).
+- Add optional `ConnectionControls` and `controls_panel` for pause, granted scopes and recent activity on hosted Connections pages (1ff25e5).
+- Add explicit `callback_path`, `owner_header` and `cookie_name` configuration while preserving existing OAuth defaults (fdf0f41).
+
+### Upgrade
+
+- Action required: none for existing consumers; install `signin-window[delegation]` and configure provider, resource, private storage and application identity to adopt the new APIs.
+- Rollback: compatible with 0.4.17 for existing APIs; consumers adopting delegation or controls must retain 0.5.0 until their integration is removed.
+
+[0.5.0]: https://github.com/benjamin-di/signin-window/releases/tag/v0.5.0
+
+## Prior unversioned release notes (through 0.4.17)
 
 - The 1Password reader accepts a 1Password Connect server from the
   environment (`OP_CONNECT_HOST` and `OP_CONNECT_TOKEN`), which takes
@@ -70,3 +102,5 @@
   native X11 pointer input and safe Chromium profile ownership.
 - Require explicit planners in shared challenge mechanics. Applications retain
   identity verification, entitlement checks, state formats and maintenance policy.
+
+[0.5.1]: https://github.com/benjamin-di/signin-window/releases/tag/v0.5.1

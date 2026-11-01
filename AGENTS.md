@@ -20,8 +20,10 @@ Documentation-only changes need `git diff --check` and link checks.
   click, type or fill a page. Optional automation has separate contracts and must receive its planner explicitly.
   Only `client.py` opens
   connections to the login service. Optional `oidc.py` uses Authlib for the configured
-  identity provider only; applications own identity-to-account mapping and all account
-  controls. Human window/relay imports never require the OIDC extra. The VNC server
+  identity provider only; optional `delegation.py` adds consented grant storage and
+  requests only that provider and the configured resource for owner proof. Applications
+  own identity-to-account mapping and all account controls. Human window/relay imports
+  never require either identity extra. The VNC server
   listens on loopback; `static/paste.js` logs and keeps nothing.
   Changing any of these is a design change: argue it in the pull request.
 - Session helpers share durable accounting and warm-first mechanics. Applications

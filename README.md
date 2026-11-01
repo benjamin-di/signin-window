@@ -495,6 +495,35 @@ Use `disconnect_confirmation(form, service, effect)` to put an existing form
 behind an expandable explanation, and `timestamp(value, label="Last checked")`
 for readable UTC times. These helpers do not perform or authorize actions.
 
+For optional pause and activity controls, use a separate private root for each
+application and authenticated owner:
+
+```python
+from pathlib import Path
+from signin_window.connection_state import ConnectionActivity, ConnectionControls
+from signin_window.connections import controls_panel
+
+controls = ConnectionControls(Path("/private/example-owner/example-app"))
+# The application's authenticated, CSRF-protected pause action calls this.
+controls.set_paused(False)  # True pauses; neither action disconnects OAuth.
+# Every worker checks just before starting, and again before sensitive effects.
+controls.require_active()  # raises ConnectionPaused; unreadable state fails closed
+controls.record_activity(ConnectionActivity("Prepared a draft", url="https://app.example/drafts/42"))
+# Add the returned panel to page(..., body=...) only when opting into controls.
+panel = controls_panel(controls.snapshot(), granted_scopes=["drafts:write"], pause_form=trusted_pause_form)
+```
+
+`ConnectionControls` uses process-safe locks and atomic private writes, keeps at
+most 20 activity entries by default (configurable from 1 to 40), and preserves
+pause across restarts and activity updates. Missing state starts unpaused; this
+is not a connection or entitlement check. Applications still verify consent,
+owner identity and authorization before every run. Keep tokens, raw requests and
+private content out of activity summaries. Scopes come from the application's
+current grant; the helper does not infer them. `controls_panel` escapes all
+scope/activity text and allows only root-relative or HTTPS result links; only
+`pause_form` is trusted markup. Applications own its action, CSRF and stale-form
+checks. Existing pages have no new controls unless they use this helper.
+
 With `refresh=True`, a fixed script fetches the current HTML page while work is
 in progress. It preserves focus and defers updates around edited controls, open
 confirmations and text selections. Network or authentication failures expose a
@@ -578,3 +607,98 @@ Applications retain credential publication, provider-account verification and
 durable disconnect controls. Keep those controls independent of browser sessions
 and check them in actual credential writers and maintenance workers, including
 after restart or removal of the browser UI configuration.
+
+
+## Optional delegated OAuth grants
+
+`pip install 'signin-window[delegation]'` adds `signin_window.delegation`, a
+confidential-client, owner-scoped grant manager independent of browser identity
+sessions. Applications select the owner from a trusted identity; a model,
+message, URL parameter or forwarded header must never select that owner.
+
+```python
+from pathlib import Path
+from signin_window.delegation import OAuthConfig, OAuthManager, load_client_key
+
+manager = OAuthManager(OAuthConfig(
+    issuer="https://identity.example.com",
+    client_id="example-assistant",
+    client_secret="",  # private_key_jwt uses the existing private key instead
+    client_private_key=load_client_key(Path("/private/client")),
+    resource="https://tools.example.com/assistant/mcp",
+    redirect_uri="https://assistant.example.com/oauth/callback",
+    public_base_url="https://assistant.example.com",
+    scope="assistant:use",
+    store_key=encryption_key,  # application-provisioned 32 bytes; never publish
+    owner_header="X-Example-Person",
+    cookie_name="__Secure-example-assistant-oauth",
+), Path("/private/grants"))
+```
+
+Provision a client key once with `create_client_key(directory)`: it writes an
+owned 0600 RSA private key in an owned 0700 directory and returns only its public
+JWK for provider enrollment. It refuses an existing key. `load_client_key` reads
+an already provisioned key and fails if missing; never call provisioning as a
+normal deployment hook or automatically re-enroll a revoked client.
+`public_client_jwk(private_key)` returns only public fields and a stable
+thumbprint `kid`. Alternatively, configure `client_secret` without a private key
+for providers using `client_secret_basic`. Private-key assertions use the
+configured issuer as their audience and a fresh `jti` for each exchange, refresh
+and revocation; register that issuer audience with the provider.
+Discovery endpoints must share the
+configured HTTPS issuer origin; transport ignores proxy environment settings
+and never follows redirects. All token and revocation requests authenticate the
+client. Code grants use S256 PKCE, nonce and single-use browser-bound state.
+
+`connection_url(owner)` makes a ten-minute reconnect ticket. `open_browser`,
+`browser_action` and `finish_callback` implement the hosted flow; safe GET link
+previews do not consume a ticket, and a cookie-bound CSRF-checked POST claims it
+once. `register_routes(server, manager)` supports servers exposing
+`custom_route(path, methods=...)`; it registers `/oauth/connect/{ticket}`,
+`/oauth/action` and `/oauth/callback`. Mount these routes at the configured public
+base path. Register exactly `redirect_uri` with the provider. Default pages use
+generic connection text; applications may supply their own page layer using the
+same manager methods.
+
+For an application whose owner is unknown before login,
+`signin_window.direct.DirectOAuthManager` uses the same confidential client,
+consent, grant store and refresh path. Set an explicit `callback_path` (for
+example `/connections/callback`) matching `redirect_uri`. Configure an immutable
+signed `owner_claim` and an application admission floor in `required_groups`.
+`new_browser()` returns an opaque cookie and CSRF token; `authorize(cookie,
+csrf)` starts consent, and `finish_direct_callback(cookie, parameters)` returns
+a rotated authenticated cookie and owner session. The owner comes only from
+signed claims plus the configured resource's owner proof. Forms never choose it.
+
+`browser_session(cookie)` validates the saved generation. `current_identity(owner)`
+rechecks current signed claims and resource admission. Before a final local
+control write, use `management_session(cookie, csrf)` as a context manager to
+serialize the write with reconnect and disconnect; perform network admission
+checks before entering and never call token/refresh methods while holding it.
+`disconnect_browser(cookie, csrf)` commits revocation locally before attempting
+provider revocation. Durable encrypted sequence barriers prevent an older
+ownerless consent flow from installing after a disconnect. Applications own
+HTTP routes, secure cookies, origin checks, scopes and channel controls.
+
+A successful callback validates signed access and ID tokens, issuer, subject,
+resource audience, scope, expiry and nonce, then proves the application owner
+through an MCP `initialize` on the fixed resource. The resource must return that
+owner in `owner_header` and must not create a server session. Existing subject
+bindings cannot be replaced through reconnect. No userinfo or arbitrary provider
+URL is accepted. The grant store is private application state, not browser state;
+it encrypts tokens and capabilities with associated data binding owner, issuer,
+client, resource, generation and status.
+
+`connected(owner)` and `revision(owner)` are nonblocking committed-state reads.
+Run blocking OAuth operations in a worker thread. `access_token(owner,
+minimum_ttl=0)` refreshes under a per-owner process lock. It commits uncertainty
+before sending a one-use refresh; a timeout, crash or failed rotated-token write
+never reuses the old token. An uncertain refresh requires reconnect and bumps the
+generation when failure is observed. A successful refresh preserves it. Callers
+must capture `revision` before work and recheck it before publishing a late
+result; connection and application pause/access policy must also remain valid.
+`disconnect(owner)` commits a durable disconnected generation before attempting
+provider revocation. Provider failure cannot undo that local barrier. Fixed
+`OAuthError.code` values contain no provider diagnostics or secrets. The store's
+SQLite format retains version-one authenticated records for compatible extraction
+from embedded implementations; applications own any migration and rollback.

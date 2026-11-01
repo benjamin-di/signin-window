@@ -10,7 +10,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+from collections.abc import Sequence
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
+
+from .connection_state import ConnectionStatus
 
 _SCRIPT = """(() => {
   const content = document.getElementById('connection-content');
@@ -200,3 +204,63 @@ def timestamp(value: str | float | None, *, label: str = "Last checked") -> str:
         return f'<p class="muted">{html.escape(label)}: not recorded</p>'
     shown = f"{date.day} {date:%b %Y} at {date:%H:%M} UTC"
     return f'<p class="muted">{html.escape(label)}: <time datetime="{date.isoformat()}">{shown}</time></p>'
+
+
+def _activity_url(value: str | None) -> str | None:
+    if not value or any(ord(char) <= 32 or ord(char) == 127 or char == "\\" for char in value):
+        return None
+    try:
+        parsed = urlsplit(value)
+        if value.startswith("/") and not value.startswith("//") and not parsed.scheme and not parsed.netloc:
+            return value
+        if parsed.scheme == "https" and parsed.hostname and parsed.username is None and parsed.password is None:
+            _ = parsed.port  # Validate malformed/out-of-range ports before returning a link.
+            return value
+    except ValueError:
+        pass
+    return None
+
+
+def controls_panel(
+    status: ConnectionStatus, *, granted_scopes: Sequence[str] | None = None, pause_form: str = ""
+) -> str:
+    """Opt-in shared controls; only ``pause_form`` is trusted application HTML.
+
+    The application supplies scopes from its current grant and an authenticated,
+    CSRF-protected pause/resume form. Rendering neither grants access nor starts
+    work. Activity URLs allow root-relative paths or HTTPS, never executable URLs.
+    """
+    parts = [
+        '<section class="panel" aria-label="Connection controls">',
+        "<h2>Connection controls</h2>",
+        '<p role="status">' + ("Paused" if status.paused else "Not paused") + "</p>",
+        "<p>Pausing stops application work without disconnecting your saved connection.</p>",
+        pause_form,
+    ]
+    if granted_scopes is not None:
+        parts.append("<h3>Granted access</h3>")
+        parts.append(
+            "<ul>" + "".join(f"<li><code>{html.escape(scope)}</code></li>" for scope in granted_scopes) + "</ul>"
+            if granted_scopes
+            else "<p>No scopes granted.</p>"
+        )
+    parts.append("<h3>Recent activity</h3>")
+    if status.activity:
+        parts.append("<ol>")
+        for item in status.activity:
+            summary = html.escape(item.summary)
+            target = _activity_url(item.url)
+            if target:
+                summary = f'<a href="{html.escape(target, quote=True)}">{summary}</a>'
+            parts.extend(
+                [
+                    f"<li><p>{summary}</p><p>{html.escape(item.status)}</p>",
+                    timestamp(item.occurred_at, label="Recorded"),
+                    "</li>",
+                ]
+            )
+        parts.append("</ol>")
+    else:
+        parts.append("<p>No activity recorded.</p>")
+    parts.append("</section>")
+    return "".join(parts)

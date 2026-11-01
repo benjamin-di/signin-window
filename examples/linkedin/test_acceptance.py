@@ -17,6 +17,7 @@ from linkedin_mcp_server.config import AppConfig
 from linkedin_mcp_server.profile_lease import get_profile_lease
 from linkedin_mcp_server.session_state import load_source_state, portable_cookie_path
 from playwright.sync_api import sync_playwright
+from synthetic import SIGNIN_COLOR
 
 from signin_window.service import Windows
 
@@ -101,9 +102,40 @@ def open_view(page, url, *, reload=False):
 
 
 def complete(page, frame):
-    frame.locator("canvas").click(position={"x": 300, "y": 300})
-    page.keyboard.press("Tab")
-    page.keyboard.press("Enter")
+    # noVNC's connection event precedes its first framebuffer. Wait for the
+    # visible synthetic button, then send a real pointer click through noVNC.
+    # Neither this observation nor the click touches the remote DOM or cookies.
+    canvas = frame.locator("canvas")
+    position = None
+
+    def painted():
+        nonlocal position
+        position = canvas.evaluate(
+            """(canvas, color) => {
+              const {width, height} = canvas;
+              if (!width || !height) return null;
+              const pixels = canvas.getContext('2d').getImageData(0, 0, width, height).data;
+              let left = width, right = -1, top = height, bottom = -1;
+              for (let y = 0; y < height; y += 4) {
+                for (let x = 0; x < width; x += 4) {
+                  const offset = (y * width + x) * 4;
+                  if (color.every((channel, i) => Math.abs(pixels[offset + i] - channel) < 12)) {
+                    left = Math.min(left, x); right = Math.max(right, x);
+                    top = Math.min(top, y); bottom = Math.max(bottom, y);
+                  }
+                }
+              }
+              if (right - left < 80 || bottom - top < 30) return null;
+              const bounds = canvas.getBoundingClientRect();
+              return {x: (left + right) / 2 * bounds.width / width,
+                      y: (top + bottom) / 2 * bounds.height / height};
+            }""",
+            SIGNIN_COLOR,
+        )
+        return position is not None
+
+    wait_for(painted)
+    canvas.click(position=position)
 
 
 def current(app):
@@ -188,3 +220,33 @@ def test_export_failure_cannot_publish_a_connected_session(host):
     lease = get_profile_lease(profile)
     assert asyncio.run(lease.acquire(timeout=1))
     lease.release()
+
+
+def test_complete_waits_for_the_initial_framebuffer_and_clicks_its_visible_button():
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, executable_path=os.environ["LINKEDIN_TEST_CHROME"])
+        page = browser.new_page()
+        page.set_content('<iframe srcdoc="<canvas width=640 height=480></canvas>"></iframe>')
+        frame = page.frame_locator("iframe")
+        canvas = frame.locator("canvas")
+        # A connected viewer initially has a blank canvas. The test must wait
+        # for the actual remote surface and target its button rather than guess.
+        canvas.evaluate(
+            """(canvas, color) => {
+              canvas.onclick = event => {
+                const box = canvas.getBoundingClientRect();
+                const x = (event.clientX - box.left) * canvas.width / box.width;
+                const y = (event.clientY - box.top) * canvas.height / box.height;
+                canvas.dataset.clicked = String(x >= 160 && x < 520 && y >= 80 && y < 200);
+              };
+              setTimeout(() => {
+                const context = canvas.getContext('2d');
+                context.fillStyle = `rgb(${color.join(',')})`;
+                context.fillRect(160, 80, 360, 120);
+              }, 250);
+            }""",
+            SIGNIN_COLOR,
+        )
+        complete(page, frame)
+        assert canvas.get_attribute("data-clicked") == "true"
+        browser.close()

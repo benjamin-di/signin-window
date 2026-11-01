@@ -5,7 +5,10 @@ from urllib.parse import urlsplit
 from linkedin_mcp_server import setup
 from linkedin_mcp_server.core import BrowserManager
 
+SIGNIN_COLOR = (18, 193, 137)
 SIGNIN = """<!doctype html><title>Synthetic sign-in</title>
+<style>button {position: fixed; left: 32px; top: 32px; width: 360px; height: 120px;
+ background: rgb(18, 193, 137); color: white; border: 0; font-size: 22px;}</style>
 <button autofocus onclick="document.cookie='li_at=synthetic-cookie; path=/; SameSite=Lax';
  location.href='/feed/'">Complete synthetic sign-in</button>"""
 FEED = "<!doctype html><title>Synthetic feed</title><h1>Synthetic connected account</h1>"

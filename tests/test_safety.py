@@ -10,7 +10,7 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parents[1] / "src" / "signin_window"
 PYTHON = sorted(p for p in SRC.rglob("*.py") if "automation" not in p.relative_to(SRC).parts)
 # Modules that open connections (urllib.parse, say, only parses).
-NETWORK = ("urllib.request", "http.client", "httpx", "requests", "aiohttp", "socket", "websockets")
+NETWORK = ("urllib.request", "http.client", "httpx", "httpx2", "requests", "aiohttp", "socket", "websockets")
 
 
 def imports(path: Path) -> set[str]:
@@ -49,6 +49,8 @@ def test_only_the_client_reaches_the_network():
         found = network(imports(path))
         if path.name == "client.py":
             assert found <= {"urllib.request", "websockets.asyncio.client", "websockets.exceptions"}, found
+        elif path.name == "delegation.py":  # optional fixed issuer/resource OAuth protocol requests
+            assert found <= {"httpx2"}, found
         elif path.name == "service.py":  # its own VNC servers' ports on loopback
             assert found <= {"socket"}, found
             hosts = re.findall(r"\.(?:bind|connect_ex|open_connection)\(\(?([^,)]*)", path.read_text())
@@ -66,10 +68,10 @@ def test_the_paste_add_on_types_without_logging_or_keeping_the_text():
     assert "stopPropagation()" in keydown and "preventDefault()" not in keydown  # the browser must still paste
 
 
-def test_only_optional_oidc_module_imports_identity_protocol_client():
+def test_only_optional_identity_modules_import_identity_protocol_client():
     for path in PYTHON:
         identity = {name for name in imports(path) if name.startswith("authlib")}
-        assert not identity or path.name == "oidc.py", (path.name, identity)
+        assert not identity or path.name in {"oidc.py", "delegation.py"}, (path.name, identity)
     assert "authlib.integrations.starlette_client" in imports(SRC / "oidc.py")
 
 
