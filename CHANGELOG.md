@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.6.0] - 2026-11-02
+
+### Added
+
+- Add `BrowserAuth.fresh`, `require_fresh`, `step_up_url` and `refused`, so applications start fresh-authentication step-up by navigation and explain refused POSTs instead of redirecting a submitted form (#4).
+
+### Fixed
+
+- Keep a verified browser session while a sign-in or step-up is pending; only a successful callback replaces it, and a refused provider identity ends it. Previously an abandoned, cancelled or browser-blocked step-up signed the person out (#4).
+- Let a sign-in started near the end of a browser session finish within its own ten-minute window (#4).
+
+### Upgrade
+
+- Action required: applications that answer a sensitive POST with a redirect to `/connections/login?reauth=1` must return `auth.require_fresh(request, ...)` instead. The `form-action 'self'` page policy cancels the hop to the provider after a submitted form. Replace empty 403 responses for sessionless or cross-origin POSTs with `auth.refused(request)`. A sign-in already in progress at upgrade is refused once at its callback; sign in again.
+- Rollback: compatible with 0.5.1 for applications that do not call the new methods.
+
+[0.6.0]: https://github.com/benjamin-di/signin-window/releases/tag/v0.6.0
+
 ## [0.5.1] - 2026-11-01
 
 ### Fixed

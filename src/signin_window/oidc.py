@@ -19,7 +19,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from authlib.integrations.starlette_client import OAuth
 from starlette.requests import HTTPConnection, Request
@@ -28,11 +28,32 @@ from starlette.routing import Route
 
 from .connections import SCRIPT_SOURCE, page
 
+#: Browser safety headers of every Connections page; an application's own complete policy takes precedence.
+PAGE_HEADERS = {
+    "cache-control": "no-store",
+    "referrer-policy": "strict-origin",
+    "x-frame-options": "DENY",
+    "x-content-type-options": "nosniff",
+    "content-security-policy": (
+        f"default-src 'self'; script-src {SCRIPT_SOURCE}; style-src 'self' 'unsafe-inline'; "
+        "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    ),
+}
 _SID = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _CLAIM = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 _MAX_AGE = 900
+#: How long a started sign-in may take at the identity provider before its callback is refused.
+_PENDING_SECONDS = 600
 #: A sign-in whose verified ``auth_time`` is at most this old already counts as a fresh confirmation.
 RECENT_AUTHENTICATION_SECONDS = 300
+
+
+def _drop_pending(session):
+    """Forget an unfinished sign-in attempt without touching a verified identity."""
+    for key in [
+        key for key in session if key in ("next", "reauth_started", "pending_expires") or key.startswith("_state_")
+    ]:
+        del session[key]
 
 
 @dataclass(frozen=True)
@@ -126,6 +147,10 @@ class BrowserStore:
         if not _SID.fullmatch(sid):
             raise ValueError("Invalid browser session reference")
         expires = min(self.clock() + _MAX_AGE, float(data.get("expires", self.clock() + _MAX_AGE)))
+        # A sign-in attempt kept beside an identity outlives that identity's remaining minutes, never _MAX_AGE.
+        pending = data.get("pending_expires")
+        if isinstance(pending, int | float) and not isinstance(pending, bool) and math.isfinite(pending):
+            expires = min(self.clock() + _MAX_AGE, max(expires, pending))
         encoded = json.dumps(data)
         if not math.isfinite(expires) or len(encoded) > 65536:
             raise ValueError("Browser session exceeds its bounds")
@@ -208,6 +233,81 @@ class BrowserAuth:
     def origin_ok(self, request: HTTPConnection):
         return request.headers.getlist("origin") == [self.origin]
 
+    def fresh(self, request: HTTPConnection, max_age: float = RECENT_AUTHENTICATION_SECONDS) -> bool:
+        """Whether the verified identity confirmed its sign-in at the provider at most ``max_age`` seconds ago."""
+        identity = self.identity(request)
+        when = identity.get("reauthenticated_at") if identity else None
+        return (
+            isinstance(when, int | float)
+            and not isinstance(when, bool)
+            and math.isfinite(when)
+            and 0 <= self.store.clock() - when <= max_age
+        )
+
+    def step_up_url(self, next: str | None = None) -> str:
+        """The local link that asks the provider to confirm the person again, then returns to a safe page.
+
+        Start step-up only by navigating to this link. Never redirect a submitted form here: the page policy
+        (``form-action``) applies to every redirect after a submission, so a browser cancels the hop to the
+        provider.
+        """
+        destination = self._destination(next or self.home)
+        url = self.prefix + "/connections/login?reauth=1"
+        return url if destination == self.home else url + "&next=" + quote(destination, safe="/")
+
+    def require_fresh(
+        self,
+        request: HTTPConnection,
+        *,
+        max_age: float = RECENT_AUTHENTICATION_SECONDS,
+        next: str | None = None,
+        action: str = "continue",
+    ) -> Response | None:
+        """``None`` when the sign-in is fresh enough, else a page whose link starts step-up.
+
+        Call it at the start of a sensitive POST handler and return the page as is. The action did not
+        happen; after confirming, the person returns to ``next`` (default: the connections home) and repeats it.
+        """
+        if self.fresh(request, max_age):
+            return None
+        return HTMLResponse(
+            page(
+                "Confirm it's you",
+                f"<p>To {html.escape(action)}, confirm your sign-in again. Nothing has changed yet.</p>"
+                f'<p><a class="button" href="{html.escape(self.step_up_url(next), quote=True)}">'
+                "Confirm and continue</a></p>"
+                f'<p><a href="{html.escape(self.home, quote=True)}">Back to Connections</a></p>',
+                login_url=self.prefix + "/connections/login",
+            ),
+            status_code=403,
+            headers=PAGE_HEADERS,
+        )
+
+    def refused(self, request: HTTPConnection) -> Response:
+        """An explained refusal: 401 for a POST without a verified session, else 403 (another origin, or an
+        identity the application does not allow to make the change).
+
+        It never redirects: a redirect after a submitted form that reaches the provider is cancelled by the
+        page policy, which leaves only an empty error.
+        """
+        login = self.prefix + "/connections/login"
+        status = 403
+        if self.identity(request) is None:
+            status = 401
+            title = "Your sign-in has ended"
+            body = (
+                "<p>Nothing was changed. Sign in to Connections again, then repeat the action.</p>"
+                f'<p><a class="button" href="{html.escape(login, quote=True)}">Sign in to Connections</a></p>'
+            )
+        else:
+            title = "Request refused"
+            body = (
+                "<p>Nothing was changed. The request did not come from this Connections page, or this sign-in "
+                "cannot make this change. Return to Connections and try again.</p>"
+                f'<p><a class="button" href="{html.escape(self.home, quote=True)}">Back to Connections</a></p>'
+            )
+        return HTMLResponse(page(title, body, login_url=login), status_code=status, headers=PAGE_HEADERS)
+
     def _destination(self, value):
         if value == self.home or re.fullmatch(re.escape(self.prefix + "/connect/") + r"[A-Za-z0-9_-]{32,64}", value):
             return value
@@ -215,8 +315,14 @@ class BrowserAuth:
 
     async def login(self, request: Request):
         destination = self._destination(request.query_params.get("next", self.home))
-        request.session.clear()
+        # Starting a sign-in never ends the current one: an abandoned, cancelled or refused attempt leaves the
+        # verified session usable, and a cross-site link to this page cannot sign anyone out.
+        if self.identity(request) is None:
+            request.session.clear()
+        else:
+            _drop_pending(request.session)
         request.session["next"] = destination
+        request.session["pending_expires"] = self.store.clock() + _PENDING_SECONDS
         step_up = request.query_params.get("reauth") == "1"
         if step_up:
             request.session["reauth_started"] = self.store.clock()
@@ -241,7 +347,7 @@ class BrowserAuth:
                 **({"prompt": "login", "max_age": 0} if step_up else {}),
             )
         except Exception:
-            request.session.clear()
+            _drop_pending(request.session)
             return HTMLResponse(
                 page(
                     "Sign-in is unavailable",
@@ -254,12 +360,27 @@ class BrowserAuth:
     async def callback(self, request: Request):
         destination = self._destination(request.session.get("next", self.home))
         reauth_started = request.session.get("reauth_started")
+        signed_in = self.identity(request) is not None  # Read before the callback claims the stored row.
+        claimed = refused = False
         try:
             if not self.store.consume(request.cookies.get(self.cookie, "")):
                 raise ValueError("callback already consumed")
+            # The claimed row is gone; whatever this request keeps must be stored again under a new reference.
+            claimed = True
+            request.scope["rotate_browser_session"] = True
+            pending = request.session.get("pending_expires")
+            if (
+                not isinstance(pending, int | float)
+                or isinstance(pending, bool)
+                or not math.isfinite(pending)
+                or self.store.clock() > pending
+            ):
+                raise ValueError("sign-in attempt expired")
             token = await self.client.authorize_access_token(
                 request, claims_options={"iss": {"essential": True, "value": self.config.issuer}}, leeway=0
             )
+            # From here the provider has vouched for a person; refusing that identity ends any earlier session.
+            refused = True
             info = token.get("userinfo") or {}
             sub, groups = info.get("sub"), info.get("groups", [])
             if (
@@ -274,6 +395,7 @@ class BrowserAuth:
             expires = min(float(info["exp"]), self.store.clock() + _MAX_AGE)
             if not math.isfinite(expires) or expires <= self.store.clock():
                 raise ValueError("identity expired")
+            refused = False  # An unconfirmed step-up keeps the earlier, still verified session without freshness.
             authenticated = info.get("auth_time")
             if reauth_started is not None and (
                 not isinstance(authenticated, int | float)
@@ -305,7 +427,15 @@ class BrowserAuth:
             request.scope["rotate_browser_session"] = True
             return RedirectResponse(destination, status_code=303)
         except Exception:
-            request.session.clear()
+            if not claimed:
+                # Another request owns this row (or none exists): store nothing, so a concurrent outcome stands.
+                request.session.clear()
+                request.scope.pop("rotate_browser_session", None)
+                request.scope["keep_browser_session"] = True
+            elif refused or not signed_in:
+                request.session.clear()
+            else:
+                _drop_pending(request.session)
             return HTMLResponse(
                 page(
                     "We could not confirm your sign-in",
@@ -351,7 +481,9 @@ class BrowserAuth:
             async def respond(message):
                 if message["type"] == "http.response.start":
                     data = scope["session"]
-                    if data != original or scope.get("rotate_browser_session"):
+                    if scope.get("keep_browser_session"):
+                        pass  # Leave the stored row and the cookie exactly as they are.
+                    elif data != original or scope.get("rotate_browser_session"):
                         auth.store.delete(old)
                         sid = secrets.token_urlsafe(32)
                         if data:
@@ -368,25 +500,13 @@ class BrowserAuth:
                         )
                         message.setdefault("headers", []).append((b"set-cookie", cookie.headers["set-cookie"].encode()))
                     if scope.get("path", "").startswith((auth.prefix + "/connections/", "/connections/")):
-                        message.setdefault("headers", []).extend(
-                            [
-                                (b"cache-control", b"no-store"),
-                                (b"referrer-policy", b"strict-origin"),
-                                (b"x-frame-options", b"DENY"),
-                                (b"x-content-type-options", b"nosniff"),
-                            ]
+                        headers = message.setdefault("headers", [])
+                        present = {name.lower() for name, _ in headers}
+                        headers.extend(
+                            (name.encode(), value.encode())
+                            for name, value in PAGE_HEADERS.items()
+                            if name.encode() not in present
                         )
-                        headers = message["headers"]
-                        if not any(name.lower() == b"content-security-policy" for name, _ in headers):
-                            headers.append(
-                                (
-                                    b"content-security-policy",
-                                    (
-                                        f"default-src 'self'; script-src {SCRIPT_SOURCE}; style-src 'self' "
-                                        "'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
-                                    ).encode(),
-                                )
-                            )
                 await send(message)
 
             await app(scope, receive, respond)

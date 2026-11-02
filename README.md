@@ -585,18 +585,50 @@ home, so a host that sends signed-out visitors straight to sign-in does not sign
 them back in through the provider's own session. Use separate origins for applications with different trust
 boundaries; cookie names and URL paths do not provide browser-origin isolation.
 
+Starting a sign-in never ends the current one. `/connections/login` keeps a
+verified session while the provider round trip is pending and replaces it only
+after a successful callback, so an abandoned, cancelled or unconfirmed attempt
+(or a cross-site link to that page) leaves the person signed in. A callback whose
+provider identity is refused, for example after losing the required group, ends
+the session. An attempt must complete within ten minutes. To switch to another
+account, sign out first: a cancelled attempt to sign in as someone else leaves
+the previous person signed in until that session ends.
+
 For account replacement, `/connections/login?reauth=1` requests fresh provider
 authentication. A successful, verified fresh `auth_time` produces a server-owned
 `reauthenticated_at` value in the identity. An ordinary sign-in whose verified
 `auth_time` is at most `RECENT_AUTHENTICATION_SECONDS` (300) old sets it to that
 `auth_time`, so a person who has just authenticated is not asked again; an older
 provider session, or a missing or future `auth_time`, leaves it unset. Applications decide how recently that
-must have occurred before a sensitive action. Safe `next` destinations are the
+must have occurred before a sensitive action:
+
+```python
+async def start(request):
+    if auth.identity(request) is None or not auth.origin_ok(request):
+        return auth.refused(request)
+    if (confirm := auth.require_fresh(request, max_age=300, action="connect an account")):
+        return confirm
+    ...
+```
+
+`auth.fresh(request, max_age)` reports whether the confirmation is recent enough.
+`auth.require_fresh(...)` returns `None` or a "Confirm it's you" page whose link
+starts step-up; after confirming, the person returns to `next` (default: the
+connections home) and repeats the action. `auth.step_up_url(next)` gives the same
+link for a page that offers it before the action. Start step-up only by
+navigation: never redirect a submitted form into `/connections/login`. The
+Connections policy's `form-action 'self'` applies to every redirect after a
+submission, so browsers cancel the hop to the provider. `auth.refused(request)`
+answers a POST without a verified session (401, with a sign-in link) or from
+another origin (403) with an explanation instead of an empty error; it never
+redirects, for the same reason. Safe `next` destinations are the
 connections home or a local `/connect/<id>` attempt, including a configured base
 path. Test-only loopback HTTP must be explicitly enabled in `OIDCConfig`; it uses
 a different cookie name.
 
-Connections responses receive a restrictive default Content Security Policy.
+Connections responses receive a restrictive default Content Security Policy and
+the other `PAGE_HEADERS`; pages from `require_fresh` and `refused` carry them
+even when served outside the middleware.
 An application redirecting a submitted form to its native provider may supply its
 own complete policy, allowing only that fixed provider origin in `form-action`.
 The middleware preserves that policy without appending a conflicting second one;

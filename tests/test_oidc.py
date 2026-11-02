@@ -5,7 +5,7 @@ import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 from oidc_provider import Provider
@@ -263,3 +263,175 @@ def test_a_recent_confirmation_counts_from_the_providers_authentication_time(sys
     provider.tamper = {"auth_time": int(time.time()) - 200}
     assert sign_in(provider, client).status_code == 303
     assert client.get("/connections/status").json()["reauthenticated_at"] == provider.tamper["auth_time"]
+
+
+def stepping_app(auth):
+    async def act(request):
+        if auth.identity(request) is None or not auth.origin_ok(request):
+            return auth.refused(request)
+        return auth.require_fresh(request, action="connect an account") or JSONResponse({"done": True})
+
+    async def status(request):
+        who = auth.identity(request)
+        return JSONResponse({**(who or {}), "fresh": auth.fresh(request)}, status_code=200 if who else 401)
+
+    return auth.middleware(
+        Starlette(
+            routes=[
+                *auth.routes(),
+                Route("/connections/status", status),
+                Route("/connections/act", act, methods=["POST"]),
+            ]
+        )
+    )
+
+
+@pytest.fixture
+def stepping(system):
+    auth, provider, _ = system
+    with TestClient(stepping_app(auth), base_url=auth.config.public_url, follow_redirects=False) as client:
+        yield auth, provider, client
+
+
+def test_an_abandoned_or_cross_site_sign_in_start_keeps_the_verified_session(stepping):
+    _, provider, client = stepping
+    provider.tamper = {"auth_time": int(time.time()) - 3600}
+    assert sign_in(provider, client).status_code == 303
+    for start in ("/connections/login?reauth=1", "/connections/login"):
+        assert client.get(start).status_code == 302
+        identity = client.get("/connections/status")
+        assert identity.status_code == 200 and identity.json()["sub"] == "subject-one"
+
+
+def test_a_cancelled_step_up_keeps_the_session_without_freshness(stepping):
+    _, provider, client = stepping
+    provider.tamper = {"auth_time": int(time.time()) - 3600}
+    assert sign_in(provider, client).status_code == 303
+    started = client.get("/connections/login?reauth=1").headers["location"]
+    state = parse_qs(urlsplit(started).query)["state"][0]
+    cancelled = client.get("/connections/callback?" + urlencode({"error": "access_denied", "state": state}))
+    assert cancelled.status_code == 403 and "Back to Connections" in cancelled.text
+    identity = client.get("/connections/status").json()
+    assert identity["sub"] == "subject-one" and identity["fresh"] is False
+
+
+def test_an_unverified_step_up_keeps_the_earlier_session_without_freshness(stepping):
+    _, provider, client = stepping
+    provider.tamper = {"auth_time": int(time.time()) - 3600}
+    assert sign_in(provider, client).status_code == 303
+    assert sign_in(provider, client, "?reauth=1").status_code == 403
+    identity = client.get("/connections/status").json()
+    assert identity["sub"] == "subject-one" and identity["fresh"] is False
+
+
+def test_a_refused_provider_identity_ends_the_earlier_session(stepping):
+    _, provider, client = stepping
+    assert sign_in(provider, client).status_code == 303
+    provider.tamper = {"groups": []}
+    assert sign_in(provider, client, "?reauth=1").status_code == 403
+    assert client.get("/connections/status").status_code == 401
+
+
+def test_a_forged_callback_navigation_does_not_sign_the_person_out(stepping):
+    _, provider, client = stepping
+    assert sign_in(provider, client).status_code == 303
+    assert client.get("/connections/callback?code=forged&state=forged").status_code == 403
+    assert client.get("/connections/status").json()["sub"] == "subject-one"
+
+
+def test_a_step_up_started_near_session_expiry_can_still_complete(stepping):
+    auth, provider, client = stepping
+    provider.tamper = {"auth_time": int(time.time()) - 3600, "exp": int(time.time()) + 7200}
+    assert sign_in(provider, client).status_code == 303
+    start = time.time()
+    auth.store.clock = lambda: start + 850
+    location = client.get("/connections/login?reauth=1").headers["location"]
+    auth.store.clock = lambda: start + 950  # The earlier identity has expired; the attempt has not.
+    assert client.get("/connections/status").status_code == 401
+    provider.tamper = {"auth_time": int(start + 940), "exp": int(time.time()) + 7200}
+    assert client.get(path(provider.authorize(location))).status_code == 303
+    assert client.get("/connections/status").json()["fresh"] is True
+
+
+def test_require_fresh_answers_with_a_step_up_link_never_a_redirect(stepping):
+    auth, provider, client = stepping
+    provider.tamper = {"auth_time": int(time.time()) - 3600}
+    assert sign_in(provider, client).status_code == 303
+    page = client.post("/connections/act", headers={"origin": auth.origin})
+    assert page.status_code == 403 and "location" not in page.headers
+    assert "Confirm it&#x27;s you" in page.text and "connect an account" in page.text
+    assert 'href="/connections/login?reauth=1"' in page.text
+    location = client.get("/connections/login?reauth=1").headers["location"]
+    provider.tamper = {}
+    assert client.get(path(provider.authorize(location))).headers["location"] == "/connections/"
+    assert client.post("/connections/act", headers={"origin": auth.origin}).json() == {"done": True}
+
+
+def test_step_up_links_return_only_to_safe_local_pages(system):
+    auth, _, _ = system
+    attempt = "/connect/" + "a" * 32
+    assert auth.step_up_url() == "/connections/login?reauth=1"
+    assert auth.step_up_url(attempt) == "/connections/login?reauth=1&next=" + attempt
+    for unsafe in ("https://other.example.com", "//other.example.com", "/connections/logout"):
+        assert auth.step_up_url(unsafe) == "/connections/login?reauth=1"
+
+
+def test_refusals_explain_themselves_instead_of_redirecting(stepping):
+    auth, provider, client = stepping
+    signed_out = client.post("/connections/act", headers={"origin": auth.origin})
+    assert signed_out.status_code == 401 and "location" not in signed_out.headers
+    assert "Your sign-in has ended" in signed_out.text and 'href="/connections/login"' in signed_out.text
+    assert sign_in(provider, client).status_code == 303
+    foreign = client.post("/connections/act", headers={"origin": "https://other.example.com"})
+    assert foreign.status_code == 403 and "Request refused" in foreign.text
+
+
+def test_a_callback_that_loses_the_claim_never_restores_an_ended_session(stepping):
+    auth, provider, client = stepping
+    assert sign_in(provider, client).status_code == 303
+    location = client.get("/connections/login?reauth=1").headers["location"]
+    pending = client.cookies[auth.cookie]
+    callback = path(provider.authorize(location))
+    provider.tamper = {"groups": []}
+    assert client.get(callback).status_code == 403  # The refused identity ends the session.
+    client.cookies.set(auth.cookie, pending, domain="app.example.com", path="/")
+    duplicate = client.get(callback)  # The same callback again, as a retried or concurrent request.
+    assert duplicate.status_code == 403 and "set-cookie" not in duplicate.headers
+    assert client.get("/connections/status").status_code == 401
+
+
+def test_a_callback_that_loses_a_concurrent_claim_writes_nothing(stepping, monkeypatch):
+    auth, provider, client = stepping
+    assert sign_in(provider, client).status_code == 303
+    location = client.get("/connections/login?reauth=1").headers["location"]
+    # Another request claimed this row after this one read it (a retried or concurrent callback).
+    monkeypatch.setattr(auth.store, "consume", lambda sid: False)
+    lost = client.get(path(provider.authorize(location)))
+    assert lost.status_code == 403 and "set-cookie" not in lost.headers
+
+
+def test_a_sign_in_attempt_expires_after_its_own_window(stepping):
+    auth, provider, client = stepping
+    provider.tamper = {"auth_time": int(time.time()) - 3600}
+    assert sign_in(provider, client).status_code == 303
+    start = time.time()
+    location = client.get("/connections/login?reauth=1").headers["location"]
+    auth.store.clock = lambda: start + 601
+    provider.tamper = {"exp": int(start) + 7200}
+    assert client.get(path(provider.authorize(location))).status_code == 403
+    identity = client.get("/connections/status").json()
+    assert identity["sub"] == "subject-one" and identity["fresh"] is False
+
+
+def test_confirmation_and_refusal_pages_carry_their_own_safety_headers(stepping):
+    from starlette.requests import Request
+
+    from signin_window.oidc import PAGE_HEADERS
+
+    auth, _, client = stepping
+    bare = Request({"type": "http", "method": "GET", "path": "/connect/x", "headers": [], "query_string": b""})
+    for response in (auth.require_fresh(bare), auth.refused(bare)):
+        assert {name: response.headers.get(name) for name in PAGE_HEADERS} == PAGE_HEADERS
+    served = client.post("/connections/act", headers={"origin": auth.origin})
+    for name in PAGE_HEADERS:
+        assert len(served.headers.get_list(name)) == 1
