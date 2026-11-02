@@ -71,6 +71,110 @@ def test_real_pkce_claims_and_opaque_cookie_without_provider_tokens(system):
 
 
 @pytest.mark.parametrize(
+    ("claims", "expected"),
+    [
+        ({"display_name": "Example"}, "Example"),
+        ({}, "Example One"),
+        ({"display_name": ""}, "Example One"),
+        ({"display_name": " \n\u202eExample\x00 "}, "Example"),
+        ({"display_name": "x" * 200}, "x" * 100),
+        ({"display_name": None, "name": None}, None),
+        ({"name": "Your account"}, None),
+        ({"display_name": ["untrusted"]}, "Example One"),
+    ],
+)
+def test_display_label_is_optional_bounded_and_display_only(system, claims, expected):
+    auth, provider, client = system
+    provider.tamper.update(claims)
+    assert sign_in(provider, client).status_code == 303
+    identity = client.get("/connections/status").json()
+    assert identity["label"] == expected
+    assert identity["sub"] == "subject-one"
+    assert identity["claims"] == {"person_id": "first"}
+    assert auth.store.load(client.cookies[auth.cookie])["label"] == expected
+
+
+def test_display_label_claim_can_be_configured(system):
+    auth, provider, client = system
+    auth.config = replace(auth.config, label_claim="short_name")
+    provider.tamper.update(short_name="Short", display_name="Other")
+    assert sign_in(provider, client).status_code == 303
+    assert client.get("/connections/status").json()["label"] == "Short"
+    with pytest.raises(ValueError, match="display label claim"):
+        replace(auth.config, label_claim="bad claim")
+
+
+def test_verified_missing_group_notifies_host_without_authorizing(system):
+    auth, provider, client = system
+    observed = []
+    auth.on_group_refused = observed.append
+    provider.tamper.update(groups=[])
+    assert sign_in(provider, client).status_code == 403
+    assert client.get("/connections/status").status_code == 401
+    assert observed == [
+        {
+            "issuer": provider.issuer,
+            "sub": "subject-one",
+            "groups": [],
+            "claims": {"person_id": "first"},
+        }
+    ]
+    assert "synthetic-access-token" not in str(observed)
+
+
+@pytest.mark.parametrize("tamper", [{"iss": "https://other.example.com"}, {"exp": 1}, {"sub": ""}, {"groups": "bad"}])
+def test_invalid_identity_never_notifies_group_removal(system, tamper):
+    auth, provider, client = system
+    observed = []
+    auth.on_group_refused = observed.append
+    provider.tamper.update({"groups": [], **tamper})
+    assert sign_in(provider, client).status_code == 403
+    assert observed == []
+
+
+def test_group_refusal_callback_failure_stays_closed(system):
+    auth, provider, client = system
+
+    def fail(identity):
+        raise ValueError("synthetic host refusal")
+
+    auth.on_group_refused = fail
+    provider.tamper.update(groups=[])
+    assert sign_in(provider, client).status_code == 403
+    assert client.get("/connections/status").status_code == 401
+
+
+def test_new_sign_in_notifies_host_once_with_verified_identity(system):
+    auth, provider, client = system
+    observed = []
+    auth.on_sign_in = observed.append
+    provider.tamper.update(display_name="Example")
+    assert sign_in(provider, client).status_code == 303
+    assert len(observed) == 1
+    assert observed[0]["sub"] == "subject-one"
+    assert observed[0]["label"] == "Example"
+    assert observed[0]["claims"] == {"person_id": "first"}
+    assert "synthetic-access-token" not in str(observed)
+    assert client.get("/connections/status").status_code == 200
+    assert len(observed) == 1
+    provider.tamper.update(groups=[])
+    assert sign_in(provider, client).status_code == 403
+    assert len(observed) == 1
+
+
+def test_host_sign_in_refusal_never_saves_the_new_identity(system):
+    auth, provider, client = system
+    assert sign_in(provider, client).status_code == 303
+
+    def fail(identity):
+        raise ValueError("synthetic host refusal")
+
+    auth.on_sign_in = fail
+    assert sign_in(provider, client).status_code == 403
+    assert client.get("/connections/status").status_code == 401
+
+
+@pytest.mark.parametrize(
     "tamper",
     [
         {"nonce": "wrong"},

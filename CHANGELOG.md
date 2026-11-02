@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.7.0] - 2026-11-02
+
+### Added
+
+- Add a sanitized display-only `identity()["label"]`, chosen from `OIDCConfig.label_claim` (default `display_name`), then the provider's name, without treating placeholders as identities (#5).
+- Add `BrowserAuth.on_sign_in` and `on_group_refused` callbacks so applications record verified membership changes and distinguish a new sign-in from an older browser session (#5).
+
+### Upgrade
+
+- Action required: none; applications adopting labels or membership callbacks must allow signin-window 0.7 and keep labels separate from account ownership.
+- Rollback: compatible with 0.6.0 until an application uses the new label or callback interfaces; remove those integrations before reverting.
+
+[0.7.0]: https://github.com/benjamin-di/signin-window/releases/tag/v0.7.0
+
 ## [0.6.0] - 2026-11-02
 
 ### Added
@@ -15,6 +29,9 @@
 
 - Action required: applications that answer a sensitive POST with a redirect to `/connections/login?reauth=1` must return `auth.require_fresh(request, ...)` instead. The `form-action 'self'` page policy cancels the hop to the provider after a submitted form. Replace empty 403 responses for sessionless or cross-origin POSTs with `auth.refused(request)`. A sign-in already in progress at upgrade is refused once at its callback; sign in again.
 - Rollback: compatible with 0.5.1 for applications that do not call the new methods.
+
+[0.6.0]: https://github.com/benjamin-di/signin-window/releases/tag/v0.6.0
+
 
 [0.6.0]: https://github.com/benjamin-di/signin-window/releases/tag/v0.6.0
 

@@ -16,6 +16,7 @@ import secrets
 import sqlite3
 import stat
 import time
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,6 +57,13 @@ def _drop_pending(session):
         del session[key]
 
 
+def _label(value):
+    if not isinstance(value, str):
+        return None
+    value = "".join(c for c in value if not unicodedata.category(c).startswith("C")).strip()[:100]
+    return value if value and value != "Your account" else None
+
+
 @dataclass(frozen=True)
 class OIDCConfig:
     issuer: str
@@ -67,6 +75,7 @@ class OIDCConfig:
     claim_names: tuple[str, ...] = ("person_id",)
     client_secret: str | None = field(default=None, repr=False)
     allow_loopback_http: bool = False
+    label_claim: str = "display_name"
 
     def __post_init__(self):
         for value in (self.issuer, self.public_url):
@@ -88,6 +97,8 @@ class OIDCConfig:
             raise ValueError("OIDC requires a client id and a distinct __Host- cookie name")
         if len(self.claim_names) > 32 or any(not _CLAIM.fullmatch(name) for name in self.claim_names):
             raise ValueError("Select a bounded list of application identity claims")
+        if not isinstance(self.label_claim, str) or not _CLAIM.fullmatch(self.label_claim):
+            raise ValueError("Select one display label claim")
 
 
 class BrowserStore:
@@ -179,8 +190,10 @@ class BrowserStore:
 class BrowserAuth:
     """Code + PKCE + nonce login through Authlib, with application-owned authorization."""
 
-    def __init__(self, config: OIDCConfig, *, clock=time.time, transport=None):
+    def __init__(self, config: OIDCConfig, *, clock=time.time, transport=None, on_group_refused=None, on_sign_in=None):
         self.config = config
+        self.on_group_refused = on_group_refused
+        self.on_sign_in = on_sign_in
         self.store = BrowserStore(config.state_dir, clock=clock)
         self.cookie = (
             config.cookie_name.removeprefix("__Host-") + "-test" if config.allow_loopback_http else config.cookie_name
@@ -223,6 +236,7 @@ class BrowserAuth:
             "issuer": data["issuer"],
             "sub": data["sub"],
             "name": str(data.get("name") or "Your account")[:100],
+            "label": _label(data.get("label")) or _label(data.get("name")),
             "groups": list(data["groups"]),
             "claims": dict(data["claims"]),
             "expires": data["expires"],
@@ -389,12 +403,22 @@ class BrowserAuth:
                 or not sub
                 or not isinstance(groups, list)
                 or not all(isinstance(group, str) for group in groups)
-                or (self.config.required_group and self.config.required_group not in groups)
             ):
                 raise ValueError("identity refused")
             expires = min(float(info["exp"]), self.store.clock() + _MAX_AGE)
             if not math.isfinite(expires) or expires <= self.store.clock():
                 raise ValueError("identity expired")
+            if self.config.required_group and self.config.required_group not in groups:
+                if self.on_group_refused is not None:
+                    self.on_group_refused(
+                        {
+                            "issuer": self.config.issuer,
+                            "sub": sub,
+                            "groups": list(groups),
+                            "claims": {name: info[name] for name in self.config.claim_names if name in info},
+                        }
+                    )
+                raise ValueError("identity refused")
             refused = False  # An unconfirmed step-up keeps the earlier, still verified session without freshness.
             authenticated = info.get("auth_time")
             if reauth_started is not None and (
@@ -417,13 +441,18 @@ class BrowserAuth:
                 issuer=self.config.issuer,
                 sub=sub,
                 groups=groups,
-                name=str(info.get("name") or "Your account")[:100],
+                name=_label(info.get("name")) or "Your account",
+                label=_label(info.get(self.config.label_claim)) or _label(info.get("name")),
                 expires=expires,
                 claims={name: info[name] for name in self.config.claim_names if name in info},
                 auth_time=authenticated,
                 # A step-up proves now; otherwise a provider-verified recent authentication counts from its own time.
                 reauthenticated_at=now if reauth_started is not None else (min(authenticated, now) if recent else None),
             )
+            if self.on_sign_in is not None:
+                refused = True  # A host refusal must not save the newly verified identity.
+                self.on_sign_in(dict(request.session))
+                refused = False
             request.scope["rotate_browser_session"] = True
             return RedirectResponse(destination, status_code=303)
         except Exception:

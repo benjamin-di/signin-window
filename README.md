@@ -570,11 +570,29 @@ public-client PKCE. Every exchange also validates state, nonce, issuer, audience
 and expiry. Callbacks are single-use even across application workers.
 
 `auth.identity(request)` returns `None` or a verified dictionary containing
-`issuer`, `sub`, `name`, `groups`, `claims` and `expires`. Only explicitly selected
+`issuer`, `sub`, `name`, `label`, `groups`, `claims` and `expires`. `label` uses
+`OIDCConfig.label_claim` (default `display_name`), falling back to `name`, then
+`None`. Labels strip control characters and are bounded to 100 characters;
+the `Your account` placeholder is never a label. Labels are display-only and
+must never establish ownership or match accounts. Only explicitly selected
 custom claims are retained. Map that identity to an existing account in your
 application; groups alone do not confer ownership. Neither browser input nor a
 forwarded header establishes a connection owner. Supply that policy through
 `Relay(authorize=...)`, protecting every route and the live viewer.
+
+An optional `BrowserAuth(..., on_group_refused=callback)` receives only the
+verified issuer, subject, groups and configured custom claims when an unexpired
+identity lacks the required group. It runs before that login is refused, allowing
+an application to mark an existing person inactive. It never authorizes the
+person, creates an account or runs for invalid protocol claims. The callback
+must retain the application's pinned identity check and may raise to fail closed.
+
+`on_sign_in=callback` receives the newly verified identity fields after a
+successful callback, including its `label` and selected custom `claims`, before
+the browser session is saved. It may record re-admission after group membership
+is restored. Only this callback proves a new sign-in; reading an older browser
+cookie must never reactivate an inactive person. Neither callback receives
+provider tokens. A callback exception refuses the sign-in.
 
 The browser holds an opaque Secure/HttpOnly/SameSite cookie with no Domain
 attribute. Private server-side sessions last at most 15 minutes. Provider
