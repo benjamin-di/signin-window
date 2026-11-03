@@ -136,7 +136,7 @@ article,.panel{background:var(--surface);padding:1.5rem;border:1px solid var(--l
 [role=status]{padding:.45rem .75rem;background:var(--status-bg);border-radius:.5rem;font-weight:600}
 a{color:var(--accent);text-underline-offset:.2em}button,.button{font:inherit;min-height:44px;padding:.65rem 1rem;
 border:1px solid var(--accent);border-radius:.6rem;background:var(--accent);color:var(--on-accent);
-display:inline-block;text-decoration:none;cursor:pointer;line-height:1.4}
+display:inline-block;text-decoration:none;cursor:pointer;line-height:1.4;max-width:100%;white-space:normal;overflow-wrap:anywhere}
 button.secondary,.button.secondary{color:var(--accent);background:var(--surface);border-color:var(--line)}
 button.danger{background:var(--danger);border-color:var(--danger);color:#fff}
 button.quiet{background:transparent;color:var(--muted);border-color:transparent}
@@ -145,7 +145,8 @@ a:focus-visible,button:focus-visible,summary:focus-visible,input:focus-visible{
 outline:3px solid var(--focus);outline-offset:3px}
 summary{cursor:pointer;min-height:44px;padding:.65rem 0;font-weight:600;color:var(--muted)}
 details{border-top:1px solid var(--line);margin-top:1rem;padding-top:.3rem}details p{color:var(--muted)}
-details.manage summary{color:var(--danger)}label{display:block}input{font:inherit;max-width:100%}
+details.manage summary{color:var(--danger)}label{display:block;min-height:44px;padding:.4rem 0}
+input{font:inherit;max-width:100%;accent-color:var(--accent)}
 input[type=checkbox]{margin-right:.5rem}code{overflow-wrap:anywhere;font-size:1.1rem}time{white-space:normal}
 ol{padding-left:1.5rem}li{margin:.6rem 0}ul{padding-left:1.2rem}
 .code{font:700 1.6rem/1.5 ui-monospace,monospace;user-select:all}
@@ -155,7 +156,7 @@ ol{padding-left:1.5rem}li{margin:.6rem 0}ul{padding-left:1.2rem}
 --line:#415168;--accent:#9cc0ff;--on-accent:#14263f;--danger:#be4651;--status-bg:#2a3950;--focus:#ffd486}
 details.manage summary{color:#ffb4bb}}
 @media(max-width:480px){main{margin:.75rem auto;padding:1rem}article,.panel{padding:1.1rem}
-form{display:block;margin:.6rem 0}form button{width:100%}}
+form{display:block;margin:.6rem 0}button,.button{width:100%;text-align:center}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
 """
 

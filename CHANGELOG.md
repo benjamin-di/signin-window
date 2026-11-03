@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.1] - 2026-11-03
+
+### Fixed
+
+- Give link actions the same full-width mobile layout as form buttons, keep long labels within their container and provide comfortable checkbox-label touch targets (#6).
+
+### Upgrade
+
+- Action required: none.
+- Rollback: compatible with 0.7.0; application state and authentication interfaces are unchanged.
+
+[0.7.1]: https://github.com/benjamin-di/signin-window/releases/tag/v0.7.1
+
 ## [0.7.0] - 2026-11-02
 
 ### Added

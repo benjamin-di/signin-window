@@ -454,3 +454,37 @@ def test_connection_shell_fits_a_small_screen_with_enlarged_text(browser_page, s
     browser_page.add_style_tag(content=":root{font-size:32px}")
     assert browser_page.evaluate("document.documentElement.scrollWidth <= innerWidth")
     assert browser_page.locator("button").bounding_box()["height"] >= 44
+
+
+@pytest.mark.parametrize("width", [320, 390, 1280])
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+def test_connection_actions_remain_accessible_and_consistent_at_phone_widths(browser_page, width, scheme):
+    from signin_window.connections import page
+
+    browser_page.set_viewport_size({"width": width, "height": 844})
+    browser_page.emulate_media(color_scheme=scheme)
+    browser_page.set_content(
+        page(
+            "Example connection",
+            """
+        <article><h2>Example provider</h2><p role="status">Connection saved</p>
+        <a class="button" href="/connections/login">Verify and reconnect</a>
+        <form method="post" action="/connections/start"><button>Reconnect</button></form>
+        <label><input type="checkbox" name="capability">Share with this person</label>
+        </article>""",
+        )
+    )
+    link = browser_page.get_by_role("link", name="Verify and reconnect")
+    button = browser_page.get_by_role("button", name="Reconnect", exact=True)
+    assert link.bounding_box()["height"] >= 44
+    assert button.bounding_box()["height"] >= 44
+    if width <= 480:
+        assert abs(link.bounding_box()["width"] - button.bounding_box()["width"]) < 1
+    assert browser_page.locator("label").bounding_box()["height"] >= 44
+    assert browser_page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    assert browser_page.locator("html").evaluate("el => getComputedStyle(el).backgroundColor") == (
+        "rgb(18, 26, 38)" if scheme == "dark" else "rgb(244, 246, 250)"
+    )
+    browser_page.keyboard.press("Tab")
+    assert link.evaluate("el => document.activeElement === el")
+    assert link.evaluate("el => getComputedStyle(el).outlineWidth") == "3px"
