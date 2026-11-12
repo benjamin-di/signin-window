@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.8.1] - 2026-11-11
+
+_Publishes the 0.8.0 changes, which the public mirror and PyPI did not receive; the package is unchanged from 0.8.0._
+
+### Upgrade
+
+- Action required: none.
+- Rollback: compatible with 0.8.0.
+
+[0.8.1]: https://github.com/benjamin-di/signin-window/releases/tag/v0.8.1
+
+## [0.8.0] - 2026-11-11
+
+### Added
+
+- Add optional host-supplied `PageIdentity` build footers through `connections.page(identity=...)`, `PageText(identity=...)` on relay sign-in, expired and unavailable pages, `build_app(..., identity=...)` on the direct viewer, `BrowserAuth(..., identity=...)` on its local pages and `delegation.register_routes(..., identity=...)` on consent, status and failure pages; a changed build stops connection-page status polling and offers a reload link while preserving the loaded page and unsent forms (#7)
+- Show the same version disclosure on Connections and sign-in footers, with keyboard and touch access to the selectable full source revision (#7)
+
+### Upgrade
+
+- Action required: none; applications opt in by supplying their own service, version and full source revision as `identity`.
+- Rollback: compatible with 0.7.1 only after removing every `identity` argument named above and every `PageIdentity` import, which 0.7.1 rejects; application state and authentication interfaces are unchanged.
+
+[0.8.0]: https://github.com/benjamin-di/signin-window/releases/tag/v0.8.0
+
 ## [0.7.1] - 2026-11-03
 
 ### Fixed

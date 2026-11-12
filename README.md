@@ -374,6 +374,21 @@ function that must return true before a window opens, for an invite code the per
 still resumes its attempt). Use it only for a link the host has bound to the signed-in person who just asked for it;
 a link handed to someone keeps the intro, which tells them whose account it connects.
 
+Pass `PageText(identity=PageIdentity("Example", "1.2.3", "abcdef1234567890"))`
+to `Relay(text=...)` to show the host application's build on sign-in, expired
+and unavailable pages. Import `PageIdentity` from `signin_window.connections`.
+The optional `build_app(..., identity=...)` uses the same contract for its direct
+viewer shell. Connections and sign-in footers show the service, version and
+compact revision in a native disclosure control. Open it with the keyboard or a
+tap to select the full source revision. The application supplies all metadata;
+noVNC files and the provider's sign-in content are unchanged. Omitting identity
+preserves existing output; blank values display as `unknown`, `dev`, `unknown`.
+`BrowserAuth(..., identity=...)` also forwards the host identity to its local
+confirmation, refusal, sign-in failure and signed-out pages. The optional
+`delegation.register_routes(mcp, manager, identity=...)` stamps its local consent,
+status and failure pages, preserving its strict policy with an unstyled semantic
+footer. Provider-hosted pages remain the provider's content.
+
 The relay talks to the login service through `LoginClient`; any object with the same methods (`Backend`) works,
 for a login service of another shape.
 
@@ -483,13 +498,21 @@ whether the resulting session or content is acceptable.
 ## Connection page helpers
 
 `signin_window.connections.page(title, body, intro="", refresh=False,`
-`login_url="/connections/login")` renders a
+`login_url="/connections/login", identity=None)` renders a
 responsive connection screen with keyboard focus styles and light/dark colors.
 `title` and `intro` are plain text; `body` is trusted application HTML. Escape all
 account and request values before interpolating them. Applications still own
 forms, CSRF checks, account mapping and connection authority. Supply the fixed
 application login URL explicitly when using a base prefix or a different login
 route; recovery links use this URL even on nested pages.
+
+Pass the frozen `PageIdentity(service, version, source_revision)` from
+`signin_window.connections` as `identity` to show a compact, selectable build
+footer: `Example v1.2.3 · abcdef123456`. The application supplies its own version
+and full source revision; the renderer never substitutes its package version.
+The full revision remains in the footer's title and `data-source-revision`.
+Empty service, version and revision values display as `unknown`, `dev` and
+`unknown`, respectively. Omitting identity leaves existing pages unchanged.
 
 Use `disconnect_confirmation(form, service, effect)` to put an existing form
 behind an expandable explanation, and `timestamp(value, label="Last checked")`
@@ -527,7 +550,12 @@ checks. Existing pages have no new controls unless they use this helper.
 With `refresh=True`, a fixed script fetches the current HTML page while work is
 in progress. It preserves focus and defers updates around edited controls, open
 confirmations and text selections. Network or authentication failures expose a
-recovery link. Without JavaScript, the page offers a manual refresh link. The
+recovery link. If the host build identity changes (including its presence), polling
+stops before any content replacement and offers a reload link, retaining the
+loaded shell, footer and any unsent form changes. A response without the
+Connections content is retried like a failed refresh, never treated as a new
+build. Without JavaScript, the page
+offers a manual refresh link. The
 script never submits a form or starts a sign-in. An explicit
 `<button type="button" data-copy-code="code-id">Copy code</button>` copies the
 text of that code element on click, with a manual-selection fallback.

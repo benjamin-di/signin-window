@@ -36,6 +36,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from starlette.responses import HTMLResponse, RedirectResponse
 
+from ._identity import stamp
+from .connections import PageIdentity
+
 MAX_BODY = 65536
 LIFETIME = 600
 LOCK_WAIT = 30
@@ -812,7 +815,7 @@ def _headers(manager):
     }
 
 
-def _page(manager, csrf=None, connected=False, *, failed=False):
+def _page(manager, csrf=None, connected=False, *, failed=False, identity: PageIdentity | None = None):
     action = manager.config.public_base_url + "/oauth/action"
     text = (
         "Connection could not be completed. Request a new connection link."
@@ -830,16 +833,23 @@ def _page(manager, csrf=None, connected=False, *, failed=False):
                 f'<button name="action" value="{name}">{label}</button></form>'
             )
     return HTMLResponse(
-        "<!doctype html><title>Application connection</title><h1>Application connection</h1>"
-        + f"<p>{text}</p>"
-        + forms,
+        stamp(
+            "<!doctype html><title>Application connection</title><h1>Application connection</h1>"
+            + f"<p>{text}</p>"
+            + forms,
+            identity,
+            inline_style=False,
+        ),
         headers=_headers(manager),
         status_code=400 if failed else 200,
     )
 
 
-def register_routes(mcp, manager):
-    """Register the exact public browser surface; all blocking work runs off-loop."""
+def register_routes(mcp, manager, *, identity: PageIdentity | None = None):
+    """Register browser routes, optionally identifying the host build on locally rendered pages.
+
+    All blocking work runs off-loop.
+    """
     cookie_path = urlsplit(manager.config.public_base_url).path + "/oauth"
     cookie_name = manager.config.cookie_name
 
@@ -849,13 +859,13 @@ def register_routes(mcp, manager):
             if request.url.query:
                 raise OAuthError()
             cookie, csrf, connected = await asyncio.to_thread(manager.open_browser, request.path_params["ticket"])
-            response = _page(manager, csrf, connected)
+            response = _page(manager, csrf, connected, identity=identity)
             response.set_cookie(
                 cookie_name, cookie, max_age=LIFETIME, path=cookie_path, secure=True, httponly=True, samesite="lax"
             )
             return response
         except Exception:
-            return _page(manager, failed=True)
+            return _page(manager, failed=True, identity=identity)
 
     @mcp.custom_route("/oauth/action", methods=["POST"])
     async def action(request):
@@ -880,9 +890,9 @@ def register_routes(mcp, manager):
             )
             if "redirect" in result:
                 return RedirectResponse(result["redirect"], status_code=303, headers=_headers(manager))
-            return _page(manager, result["csrf"], result["connected"])
+            return _page(manager, result["csrf"], result["connected"], identity=identity)
         except Exception:
-            return _page(manager, failed=True)
+            return _page(manager, failed=True, identity=identity)
 
     @mcp.custom_route("/oauth/callback", methods=["GET"])
     async def callback(request):
@@ -894,6 +904,6 @@ def register_routes(mcp, manager):
             result = await asyncio.to_thread(
                 manager.finish_callback, request.cookies.get(cookie_name), dict(request.query_params)
             )
-            return _page(manager, result["csrf"], result["connected"])
+            return _page(manager, result["csrf"], result["connected"], identity=identity)
         except Exception:
-            return _page(manager, failed=True)
+            return _page(manager, failed=True, identity=identity)

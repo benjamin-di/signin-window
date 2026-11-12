@@ -5,7 +5,11 @@ from __future__ import annotations
 
 import json
 import re
+from html.parser import HTMLParser
 
+import pytest
+
+from signin_window.connections import PageIdentity
 from signin_window.page import DEFAULT_OUTCOMES, PageText, render
 
 
@@ -53,3 +57,70 @@ def test_the_label_fills_the_title_host_and_button_too():
     assert "<span id=host>shop.example&lt;</span>" in page and ">Continue on shop.example&lt;</button>" in page
     assert config(page)["frameTitle"] == "Sign in to shop.example<"
     assert "<title>Sign in to</title>" in render(text, None)
+
+
+class IdentityFooter(HTMLParser):
+    def __init__(self, markup):
+        super().__init__()
+        self.attributes = {}
+        self.text = ""
+        self.tags = []
+        self.in_footer = False
+        self.feed(markup)
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "footer":
+            self.in_footer = True
+            self.attributes = dict(attrs)
+        if self.in_footer:
+            self.tags.append(tag)
+
+    def handle_data(self, data):
+        if self.in_footer:
+            self.text += data
+
+    def handle_endtag(self, tag):
+        if tag == "footer":
+            self.in_footer = False
+
+
+@pytest.mark.parametrize("label", ["Example account", None])
+def test_signin_and_expired_pages_escape_host_identity_and_expose_the_full_revision(label):
+    identity = PageIdentity('<img src=x onerror="bad()">', '1.2.3" <dev>', 'abcdef1234567890" <revision>')
+    text = PageText(identity=identity).with_outcomes(connected="<h1>Saved</h1>")
+    rendered = render(text, label)
+    footer = IdentityFooter(rendered)
+    assert footer.attributes == {
+        "id": "page-identity",
+        "data-service": identity.service,
+        "data-version": identity.version,
+        "data-source-revision": identity.source_revision,
+        "title": f"Source revision: {identity.source_revision}",
+    }
+    assert footer.text == (
+        f"{identity.service} v{identity.version} · abcdef123456Source revision{identity.source_revision}"
+    )
+    assert "script" not in footer.tags
+    assert '<img src=x onerror="bad()">' not in rendered
+    assert "&lt;revision&gt;" in rendered
+    assert text.identity is identity
+    if label is None:
+        assert "<script" not in rendered
+
+
+def test_signin_identity_is_optional_and_blank_metadata_is_explicit():
+    assert not IdentityFooter(render(PageText(), "Example")).attributes
+    footer = IdentityFooter(render(PageText(identity=PageIdentity(" ", "", " ")), "Example"))
+    assert footer.attributes["data-service"] == "unknown"
+    assert footer.attributes["data-version"] == "dev"
+    assert footer.attributes["data-source-revision"] == "unknown"
+    assert footer.text.startswith("unknown vdev · unknown")
+
+
+def test_identity_footer_keeps_script_html_literals_intact():
+    from signin_window.connections import PageIdentity
+
+    script = 'window.exampleClosingTag = "</html>";'
+    markup = render(PageText(script_extra=script, identity=PageIdentity("Example", "1.2.3", "a" * 40)), "Example")
+    assert script in markup
+    assert markup.rindex('<footer id="page-identity"') > markup.rindex("</script>")

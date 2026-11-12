@@ -14,6 +14,9 @@ import html
 import json
 from dataclasses import dataclass, field
 
+from ._identity import stamp
+from .connections import PageIdentity
+
 DEFAULT_OUTCOMES = {
     "connected": (
         "<p class=ok>✓</p><h1>Connection saved</h1><p>You can close this page and return to your assistant.</p>"
@@ -73,6 +76,9 @@ class PageText:
     #: that returns true to go on with the sign-in (for a code the person enters first, say).
     script_extra: str = ""
 
+    #: Optional host application identity, also shown on expired and unavailable pages.
+    identity: PageIdentity | None = None
+
     def with_outcomes(self, **outcomes: str) -> PageText:
         """A copy with more (or other) outcome messages."""
         from dataclasses import replace
@@ -98,7 +104,10 @@ def render(text: PageText, label: str | None) -> str:
         )
         body = f"<main class=msg>{text.html(text.outcomes.get('expired', DEFAULT_OUTCOMES['expired']))}{back}</main>"
         title = text.plain(text.title.replace(" {label}", "")).strip()  # no link, no label
-        return _PAGE.replace("{{TITLE}}", html.escape(title)).replace("{{BODY}}", body).replace("{{SCRIPT}}", "")
+        return stamp(
+            _PAGE.replace("{{TITLE}}", html.escape(title)).replace("{{BODY}}", body).replace("{{SCRIPT}}", ""),
+            text.identity,
+        )
     body = (
         _BODY.replace("{{HEADING}}", html.escape(text.plain(text.title, label)))
         .replace("{{HELP}}", text.html(text.help_html, label))
@@ -130,7 +139,9 @@ def render(text: PageText, label: str | None) -> str:
         + _SCRIPT
     )
     title = html.escape(text.plain(text.title, label))
-    return _PAGE.replace("{{TITLE}}", title).replace("{{BODY}}", body).replace("{{SCRIPT}}", script)
+    return stamp(
+        _PAGE.replace("{{TITLE}}", title).replace("{{BODY}}", body).replace("{{SCRIPT}}", script), text.identity
+    )
 
 
 _BODY = """<header><h1>{{HEADING}}</h1>

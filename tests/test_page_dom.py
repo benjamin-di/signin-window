@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from signin_window.connections import PageIdentity
 from signin_window.page import PageText, render
 
 sync_api = pytest.importorskip("playwright.sync_api")
@@ -91,7 +92,12 @@ def test_shared_connection_refresh_runs_under_exact_csp_and_preserves_focus(brow
             headers={
                 "Content-Security-Policy": f"default-src 'self'; script-src {SCRIPT_SOURCE}; style-src 'unsafe-inline'"
             },
-            body=page("Example", body, refresh=len(requests) == 1),
+            body=page(
+                "Example",
+                body,
+                refresh=len(requests) == 1,
+                identity=PageIdentity("Example", "1.2.3", "abcdef1234567890"),
+            ),
         )
 
     browser_page.route("**/*", serve)
@@ -100,6 +106,115 @@ def test_shared_connection_refresh_runs_under_exact_csp_and_preserves_focus(brow
     browser_page.get_by_role("status").filter(has_text="Connection saved").wait_for()
     assert browser_page.evaluate("document.activeElement.id") == "stable"
     assert requests == ["GET", "GET"]
+
+
+@pytest.mark.parametrize(
+    "next_identity",
+    [
+        PageIdentity("Other service", "1.2.3", "abcdef1234567890"),
+        PageIdentity("Example", "1.2.4", "abcdef1234567890"),
+        PageIdentity("Example", "1.2.3", "abcdef1234569999"),
+        None,
+    ],
+    ids=["service", "version", "full-revision", "removed"],
+)
+@pytest.mark.parametrize("edited", [False, True])
+def test_build_change_keeps_the_loaded_shell_and_form_and_stops_polling(browser_page, next_identity, edited):
+    from signin_window.connections import SCRIPT_SOURCE, page
+
+    reads = []
+    original_identity = PageIdentity("Example", "1.2.3", "abcdef1234567890")
+
+    def serve(route):
+        reads.append(route.request.method)
+        first = len(reads) == 1
+        route.fulfill(
+            content_type="text/html",
+            headers={"Content-Security-Policy": f"script-src {SCRIPT_SOURCE}"},
+            body=page(
+                "Original shell" if first else "New shell",
+                '<form action="/connections/save"><input id="choice" value="original"></form>'
+                if first
+                else "<p>New build content</p>",
+                refresh=True,
+                identity=original_identity if first else next_identity,
+            ),
+        )
+
+    browser_page.route("**/*", serve)
+    browser_page.goto("https://app.example/connections/")
+    browser_page.locator("#choice").focus()
+    if edited:
+        browser_page.locator("#choice").fill("unsent choice")
+    browser_page.evaluate("window.originalForm = document.querySelector('form')")
+    link = browser_page.get_by_role("link", name="Reload page", exact=True)
+    link.wait_for()
+    assert link.get_attribute("href") == "https://app.example/connections/"
+    assert browser_page.get_by_role("heading", name="Original shell", exact=True).is_visible()
+    assert browser_page.locator("#choice").input_value() == ("unsent choice" if edited else "original")
+    assert browser_page.evaluate("document.querySelector('form') === window.originalForm")
+    assert browser_page.evaluate("document.activeElement.id") == "choice"
+    footer = browser_page.locator("#connection-identity")
+    assert footer.inner_text() == "Example v1.2.3 · abcdef123456"
+    assert footer.get_attribute("data-source-revision") == original_identity.source_revision
+    assert browser_page.locator("#connection-content").get_attribute("data-refresh") is None
+    browser_page.wait_for_timeout(2300)
+    assert reads == ["GET", "GET"]
+
+
+@pytest.mark.parametrize("next_build", ["same", "changed"])
+def test_transient_non_connections_response_retries_before_comparing_builds(browser_page, next_build):
+    from signin_window.connections import SCRIPT_SOURCE, page
+
+    reads = []
+    original_identity = PageIdentity("Example", "1.2.3", "abcdef1234567890")
+    next_identity = original_identity if next_build == "same" else PageIdentity("Example", "1.2.4", "abcdef1234569999")
+
+    def serve(route):
+        reads.append(route.request.method)
+        if len(reads) == 1:
+            body = page(
+                "Original shell",
+                '<form action="/connections/save"><input id="choice" value="original"></form>'
+                '<p role="status">Pending</p>',
+                refresh=True,
+                identity=original_identity,
+            )
+        elif len(reads) == 2:
+            body = "<!doctype html><html><body><p>Temporarily unavailable</p></body></html>"
+        else:
+            body = page("Next shell", '<p role="status">Connection saved</p>', identity=next_identity)
+        route.fulfill(
+            content_type="text/html", headers={"Content-Security-Policy": f"script-src {SCRIPT_SOURCE}"}, body=body
+        )
+
+    def advance(milliseconds):
+        for _ in range(milliseconds // 500):
+            browser_page.clock.run_for(500)
+            browser_page.wait_for_timeout(25)
+
+    browser_page.clock.install()
+    browser_page.route("**/*", serve)
+    browser_page.goto("https://app.example/connections/")
+    if next_build == "changed":
+        browser_page.locator("#choice").fill("unsent choice")
+    browser_page.evaluate("window.originalForm = document.querySelector('form')")
+    advance(16000)
+    assert reads == ["GET", "GET", "GET"]
+    content = browser_page.locator("#connection-content")
+    assert content.get_attribute("data-refresh") is None
+    if next_build == "same":
+        assert browser_page.locator("#connection-notice").is_hidden()
+        assert browser_page.get_by_role("status").filter(has_text="Connection saved").is_visible()
+    else:
+        assert browser_page.get_by_role("link", name="Reload page", exact=True).is_visible()
+        assert browser_page.get_by_role("heading", name="Original shell", exact=True).is_visible()
+        assert browser_page.locator("#choice").input_value() == "unsent choice"
+        assert browser_page.evaluate("document.querySelector('form') === window.originalForm")
+        footer = browser_page.locator("#connection-identity")
+        assert footer.get_attribute("data-source-revision") == original_identity.source_revision
+    advance(10000)
+    assert reads == ["GET", "GET", "GET"]
 
 
 def test_refresh_expiry_offers_browser_sign_in_without_automatically_starting_one(browser_page):
@@ -212,7 +327,12 @@ def test_status_updates_do_not_erase_unsent_form_changes(browser_page):
         route.fulfill(
             content_type="text/html",
             headers={"Content-Security-Policy": f"script-src {SCRIPT_SOURCE}"},
-            body=page("Example", body if len(reads) == 1 else "<p role=status>Connection saved</p>", refresh=True),
+            body=page(
+                "Example",
+                body if len(reads) == 1 else "<p role=status>Connection saved</p>",
+                refresh=True,
+                identity=PageIdentity("Example", "1.2.3", "abcdef1234567890"),
+            ),
         )
 
     browser_page.route("**/*", serve)

@@ -57,6 +57,7 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import BaseRoute, Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from ._identity import stamp
 from .client import LoginBusy, LoginUnavailable
 from .page import PageText, render
 
@@ -452,7 +453,9 @@ class Relay:
             link = self.find(request.path_params["id"], self._address(request))
             if isinstance(link, Link) and not await self._allowed(request, link, "page"):
                 return HTMLResponse(
-                    "<h1>This sign-in request is unavailable</h1>", status_code=404, headers=PAGE_HEADERS
+                    stamp("<h1>This sign-in request is unavailable</h1>", self.text.identity),
+                    status_code=404,
+                    headers=PAGE_HEADERS,
                 )
             if not isinstance(link, Link) or not self.usable(link):
                 status = 429 if link == "limited" else 404

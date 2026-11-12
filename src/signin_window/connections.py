@@ -11,15 +11,24 @@ import base64
 import hashlib
 import html
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
+from ._identity import footer as identity_footer
 from .connection_state import ConnectionStatus
 
 _SCRIPT = """(() => {
   const content = document.getElementById('connection-content');
   if (!content) return;
   const notice = document.getElementById('connection-notice');
+  const identity = doc => {
+    const footer = doc.getElementById('connection-identity');
+    return footer ? JSON.stringify([
+      footer.dataset.service, footer.dataset.version, footer.dataset.sourceRevision
+    ]) : null;
+  };
+  const initialIdentity = identity(document);
   let failures = 0, polling = false;
   const initialValues = new WeakMap();
   const controls = () => Array.from(content.querySelectorAll('input:not([type=hidden]),textarea,select'));
@@ -30,11 +39,11 @@ _SCRIPT = """(() => {
   }
   function rememberValues() { controls().forEach(element => initialValues.set(element, value(element))); }
   rememberValues();
-  function recover(message) {
+  function recover(message, label = 'Refresh status') {
     notice.replaceChildren(document.createTextNode(message + ' '));
     const link = document.createElement('a');
     link.href = location.href;
-    link.textContent = 'Refresh status';
+    link.textContent = label;
     notice.append(link);
     notice.hidden = false;
   }
@@ -86,6 +95,11 @@ _SCRIPT = """(() => {
       const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
       const next = doc.getElementById('connection-content');
       if (!next) throw new Error('status');
+      if (identity(doc) !== initialIdentity) {
+        content.removeAttribute('data-refresh');
+        recover('A new version is available. Reload to use it; your current form has been kept.', 'Reload page');
+        return;
+      }
       failures = 0;
       notice.hidden = true;
       // Do not interrupt an open confirmation or text selection. The server still rejects stale action forms.
@@ -151,6 +165,12 @@ input[type=checkbox]{margin-right:.5rem}code{overflow-wrap:anywhere;font-size:1.
 ol{padding-left:1.5rem}li{margin:.6rem 0}ul{padding-left:1.2rem}
 .code{font:700 1.6rem/1.5 ui-monospace,monospace;user-select:all}
 #connection-notice{border:1px solid var(--line);padding:1rem;border-radius:.6rem;background:var(--surface)}
+#connection-identity{font-size:.8rem;color:var(--muted);margin-top:1.5rem;user-select:text}
+#connection-identity details{border:0;margin:0;padding:0}
+#connection-identity summary{font-size:inherit;font-weight:400;min-height:24px;padding:.2rem 0}
+#connection-identity small{font-size:inherit}
+#connection-identity p{margin:.25rem 0 0}
+#connection-identity code{display:block;white-space:normal;overflow-wrap:anywhere;user-select:all}
 [hidden]{display:none!important}
 @media(prefers-color-scheme:dark){:root{--bg:#121a26;--surface:#1c2736;--text:#eef2f8;--muted:#b7c4d6;
 --line:#415168;--accent:#9cc0ff;--on-accent:#14263f;--danger:#be4651;--status-bg:#2a3950;--focus:#ffd486}
@@ -161,11 +181,27 @@ form{display:block;margin:.6rem 0}button,.button{width:100%;text-align:center}}
 """
 
 
+@dataclass(frozen=True)
+class PageIdentity:
+    """Host application's build metadata, never the renderer package's version."""
+
+    service: str
+    version: str
+    source_revision: str
+
+
 def page(
-    title: str, body: str, *, intro: str = "", refresh: bool = False, login_url: str = "/connections/login"
+    title: str,
+    body: str,
+    *,
+    intro: str = "",
+    refresh: bool = False,
+    login_url: str = "/connections/login",
+    identity: PageIdentity | None = None,
 ) -> str:
-    """Render trusted application markup inside the common accessible shell."""
+    """Render trusted application markup, with optional host-supplied build identity."""
     live = " data-refresh" if refresh else ""
+    footer = identity_footer(identity, element_id="connection-identity") if identity is not None else ""
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -182,6 +218,7 @@ def page(
             if refresh
             else ""
         )
+        + footer
         + f"</main><script>{_SCRIPT}</script></body></html>"
     )
 

@@ -10,6 +10,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from signin_window import relay as relay_module
 from signin_window.client import LoginBusy, LoginUnavailable
+from signin_window.connections import PageIdentity
 from signin_window.page import PageText
 from signin_window.relay import Link, LinkLimited, Relay
 
@@ -397,3 +398,31 @@ def test_the_viewers_files_are_asked_for_the_links_window(relay, http, backend):
     start(http, link)
     http.get(path(link) + "/novnc/vnc.html")
     assert backend.static_for == "window-0000000000"
+
+
+def test_relay_forwards_host_identity_to_owned_pages_only(backend):
+    relay = Relay(
+        backend,
+        "https://example.com/connect",
+        text=PageText(identity=PageIdentity("Example", "1.2.3", "abcdef1234567890")),
+    )
+    link = relay.create("synthetic-account", label="Private account label")
+    with TestClient(relay.app(), base_url="https://example.com") as client:
+        for target, status in [("/" + link.id, 200), ("/" + "x" * 32, 404)]:
+            response = client.get(target)
+            assert response.status_code == status
+            assert 'data-source-revision="abcdef1234567890"' in response.text
+            assert "Example v1.2.3 · abcdef123456" in response.text
+        relay.start(link, "desktop")
+        viewer = client.get("/" + link.id + "/novnc/vnc.html")
+        assert viewer.status_code == 200
+        assert "page-identity" not in viewer.text
+        assert "abcdef1234567890" not in viewer.text
+        relay._authorize = lambda request, link, operation: False
+        unavailable = client.get("/" + link.id)
+        assert unavailable.status_code == 404
+        assert "This sign-in request is unavailable" in unavailable.text
+        assert "Private account label" not in unavailable.text
+        assert 'data-source-revision="abcdef1234567890"' in unavailable.text
+        assert "v" * 24 not in unavailable.text
+        assert "s3cret-cookie" not in unavailable.text

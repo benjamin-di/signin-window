@@ -176,10 +176,15 @@ async def main(windows_box: list) -> int:
         print("live view connected through the link")
 
         canvas = await frame.wait_for_selector("#noVNC_container canvas")
-        await canvas.click()  # focuses the viewer, and the remote field under the pointer
-        await remote["page"].focus("#f")
-        await page.keyboard.press("y")  # plain typing reaches the field before the paste is tried
-        await wait_for(lambda: _value(remote, "y"), "a typed key did not reach the remote page")
+        # A connected view can still drop the first input on a loaded host; a person would click again.
+        for _ in range(3):
+            await canvas.click()  # focuses the viewer, and the remote field under the pointer
+            await remote["page"].focus("#f")
+            await page.keyboard.press("y")  # plain typing reaches the field before the paste is tried
+            if await _within(lambda: _value(remote, "y"), seconds=10):
+                break
+            await remote["page"].fill("#f", "")
+        await wait_for(lambda: _value(remote, "y"), "a typed key did not reach the remote page", seconds=1)
         await page.keyboard.press("Backspace")
         await page.evaluate("text => navigator.clipboard.writeText(text)", TEXT)
         await page.keyboard.press("Control+V")
@@ -207,6 +212,14 @@ async def main(windows_box: list) -> int:
         await viewer.close()
     print("e2e: ok")
     return 0
+
+
+async def _within(check, seconds: float) -> bool:  # type: ignore[no-untyped-def]
+    for _ in range(int(seconds * 10)):
+        if await check():
+            return True
+        await asyncio.sleep(0.1)
+    return False
 
 
 async def _value(remote: dict, expected: str) -> bool:

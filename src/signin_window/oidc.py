@@ -27,7 +27,7 @@ from starlette.requests import HTTPConnection, Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from .connections import SCRIPT_SOURCE, page
+from .connections import SCRIPT_SOURCE, PageIdentity, page
 
 #: Browser safety headers of every Connections page; an application's own complete policy takes precedence.
 PAGE_HEADERS = {
@@ -188,10 +188,23 @@ class BrowserStore:
 
 
 class BrowserAuth:
-    """Code + PKCE + nonce login through Authlib, with application-owned authorization."""
+    """Code + PKCE + nonce login through Authlib, with application-owned authorization.
 
-    def __init__(self, config: OIDCConfig, *, clock=time.time, transport=None, on_group_refused=None, on_sign_in=None):
+    ``identity`` optionally identifies the host build on locally rendered pages.
+    """
+
+    def __init__(
+        self,
+        config: OIDCConfig,
+        *,
+        clock=time.time,
+        transport=None,
+        on_group_refused=None,
+        on_sign_in=None,
+        identity: PageIdentity | None = None,
+    ):
         self.config = config
+        self.page_identity = identity
         self.on_group_refused = on_group_refused
         self.on_sign_in = on_sign_in
         self.store = BrowserStore(config.state_dir, clock=clock)
@@ -292,6 +305,7 @@ class BrowserAuth:
                 "Confirm and continue</a></p>"
                 f'<p><a href="{html.escape(self.home, quote=True)}">Back to Connections</a></p>',
                 login_url=self.prefix + "/connections/login",
+                identity=self.page_identity,
             ),
             status_code=403,
             headers=PAGE_HEADERS,
@@ -320,7 +334,9 @@ class BrowserAuth:
                 "cannot make this change. Return to Connections and try again.</p>"
                 f'<p><a class="button" href="{html.escape(self.home, quote=True)}">Back to Connections</a></p>'
             )
-        return HTMLResponse(page(title, body, login_url=login), status_code=status, headers=PAGE_HEADERS)
+        return HTMLResponse(
+            page(title, body, login_url=login, identity=self.page_identity), status_code=status, headers=PAGE_HEADERS
+        )
 
     def _destination(self, value):
         if value == self.home or re.fullmatch(re.escape(self.prefix + "/connect/") + r"[A-Za-z0-9_-]{32,64}", value):
@@ -367,6 +383,7 @@ class BrowserAuth:
                     "Sign-in is unavailable",
                     "<p>We could not reach a trusted sign-in service. Try signing in to Connections again.</p>"
                     f'<p><a class="button" href="{html.escape(self.home, quote=True)}">Back to Connections</a></p>',
+                    identity=self.page_identity,
                 ),
                 status_code=503,
             )
@@ -471,6 +488,7 @@ class BrowserAuth:
                     "<p>Sign in to Connections again. If this keeps happening, ask your administrator to check "
                     "that this account has access.</p>"
                     f'<p><a class="button" href="{html.escape(self.home, quote=True)}">Back to Connections</a></p>',
+                    identity=self.page_identity,
                 ),
                 status_code=403,
             )
@@ -486,6 +504,7 @@ class BrowserAuth:
                 "<p>Signing out does not disconnect your saved accounts.</p>"
                 f'<p><a class="button" href="{html.escape(self.prefix)}/connections/login">'
                 "Sign in to Connections</a></p>",
+                identity=self.page_identity,
             )
         )
 

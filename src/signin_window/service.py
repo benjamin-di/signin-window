@@ -52,6 +52,9 @@ from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from ._identity import stamp
+from .connections import PageIdentity
+
 log = logging.getLogger("signin_window")
 
 #: Window sizes for the person's screen: the display is made this size, and so should the browser window be.
@@ -574,6 +577,7 @@ def build_app(
     title: str = "Sign in",
     routes: Iterable[BaseRoute] = (),
     direct_view: bool = True,
+    identity: PageIdentity | None = None,
 ) -> Starlette:
     """The login service's API::
 
@@ -589,7 +593,8 @@ def build_app(
     ``start_params(body)`` turns the start request into the window's ``params`` (raise ``ValueError`` to refuse it
     with 400); without it, a start takes no parameters. ``routes`` adds your own (behind the bearer). With
     ``direct_view`` False there is no ``/view`` page, and the live view needs the bearer as well as the window's token
-    (only your server, through the relay, can open it).
+    (only your server, through the relay, can open it). ``identity`` optionally stamps the direct viewer shell
+    with the host application's build metadata; noVNC files are unchanged.
     """
     if len(token) < 32:
         raise ValueError("the bearer token must have at least 32 characters")
@@ -641,7 +646,14 @@ def build_app(
     async def view(request: Request) -> Response:
         if viewable(request.path_params["id"], request.query_params.get("t", "")) is None:
             return Response(status_code=404)
-        page = VIEW_PAGE.replace("{{TITLE}}", _escape(title))
+        page = stamp(
+            VIEW_PAGE.replace("{{TITLE}}", _escape(title)),
+            identity,
+            style=(
+                "body{display:flex;flex-direction:column}header,#status{flex-shrink:0}"
+                "#screen{position:static;flex:1;min-height:0}#status{position:static}#done{flex:1}"
+            ),
+        )
         return HTMLResponse(page, headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
 
     async def view_state(request: Request) -> JSONResponse:

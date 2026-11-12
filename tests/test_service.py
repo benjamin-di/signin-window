@@ -16,6 +16,7 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from signin_window import service
+from signin_window.connections import PageIdentity
 from signin_window.service import Windows, build_app
 
 TOKEN = "t" * 40
@@ -511,3 +512,39 @@ def test_without_the_direct_view_the_live_view_needs_the_bearer_too(tmp_path):
             client.websocket_connect(f"/logins/{started['id']}/vnc?t={started['view_token']}"),
         ):
             pass  # the token alone opens nothing
+
+
+def test_direct_view_stamps_only_its_owned_shell_without_changing_admission_or_state(tmp_path, caplog):
+    vendor = "<html><body>Unmodified synthetic viewer</body></html>"
+    (tmp_path / "vnc.html").write_text(vendor)
+    identity = PageIdentity('<img src=x onerror="bad()">', '1.2.3" <dev>', 'abcdef1234567890" <revision>')
+    app = app_for(no_display(Windows(waiting_until({}))), tmp_path, identity=identity)
+    with TestClient(app) as client:
+        started = client.post("/logins", json={}, headers=AUTH).json()
+        window_id, view_token = started["id"], started["view_token"]
+        poll(client, window_id, "waiting")
+        assert client.get(f"/view/{window_id}?t=wrong").status_code == 404
+        response = client.get(f"/view/{window_id}?t={view_token}")
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["x-frame-options"] == "DENY"
+        assert 'data-source-revision="abcdef1234567890&quot; &lt;revision&gt;"' in response.text
+        assert "&lt;img src=x onerror=&quot;bad()&quot;&gt; v1.2.3&quot; &lt;dev&gt;" in response.text
+        assert "<img src=x" not in response.text
+        assert "<code>abcdef1234567890&quot; &lt;revision&gt;</code>" in response.text
+        assert view_token not in response.text and "secret" not in response.text
+        assert client.get(f"/view/{window_id}/state?t={view_token}").json() == {
+            "state": "waiting",
+            "host": "accounts.example.com",
+        }
+        assert client.get("/novnc/vnc.html").text == vendor
+        assert client.get(f"/logins/{window_id}").status_code == 401
+        assert view_token not in caplog.text and "secret" not in caplog.text
+
+
+def test_direct_view_without_identity_keeps_the_existing_shell(tmp_path):
+    app = app_for(no_display(Windows(waiting_until({}))), tmp_path)
+    with TestClient(app) as client:
+        started = client.post("/logins", json={}, headers=AUTH).json()
+        response = client.get(f"/view/{started['id']}?t={started['view_token']}")
+        assert response.text == service.VIEW_PAGE.replace("{{TITLE}}", "Sign in")

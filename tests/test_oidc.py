@@ -14,6 +14,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+from signin_window.connections import PageIdentity
 from signin_window.oidc import BrowserAuth, BrowserStore, OIDCConfig
 
 
@@ -539,3 +540,44 @@ def test_confirmation_and_refusal_pages_carry_their_own_safety_headers(stepping)
     served = client.post("/connections/act", headers={"origin": auth.origin})
     for name in PAGE_HEADERS:
         assert len(served.headers.get_list(name)) == 1
+
+
+def test_browser_auth_forwards_host_identity_to_every_owned_html_outcome(system, monkeypatch, caplog):
+    from unittest.mock import AsyncMock
+
+    original, provider, _ = system
+    metadata = PageIdentity('<img src=x onerror="bad()">', '1.2.3" <dev>', 'abcdef1234567890" <revision>')
+    auth = BrowserAuth(original.config, transport=provider.transport(), identity=metadata)
+    responses = []
+    with TestClient(stepping_app(auth), base_url=auth.config.public_url, follow_redirects=False) as client:
+        refused = client.post("/connections/act", headers={"origin": auth.origin})
+        assert refused.status_code == 401
+        responses.append(refused)
+        callback = client.get("/connections/callback?code=private-callback&state=invalid")
+        assert callback.status_code == 403
+        responses.append(callback)
+        with monkeypatch.context() as patch:
+            patch.setattr(auth.client, "load_server_metadata", AsyncMock(side_effect=ValueError("private-provider")))
+            unavailable = client.get("/connections/login")
+            assert unavailable.status_code == 503
+            responses.append(unavailable)
+        provider.tamper["auth_time"] = int(time.time()) - 600
+        assert sign_in(provider, client).status_code == 303
+        confirm = client.post("/connections/act", headers={"origin": auth.origin})
+        assert confirm.status_code == 403 and "Confirm and continue" in confirm.text
+        responses.append(confirm)
+        foreign = client.post("/connections/act", headers={"origin": "https://other.example.com"})
+        assert foreign.status_code == 403
+        responses.append(foreign)
+        logout = client.post("/connections/logout", headers={"origin": auth.origin})
+        assert logout.status_code == 200
+        responses.append(logout)
+        for response in responses:
+            assert 'id="connection-identity"' in response.text
+            assert 'data-source-revision="abcdef1234567890&quot; &lt;revision&gt;"' in response.text
+            assert "&lt;img src=x onerror=&quot;bad()&quot;&gt; v1.2.3&quot; &lt;dev&gt;" in response.text
+            assert "<img src=x" not in response.text
+            assert response.headers["cache-control"] == "no-store"
+            assert "subject-one" not in response.text
+            assert "private-callback" not in response.text and "private-provider" not in response.text
+        assert "private-provider" not in caplog.text and "private-callback" not in caplog.text

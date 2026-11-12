@@ -26,6 +26,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from signin_window import delegation as oauth
+from signin_window.connections import PageIdentity
 from signin_window.delegation import OAuthConfig, OAuthError, OAuthManager, register_routes
 
 ISSUER = "https://identity.example.com"
@@ -566,13 +567,24 @@ def test_form_policy_uses_only_issuer_origin_and_cannot_inject_directives(config
     ]
 
 
-def test_browser_routes_need_capability_cookie_csrf_origin_and_never_echo_secrets(manager, provider):
+@pytest.mark.parametrize("identity", [None, PageIdentity("Example", "1.2.3", "abcdef1234567890")])
+def test_browser_routes_need_capability_cookie_csrf_origin_and_never_echo_secrets(manager, provider, identity):
     server = FastMCP("synthetic-oauth")
-    register_routes(server, manager)
+    register_routes(server, manager, identity=identity)
+
+    def assert_identity(response):
+        assert ('id="page-identity"' in response.text) == (identity is not None)
+        assert "<style>" not in response.text and "style=" not in response.text
+        assert "'unsafe-inline'" not in response.headers["content-security-policy"]
+        if identity is not None:
+            assert "<small>Example v1.2.3 · abcdef123456</small>" in response.text
+            assert "<code>abcdef1234567890</code>" in response.text
+
     with TestClient(server.http_app(), base_url=BASE, follow_redirects=False) as client:
         url = manager.connection_url("user-a")
         response = client.get(urlsplit(url).path)
         assert response.status_code == 200
+        assert_identity(response)
         assert all(s in response.headers["set-cookie"] for s in ("Secure", "HttpOnly", "SameSite=lax", "Path=/oauth"))
         assert response.headers["cache-control"] == "no-store"
         assert response.headers["referrer-policy"] == "same-origin"
@@ -611,9 +623,23 @@ def test_browser_routes_need_capability_cookie_csrf_origin_and_never_echo_secret
             "/oauth/callback", params={"code": code, "state": query["state"], "scope": query["scope"]}
         )
         assert response.status_code == 200 and manager.connected("user-a")
+        assert_identity(response)
         assert code not in response.text and "subject-user-a" not in response.text
         assert client.get("/oauth/callback?code=private&state=bad&state=duplicate").status_code == 400
         assert client.get(urlsplit(url).path).status_code == 400
+        for response in (
+            client.get(urlsplit(url).path),
+            client.post(action, data={"csrf": "wrong", "action": "connect"}, headers={"Origin": BASE}),
+            client.get("/oauth/callback?code=private&state=bad&state=duplicate"),
+        ):
+            assert response.status_code == 400
+            assert_identity(response)
+        csrf = re.search(
+            r'name="csrf" value="([^"]+)"', client.get(urlsplit(manager.connection_url("user-a")).path).text
+        )[1]
+        disconnected = client.post(action, data={"csrf": csrf, "action": "disconnect"}, headers={"Origin": BASE})
+        assert disconnected.status_code == 200 and not manager.connected("user-a")
+        assert_identity(disconnected)
 
 
 @pytest.mark.parametrize(
@@ -1026,3 +1052,15 @@ def test_owner_proof_uses_only_the_configured_resource_response_header(config, t
     manager._prove_owner("user-a", "synthetic-token")
     with pytest.raises(OAuthError):
         manager._prove_owner("user-b", "synthetic-token")
+
+
+def test_delegation_footer_escapes_metadata_without_changing_the_consent_form(manager):
+    identity = PageIdentity('<img src=x onerror="bad()">', '1.2.3" <dev>', 'abcdef1234567890" <revision>')
+    baseline = oauth._page(manager, "synthetic-csrf")
+    response = oauth._page(manager, "synthetic-csrf", identity=identity)
+    assert dict(response.headers)["content-security-policy"] == dict(baseline.headers)["content-security-policy"]
+    assert response.body.startswith(baseline.body)
+    assert b"<img src=x" not in response.body
+    assert b"&lt;img src=x onerror=&quot;bad()&quot;&gt; v1.2.3&quot; &lt;dev&gt;" in response.body
+    assert b"<code>abcdef1234567890&quot; &lt;revision&gt;</code>" in response.body
+    assert b"<style>" not in response.body
