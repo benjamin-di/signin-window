@@ -70,7 +70,7 @@ VIEWER = """<!DOCTYPE html>
 """
 
 MODULES = {
-    "/app/ui.js": "export default { rfb: null };",
+    "/app/ui.js": "export default { rfb: null, keepControlbar() { clearTimeout(this.closeControlbarTimeout); } };",
     "/core/input/keysym.js": """export default {
   XK_Return: 0xff0d, XK_Tab: 0xff09, XK_Shift_L: 0xffe1, XK_Control_L: 0xffe3,
   XK_Control_R: 0xffe4, XK_Alt_L: 0xffe9, XK_Super_L: 0xffeb, XK_Super_R: 0xffec,

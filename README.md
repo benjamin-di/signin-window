@@ -23,7 +23,7 @@ person's browser ──https──> your server (relay) ──private network─
   waits until the site has signed the person in. It stays on a private network, behind a bearer.
 - **The relay** (`signin_window.relay`) runs in your server: one-time links, their page, noVNC's files and the live
   view, carried through to the login service. When the window ends, your hook stores the session.
-- **The paste add-on** lets the person paste into the remote page with Ctrl+V (Cmd+V), which noVNC alone does not.
+- **The input add-on** provides a visible Show keyboard control for phones and desktop paste with Ctrl+V (Cmd+V).
 
 The human window and relay APIs never click, type or fill a page: the person
 does every step of the sign-in. They never import optional automation modules.
@@ -416,13 +416,22 @@ Report vulnerabilities privately ([SECURITY.md](SECURITY.md)).
 ```sh
 make bootstrap   # uv sync --locked
 make check       # lint, format, tests
-uv sync --group browser && uv run playwright install chromium && uv run pytest tests/test_paste_dom.py
+uv sync --group browser && uv run playwright install chromium && uv run pytest tests/test_paste_dom.py tests/test_mobile_dom.py
 NOVNC_DIR=/opt/novnc uv run --group browser python scripts/e2e.py   # with Xvfb and x11vnc installed
 sudo .venv/bin/python -m signin_window.browser install-policy && uv run --group browser python scripts/browser_check.py
 ```
 
 `scripts/e2e.py` runs the whole path with real browsers and a stand-in site: a link, its live view, paste, a
-hand-over and closing the page; CI runs it on every change.
+mobile typing, password/code paste, editing keys, hand-over and closing the page; CI runs it on every change.
+
+On a phone, tap the field in the remote page, then **Show keyboard** above the viewer. Type or use the
+keyboard’s Paste menu in the masked input. Edits go directly to the remote page; **Tab**, **Enter** and
+**Backspace** act on that page. The input clears after each edit and when the viewer loses focus or disconnects.
+The native editor supports printable ASCII text. It rejects an entire edit containing other characters with
+visible feedback because the virtual display can drop their keysyms; it never sends just the supported characters.
+The warning remains while typing continues. Hide and reopen the keyboard to clear it before retrying the field.
+The browser tests check focus and input transport; opening the operating system keyboard still needs a
+physical-device check.
 
 ## License
 

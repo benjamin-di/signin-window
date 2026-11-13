@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.8.2] - 2026-11-13
+
+### Fixed
+
+- Make remote sign-in usable on phones with a visible Show keyboard control, masked transient input and explicit editing keys; bind paced typing to its VNC connection and reject multiline mobile credential paste (#10).
+- Preserve every completed native composition when edits arrive rapidly, without a deferred commit overwriting the next edit (#10).
+- Keep native typing available when clipboard paste cancels an unfinished composition, and show feedback when queued editing keys cannot be accepted (#10).
+- Keep the viewer within the visual viewport when a mobile keyboard opens and dispose of it when the sign-in ends (#10).
+- Refuse native edits containing characters the virtual keyboard transport cannot deliver, with visible feedback and no partial credential transmission (#10).
+- Cancel clipboard gestures that outlive their original viewer before canvas or native-editor input can send them, while allowing a fresh paste in the current viewer (#10).
+
+### Upgrade
+
+- Action required: none.
+- Rollback: compatible with 0.8.1; it restores the previous viewer input behavior without changing saved state.
+
+[0.8.2]: https://github.com/benjamin-di/signin-window/releases/tag/v0.8.2
+
 ## [0.8.1] - 2026-11-11
 
 _Publishes the 0.8.0 changes, which the public mirror and PyPI did not receive; the package is unchanged from 0.8.0._

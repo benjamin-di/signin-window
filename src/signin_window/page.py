@@ -42,7 +42,8 @@ class PageText:
     title: str = "Connect your {service} account"
     help_html: str = (
         "Sign in to {service} in the remote browser below. Use a password or verification code; device passkeys "
-        "do not work in this window. You can paste text with Ctrl+V or Cmd+V."
+        "do not work in this window. Tap a remote field, then Show keyboard to type or paste on your phone. "
+        "On a computer, you can also paste with Ctrl+V or Cmd+V."
     )
     intro_html: str = "Connect {service} for <b>{label}</b>. Sign in to the account you want this application to use."
     button: str = "Continue to {service}'s sign-in"
@@ -160,7 +161,8 @@ _PAGE = """<!doctype html><html lang=en><meta charset=utf-8>
 <style>
 :root{color-scheme:light;font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;color:#141414}
 html,body{margin:0;height:100%;background:#f4f4f4}
-body{display:flex;flex-direction:column}
+body{display:flex;flex-direction:column;height:var(--signin-viewport-height,100dvh)}
+header{flex-shrink:0}
 header{padding:12px 16px 8px;background:#fff;border-bottom:1px solid #ddd}
 h1{font-size:18px;margin:0 0 4px}
 header p{margin:0 0 8px;font-size:14px;color:#4b4b4b;max-width:62em}
@@ -178,6 +180,7 @@ a:focus-visible,button:focus-visible{outline:3px solid #a35d00;outline-offset:3p
 #recovery{margin:0;padding:12px 16px;background:#fff3d9;color:#5d400a}#recovery button{margin:4px 8px;font-size:14px}
 input{font:inherit;width:100%;box-sizing:border-box;padding:10px;margin-top:10px;border:1px solid #999;
  border-radius:6px}
+body.keyboard-open header p{display:none}
 [hidden]{display:none!important}
 @media (max-width:600px){header p{font-size:14px}.bar{flex-wrap:wrap}#status{text-align:left}}
 </style>
@@ -188,6 +191,15 @@ input{font:inherit;width:100%;box-sizing:border-box;padding:10px;margin-top:10px
 _SCRIPT = """<script>
 const base = location.pathname.replace(/\\/+$/, "");
 const $ = id => document.getElementById(id);
+// iOS can shrink the visual viewport without resizing the layout viewport. Keep the iframe and its input in view.
+function fitViewport() {
+  if (window.visualViewport) {
+    document.body.classList.toggle('keyboard-open', visualViewport.height < innerHeight * .8);
+    document.documentElement.style.setProperty('--signin-viewport-height', `${visualViewport.height}px`);
+  }
+}
+fitViewport();
+if (window.visualViewport) visualViewport.addEventListener('resize', fitViewport);
 const esc = t => String(t ?? "").replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 async function request(path, options = {}, allowEmpty = false) {
   const controller = new AbortController();
@@ -227,6 +239,7 @@ function finish(html) {
   over = true;
   clearTimeout(pollTimer);
   $("recovery").hidden = true;
+  $("view").replaceChildren(); viewer = false;
   $("view").hidden = true;
   $("intro").hidden = true;
   document.querySelector("header .bar").hidden = true;

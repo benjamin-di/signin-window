@@ -43,7 +43,9 @@ from signin_window.service import Window, Windows, build_app
 TEXT = "Hello, Example 123 @#%&*()[]{}<>?/|~ pass:Word_-+=."
 FIELD_PAGE = (
     "<!doctype html><title>stand-in</title>"
-    "<input id=f autofocus style='position:fixed;inset:0;width:100%;height:100%;font-size:24px'>"
+    "<input id=f autofocus style='position:fixed;top:0;left:0;width:100%;height:30%;font-size:24px'>"
+    "<input id=password type=password style='position:fixed;top:35%;left:0;width:100%;height:25%;font-size:24px'>"
+    "<input id=code inputmode=numeric style='position:fixed;top:70%;left:0;width:100%;height:25%;font-size:24px'>"
     "<script>const d = document.documentElement.dataset; d.mouse = d.keys = 0;"
     "addEventListener('mousedown', () => d.mouse++, true); addEventListener('keydown', () => d.keys++, true);"
     "</script>"
@@ -164,7 +166,7 @@ async def main(windows_box: list) -> int:
 
         link = relay.create("jane")
         viewer = await pw.chromium.launch(headless=True)
-        context = await viewer.new_context(viewport={"width": 1280, "height": 800})
+        context = await viewer.new_context(viewport={"width": 390, "height": 844}, has_touch=True)
         await context.grant_permissions(["clipboard-write"], origin=f"http://127.0.0.1:{app_port}")
         page = SHOTS["viewer"] = await context.new_page()
         await page.goto(link.url)
@@ -176,10 +178,122 @@ async def main(windows_box: list) -> int:
         print("live view connected through the link")
 
         canvas = await frame.wait_for_selector("#noVNC_container canvas")
+
+        # Real noVNC -> relay -> service -> x11vnc -> synthetic remote Chromium fields.
+        # DOM focus and emulated touch cannot prove an actual iOS software keyboard opens.
+        async def remote_value(selector, expected):
+            return await remote["page"].input_value(selector) == expected
+
+        async def mobile_paste(value):
+            await frame.locator("#signin_input").evaluate(
+                """(input, text) => {
+              const clipboardData = new DataTransfer(); clipboardData.setData('text/plain', text);
+              input.dispatchEvent(new ClipboardEvent('paste', {clipboardData, bubbles:true, cancelable:true}));
+            }""",
+                value,
+            )
+
+        async def select_first_field():
+            before = await remote["page"].evaluate("Number(document.documentElement.dataset.mouse)")
+            await canvas.click(position={"x": 10, "y": 10})
+
+            async def selected():
+                return await remote["page"].evaluate(
+                    "before => document.activeElement.id === 'f' && "
+                    "Number(document.documentElement.dataset.mouse) > before",
+                    before,
+                )
+
+            await wait_for(selected, "remote field click did not arrive")
+
+        await select_first_field()
+        # Make noVNC's scheduled toolbar close happen during the paced typing,
+        # independent of how quickly this host starts the viewer.
+        await frame.evaluate("""async () => {
+          const {default: UI} = await import('./app/ui.js');
+          UI.keepControlbar();
+          document.getElementById('signin_show').addEventListener('pointerdown', () => {
+            UI.closeControlbarTimeout = setTimeout(UI.closeControlbar, 150);
+          }, {capture: true, once: true});
+        }""")
+        await frame.get_by_role("button", name="Show keyboard", exact=True).click()
+        await page.keyboard.insert_text("user@example.com")
+        await wait_for(lambda: remote_value("#f", "user@example.com"), "mobile text did not reach the remote field")
+        await frame.get_by_role("button", name="Tab", exact=True).click()
+        await mobile_paste("Synthetic!9")
+        await wait_for(
+            lambda: remote_value("#password", "Synthetic!9"), "password paste did not reach the remote field"
+        )
+        await frame.get_by_role("button", name="Backspace", exact=True).click()
+        await page.keyboard.insert_text("8")
+        await wait_for(lambda: remote_value("#password", "Synthetic!8"), "remote password editing failed")
+        await frame.get_by_role("button", name="Tab", exact=True).click()
+        await mobile_paste("000123")
+        await wait_for(lambda: remote_value("#code", "000123"), "verification paste did not reach the remote field")
+        for _ in range(2):
+            await page.keyboard.press("Backspace")
+        await wait_for(lambda: remote_value("#code", "0001"), "repeated native Backspace did not edit the remote field")
+        await frame.get_by_role("button", name="Enter", exact=True).click()
+        assert await frame.locator("#signin_input").input_value() == "_"
+        await frame.get_by_role("button", name="Hide keyboard", exact=True).click()
+        assert await frame.locator("#signin_input").input_value() == ""
+        await remote["page"].fill("#f", "")
+        await select_first_field()
+        await frame.get_by_role("button", name="Show keyboard", exact=True).click()
+        await page.keyboard.press("Control+a")
+        await page.keyboard.insert_text("_Synthetic9")
+        await wait_for(lambda: remote_value("#f", "_Synthetic9"), "native replacement changed a leading underscore")
+        await remote["page"].fill("#f", "")
+        await page.keyboard.press("Home")
+        await page.keyboard.insert_text("Ab9!")
+        await wait_for(lambda: remote_value("#f", "Ab9!"), "native caret movement transmitted the local placeholder")
+        # Native IME edits can finish faster than the VNC typing queue drains.
+        cdp = await context.new_cdp_session(page)
+        sequence = [("Control+A", "_Ab9!"), ("Home", "Ab9!"), ("End", "_XYZ")] * 4
+        for key, value in sequence:
+            await page.keyboard.press(key)
+            await cdp.send(
+                "Input.imeSetComposition", {"text": value, "selectionStart": len(value), "selectionEnd": len(value)}
+            )
+            await cdp.send("Input.insertText", {"text": value})
+        await cdp.detach()
+        expected = "Ab9!" + "".join(value for _, value in sequence)
+        await wait_for(lambda: remote_value("#f", expected), "rapid native composition lost or duplicated remote text")
+        assert await frame.locator("#signin_feedback").inner_text() == ""
+        # A native paste can cancel the IME without a compositionend notification.
+        await page.evaluate("text => navigator.clipboard.writeText(text)", "_Paste9!")
+        cdp = await context.new_cdp_session(page)
+        await cdp.send("Input.imeSetComposition", {"text": "UNCOMMITTED9", "selectionStart": 12, "selectionEnd": 12})
+        await page.keyboard.press("Control+V")
+        await page.keyboard.insert_text("NEXT9!")
+        await cdp.detach()
+        expected += "_Paste9!NEXT9!"
+        await wait_for(lambda: remote_value("#f", expected), "native paste during IME disabled following input")
+        assert await frame.locator("#signin_input").input_value() == "_"
+        assert await frame.locator("#signin_feedback").inner_text() == ""
+        await remote["page"].fill("#f", "Ab9!")
+        for mode in ("insert", "composition", "paste"):
+            value = "_päss文9😀"
+            if mode == "composition":
+                cdp = await context.new_cdp_session(page)
+                await cdp.send("Input.imeSetComposition", {"text": value, "selectionStart": 0, "selectionEnd": 0})
+                await cdp.send("Input.insertText", {"text": value})
+                await cdp.detach()
+            elif mode == "paste":
+                await mobile_paste(value)
+            else:
+                await page.keyboard.insert_text(value)
+            await asyncio.sleep(0.3)
+            assert await remote_value("#f", "Ab9!"), f"unsupported native {mode} sent a partial credential"
+            assert await frame.locator("#signin_feedback").inner_text(), f"native {mode} gave no refusal feedback"
+            assert await frame.locator("#signin_input").input_value() == "_"
+        await frame.get_by_role("button", name="Hide keyboard", exact=True).click()
+        print("mobile text, masked password paste/edit, Tab, verification paste and repeated Backspace passed real VNC")
+        await page.set_viewport_size({"width": 1280, "height": 800})
+        await remote["page"].fill("#f", "")
         # A connected view can still drop the first input on a loaded host; a person would click again.
         for _ in range(3):
-            await canvas.click()  # focuses the viewer, and the remote field under the pointer
-            await remote["page"].focus("#f")
+            await select_first_field()
             await page.keyboard.press("y")  # plain typing reaches the field before the paste is tried
             if await _within(lambda: _value(remote, "y"), seconds=10):
                 break
@@ -199,7 +313,8 @@ async def main(windows_box: list) -> int:
         }:
             print(f"FAIL: the page says {heading!r}; stored {stored!r}", file=sys.stderr)
             return 1
-        print("Ctrl+V typed the clipboard into the remote page; the session was handed over and stored")
+        assert await page.locator("iframe").count() == 0
+        print("Ctrl+V typed the clipboard into the remote page; the session was handed over and the viewer disposed")
 
         second = relay.create("john")
         page = await context.new_page()

@@ -443,7 +443,8 @@ def test_a_display_or_port_still_held_is_skipped(tmp_path, monkeypatch):
         held.close()
 
 
-def test_a_display_that_exits_at_once_is_an_error(tmp_path):
+def test_a_display_that_exits_at_once_is_an_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(Windows, "x_tmp", tmp_path)
     windows = Windows(waiting_until({}), xvfb="/bin/false", x11vnc="/bin/false")
     window = service.Window("w" * 24, "desktop", 0, 0.0, 10.0)
     with pytest.raises(RuntimeError):
