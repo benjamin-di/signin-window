@@ -26,7 +26,10 @@ def mobile(request, mobile_browser):
       XK_Shift_L: 0xffe1, XK_Control_L: 0xffe3, XK_Control_R: 0xffe4,
       XK_Alt_L: 0xffe9, XK_Super_L: 0xffeb, XK_Super_R: 0xffec,
     };"""
-    html = VIEWER.replace("<body></body>", "<body><div id=noVNC_container><canvas tabindex=0></canvas></div></body>")
+    html = VIEWER.replace(
+        "<body></body>",
+        "<body><div id=noVNC_container><canvas width=500 height=900 tabindex=0></canvas></div></body>",
+    )
     html = html.replace("viewOnly: false,", "viewOnly: false, focusOnClick: true,")
     html = html.replace(
         "if (down === undefined) state.typed += String.fromCodePoint(keysym);",
@@ -57,7 +60,7 @@ def mobile(request, mobile_browser):
     }, true);""")
     page.route("**/*", serve)
     page.goto("https://viewer.example/vnc.html")
-    page.get_by_role("button", name="Show keyboard", exact=True).click()
+    page.get_by_role("button", name="Keyboard", exact=True).click()
     yield page
     context.close()
 
@@ -87,7 +90,7 @@ def test_focus_typing_and_privacy(mobile):
     typed(mobile, "user@example.com")
     assert editor.input_value() == "_"
     assert mobile.evaluate("testUI.rfb.focusOnClick") is False
-    mobile.get_by_role("button", name="Hide keyboard", exact=True).click()
+    mobile.get_by_role("button", name="Done", exact=True).click()
     assert editor.input_value() == ""
     assert mobile.evaluate("testUI.rfb.focusOnClick") is True
 
@@ -100,7 +103,7 @@ def test_paste_password_then_code_and_repeated_backspace(mobile):
     for _ in range(3):
         mobile.keyboard.press("Backspace")
     typed(mobile, "sYnth3tic! 123")
-    mobile.get_by_role("button", name="Backspace", exact=True).click()
+    mobile.keyboard.press("Backspace")
     typed(mobile, "sYnth3tic! 12")
     assert mobile.locator("#signin_input").evaluate("e => e === document.activeElement")
     assert mobile.locator("#signin_input").input_value() == "_"
@@ -182,8 +185,8 @@ def test_refusal_feedback_survives_following_keystrokes(mobile):
     mobile.keyboard.insert_text("ss9")
     typed(mobile, "pss9")
     assert mobile.locator("#signin_feedback").inner_text() == warning
-    mobile.get_by_role("button", name="Hide keyboard", exact=True).click()
-    mobile.get_by_role("button", name="Show keyboard", exact=True).click()
+    mobile.get_by_role("button", name="Done", exact=True).click()
+    mobile.get_by_role("button", name="Keyboard", exact=True).click()
     assert mobile.locator("#signin_feedback").inner_text() == ""
 
 
@@ -199,9 +202,10 @@ def test_mobile_beforeinput_and_editing_keys(mobile):
       e.value = ''; e.dispatchEvent(new InputEvent('input', {inputType:'deleteContentBackward'}));
     }""")
     typed(mobile, "")
-    mobile.get_by_role("button", name="Tab", exact=True).click()
-    mobile.get_by_role("button", name="Enter", exact=True).click()
-    mobile.wait_for_function("JSON.parse(document.documentElement.dataset.keys).slice(-2).join(',') === '65289,65293'")
+    mobile.keyboard.press("Tab")
+    mobile.wait_for_function("JSON.parse(document.documentElement.dataset.keys).at(-1) === 65289")
+    mobile.keyboard.press("Enter")
+    assert mobile.locator("#signin_input").input_value() == ""
 
 
 def test_replacement_connection_cannot_receive_pending_input(mobile):
@@ -229,7 +233,7 @@ def test_native_deletion_cannot_cross_viewer_replacement(mobile):
       return {deleted, keys, focused: document.activeElement === editor, value: editor.value};
     }""")
     assert result == {"deleted": True, "keys": [], "focused": False, "value": ""}
-    mobile.get_by_role("button", name="Show keyboard", exact=True).click()
+    mobile.get_by_role("button", name="Keyboard", exact=True).click()
     assert mobile.locator("#signin_input").evaluate("e => e === document.activeElement")
 
 
@@ -249,17 +253,85 @@ def test_native_editor_does_not_forward_keys_twice(mobile):
     }, true)""")
     mobile.keyboard.insert_text("a")
     mobile.keyboard.press("Backspace")
+    typed(mobile, "")
     mobile.keyboard.press("Enter")
     mobile.wait_for_timeout(100)
     assert mobile.locator("html").get_attribute("data-leaked") is None
-    assert json.loads(mobile.locator("html").get_attribute("data-keys")) == [97, 65288, 65293]
+    assert json.loads(mobile.locator("html").get_attribute("data-keys")) == [97, 65288]
 
 
 def test_controls_fit_the_viewport(mobile):
-    for element in mobile.locator("#signin_keyboard button, #signin_input").all():
+    for element in mobile.locator("#signin_keyboard button:visible").all():
         box = element.bounding_box()
         assert box and box["height"] >= 44
         assert box["x"] >= 0 and box["x"] + box["width"] <= mobile.viewport_size["width"]
+    editor = mobile.locator("#signin_input").bounding_box()
+    assert editor["width"] <= 1 and editor["height"] <= 1
+    assert mobile.get_by_role("button", name="Tab", exact=True).count() == 0
+    assert mobile.get_by_role("button", name="Backspace", exact=True).count() == 0
+
+
+def test_keyboard_height_does_not_shrink_remote_content(mobile):
+    content = mobile.locator("#noVNC_container")
+    before = content.bounding_box()
+    mobile.set_viewport_size({"width": mobile.viewport_size["width"], "height": 400})
+    mobile.wait_for_timeout(100)
+    after = content.bounding_box()
+    assert after["width"] == before["width"]
+    assert after["height"] == before["height"]
+    assert mobile.locator("#signin_viewport").evaluate("e => e.scrollHeight > e.clientHeight")
+    mobile.get_by_role("button", name="Zoom", exact=True).click()
+    mobile.wait_for_timeout(100)
+    enlarged = content.bounding_box()
+    assert enlarged["width"] > before["width"] * 1.3
+    mobile.get_by_role("button", name="Reset zoom", exact=True).click()
+    assert content.bounding_box()["width"] == before["width"]
+
+
+def test_touch_drag_pans_without_becoming_a_remote_drag(mobile):
+    mobile.set_viewport_size({"width": mobile.viewport_size["width"], "height": 400})
+    mobile.evaluate("""() => {
+      const canvas = document.querySelector('canvas');
+      canvas.addEventListener('gesturestart', () => {document.documentElement.dataset.remoteDrag = 'yes';});
+      for (const [type, y] of [['gesturestart', 200], ['gesturemove', 100], ['gestureend', 100]]) {
+        canvas.dispatchEvent(new CustomEvent(type, {detail:{type:'drag', clientX:50, clientY:y}}));
+      }
+    }""")
+    assert mobile.locator("#signin_viewport").evaluate("e => e.scrollTop") == 100
+    assert mobile.locator("html").get_attribute("data-remote-drag") is None
+
+
+def test_explicit_paste_reads_only_on_request(mobile):
+    mobile.locator("html").evaluate("e => e.dataset.clipboard = 'Synthetic!9'")
+    assert mobile.locator("html").get_attribute("data-reads") == "0"
+    mobile.get_by_role("button", name="Paste", exact=True).click()
+    typed(mobile, "Synthetic!9")
+    assert mobile.locator("html").get_attribute("data-reads") == "1"
+    assert mobile.locator("#signin_input").input_value() == "_"
+
+
+@pytest.mark.parametrize("transition", ["field", "tab", "replacement", "done"])
+def test_delayed_explicit_paste_cannot_cross_input_destination(mobile, transition):
+    mobile.evaluate(
+        "() => {navigator.clipboard.readText = () => new Promise(resolve => {window.finishPaste = resolve;});}"
+    )
+    mobile.get_by_role("button", name="Paste", exact=True).click()
+    if transition == "field":
+        mobile.locator("canvas").dispatch_event("pointerdown")
+    elif transition == "tab":
+        mobile.keyboard.press("Tab")
+    elif transition == "replacement":
+        mobile.evaluate("testUI.rfb = {...testUI.rfb}")
+    else:
+        mobile.get_by_role("button", name="Done", exact=True).click()
+    mobile.evaluate("finishPaste('NeverSendThis9')")
+    mobile.wait_for_timeout(100)
+    assert mobile.locator("html").get_attribute("data-typed") == ""
+    if transition == "tab":
+        assert 0xFF09 in json.loads(mobile.locator("html").get_attribute("data-keys"))
+        mobile.get_by_role("button", name="Paste", exact=True).click()
+        mobile.evaluate("finishPaste('Fresh9')")
+        typed(mobile, "Fresh9")
 
 
 @pytest.mark.parametrize("selection,text", [((0, 1), "_Ab9!"), ((0, 0), "Ab9!"), ((1, 1), "_Ab9!")])
@@ -320,7 +392,7 @@ def test_native_paste_during_composition_keeps_following_typing(mobile):
     assert mobile.locator("#signin_feedback").inner_text() == ""
 
 
-@pytest.mark.parametrize("action", ["keyboard", "beforeinput", "input", "button"])
+@pytest.mark.parametrize("action", ["keyboard", "beforeinput", "input"])
 def test_full_queue_refusal_is_visible_for_every_editing_entrypoint(mobile, action):
     # All actions occur in one browser task so the paced queue cannot drain first.
     mobile.evaluate(
@@ -332,7 +404,6 @@ def test_full_queue_refusal_is_visible_for_every_editing_entrypoint(mobile, acti
         if (action === 'keyboard') input.dispatchEvent(new KeyboardEvent('keydown', {
           key:'Backspace', bubbles:true, cancelable:true,
         }));
-        else if (action === 'button') document.querySelector('[data-key="BackSpace"]').click();
         else input.dispatchEvent(new InputEvent(action, {
           inputType:'deleteContentBackward', cancelable:action === 'beforeinput', bubbles:true,
         }));

@@ -151,8 +151,7 @@ document.addEventListener("paste", event => {
   type(event.clipboardData ? event.clipboardData.getData("text/plain") : "");
 }, true);
 
-// A visible native input is required to ask a phone for its keyboard. Focus it synchronously in this frame's
-// click handler, never after a message, timer or network request. The canvas remains the remote pointer target.
+// Focus the native editor during the person's gesture; a delayed network callback cannot open an iOS keyboard.
 function installKeyboard() {
   const screen = document.getElementById("noVNC_container");
   if (!screen || document.getElementById("signin_keyboard")) return;
@@ -160,47 +159,78 @@ function installKeyboard() {
   panel.id = "signin_keyboard";
   panel.setAttribute("aria-label", "Remote keyboard");
   panel.innerHTML = `
-    <div class="actions"><button type="button" id="signin_show" aria-controls="signin_input" aria-pressed="false">Show keyboard</button>
-      <button type="button" data-key="BackSpace">Backspace</button>
-      <button type="button" data-key="Tab">Tab</button>
-      <button type="button" data-key="Return">Enter</button></div>
-    <label for="signin_input">Remote input (masked)</label>
+    <div class="actions"><button type="button" id="signin_show" aria-controls="signin_input" aria-pressed="false">Keyboard</button>
+      <button type="button" id="signin_paste" hidden>Paste</button>
+      <button type="button" id="signin_zoom" aria-pressed="false">Zoom</button></div>
     <input id="signin_input" type="password" inputmode="text" autocomplete="off" autocapitalize="off"
-      autocorrect="off" spellcheck="false" enterkeyhint="enter" aria-describedby="signin_hint signin_feedback">
-    <p id="signin_hint">Tap a field in the remote page, then Show keyboard. Typing sends immediately.
-      Use your keyboard's Paste menu for passwords and verification codes. Nothing is saved here.</p>
+      autocorrect="off" spellcheck="false" enterkeyhint="done" aria-label="Type into the selected remote field"
+      aria-describedby="signin_feedback">
     <p id="signin_feedback" role="status" aria-live="polite"></p>`;
   const style = document.createElement("style");
   style.textContent = `
-    #signin_keyboard{position:fixed;inset:0 0 auto;z-index:11;box-sizing:border-box;padding:8px;
-      padding-top:max(8px,env(safe-area-inset-top));background:#fff;color:#161616;
-      font:16px/1.3 system-ui,sans-serif;touch-action:manipulation;user-select:text}
-    #signin_keyboard .actions{display:flex;gap:4px}
-    #signin_keyboard button{min-height:44px;padding:8px;border:1px solid #666;border-radius:5px;
-      color:#161616;background:#f4f4f4;font:14px system-ui;cursor:pointer;min-width:44px}
+    #signin_keyboard{position:fixed;inset:auto 0 0;z-index:11;box-sizing:border-box;padding:6px 10px;
+      padding-bottom:max(6px,env(safe-area-inset-bottom));background:#fff;color:#161616;border-top:1px solid #ddd;
+      font:14px/1.3 system-ui,sans-serif;touch-action:manipulation;user-select:text}
+    #signin_keyboard .actions{display:flex;gap:6px}
+    #signin_keyboard button{min-height:44px;padding:8px 12px;border:0;border-radius:8px;
+      color:#161616;background:#eef2f3;font:14px system-ui;cursor:pointer;min-width:44px}
+    #signin_zoom{margin-left:auto;background:transparent!important}
     #signin_keyboard button:disabled{opacity:.55;cursor:default}
-    #signin_keyboard label{display:block;margin-top:6px}
-    #signin_keyboard input{display:block;box-sizing:border-box;width:100%;height:44px;font:16px system-ui;
-      padding:8px;border:1px solid #666;border-radius:5px;color:#161616;background:#fff;touch-action:auto;
-      user-select:text;-webkit-user-select:text}
+    #signin_input{position:absolute;left:16px;top:16px;width:1px;height:1px;padding:0;border:0;
+      opacity:.01;clip-path:inset(50%);font:16px system-ui;pointer-events:none}
     #signin_keyboard :focus-visible{outline:3px solid #075fba;outline-offset:2px}
     #signin_keyboard p{font-size:13px;margin:4px 0 0}
     #signin_feedback:empty{display:none}
-    #signin_keyboard.signin_active #signin_hint{display:none}
-    #noVNC_container{position:absolute;top:var(--signin-keyboard-height);bottom:0;height:auto}
-    #noVNC_control_bar_anchor{top:var(--signin-keyboard-height)}
-    @media(min-width:700px){#signin_keyboard label,#signin_keyboard input,#signin_hint{display:none}
-      #signin_keyboard:focus-within label,#signin_keyboard:focus-within input,
-      #signin_keyboard:focus-within #signin_hint{display:block}}
+    #signin_viewport{position:fixed;inset:0 0 var(--signin-keyboard-height,57px);overflow:auto;
+      overscroll-behavior:contain;background:#fff}
+    #noVNC_container{position:relative;border-radius:0;background:#fff}
+    #noVNC_control_bar_anchor{display:none!important}
+    #signin_keyboard [hidden]{display:none!important}
   `;
   document.head.appendChild(style);
   document.body.appendChild(panel);
+  const viewport = document.createElement("div");
+  viewport.id = "signin_viewport";
+  screen.before(viewport);
+  viewport.appendChild(screen);
   const input = panel.querySelector("input");
   const feedback = panel.querySelector("#signin_feedback");
   const show = panel.querySelector("#signin_show");
+  const paste = panel.querySelector("#signin_paste");
+  const zoom = panel.querySelector("#signin_zoom");
+  let zoomed = false;
+  function fitWidth() {
+    const canvas = screen.querySelector("canvas");
+    if (!canvas || !canvas.width || !canvas.height) return;
+    const width = Math.floor(viewport.clientWidth * (zoomed ? 1.4 : 1));
+    screen.style.width = `${width}px`;
+    screen.style.height = `${Math.ceil(width * canvas.height / canvas.width)}px`;
+  }
+  zoom.addEventListener("pointerdown", event => event.preventDefault());
+  zoom.addEventListener("click", () => {
+    zoomed = !zoomed;
+    zoom.textContent = zoomed ? "Reset zoom" : "Zoom";
+    zoom.setAttribute("aria-pressed", String(zoomed));
+    fitWidth();
+  });
+  // Let noVNC decode taps and two-finger remote scrolling; a one-finger drag pans this readable local view.
+  let pan = null;
+  for (const kind of ["gesturestart", "gesturemove", "gestureend"]) {
+    screen.addEventListener(kind, event => {
+      if (event.detail.type !== "drag") return;
+      event.stopPropagation();
+      const {clientX: x, clientY: y} = event.detail;
+      if (kind === "gesturestart") pan = {x, y};
+      if (pan && kind === "gesturemove") {
+        viewport.scrollBy(pan.x - x, pan.y - y);
+        pan = {x, y};
+      }
+      if (kind === "gestureend") pan = null;
+    }, true);
+  }
   // A non-secret sentinel gives mobile Backspace something to delete even after a previous edit was cleared.
   const sentinel = "_";
-  let composing = false, rfb = null, previousFocusOnClick = true, ownsFocus = false;
+  let composing = false, rfb = null, previousFocusOnClick = true, ownsFocus = false, clipboardRequest = 0;
   let edit = {start: 1, end: 1, length: 1};
   function rememberEdit() {
     edit = {start: input.selectionStart, end: input.selectionEnd, length: input.value.length};
@@ -211,13 +241,15 @@ function installKeyboard() {
     rememberEdit();
   }
   function clear() {
+    clipboardRequest++;
     composing = false;
     input.value = "";
     cancelTyping();
     if (rfb && ownsFocus) rfb.focusOnClick = previousFocusOnClick;
     ownsFocus = false;
     panel.classList.remove("signin_active");
-    show.textContent = "Show keyboard";
+    paste.hidden = true;
+    show.textContent = "Keyboard";
     show.setAttribute("aria-pressed", "false");
   }
   function sync() {
@@ -227,6 +259,7 @@ function installKeyboard() {
       rfb = UI.rfb;
       previousFocusOnClick = rfb ? rfb.focusOnClick : true;
       if (rfb && rfb.addEventListener) rfb.addEventListener("disconnect", sync);
+      fitWidth();
     }
     const ready = connected();
     for (const control of panel.querySelectorAll("button,input")) control.disabled = !ready;
@@ -247,8 +280,8 @@ function installKeyboard() {
     // Synchronization clears ownership before a native event can reach a replacement viewer.
     return sync() && ownsFocus && document.activeElement === input;
   }
-  function queue(keys, fromEditor = true) {
-    if (!(fromEditor ? editorReady() : sync())) return;
+  function queue(keys) {
+    if (!editorReady()) return;
     if (!enqueue(keys)) {
       feedback.textContent = "Input was not sent. Wait for pending typing; send at most 1000 characters at a time.";
     }
@@ -295,7 +328,8 @@ function installKeyboard() {
     ownsFocus = true;
     rfb.focusOnClick = false;
     panel.classList.add("signin_active");
-    show.textContent = "Hide keyboard";
+    paste.hidden = !navigator.clipboard?.readText;
+    show.textContent = "Done";
     show.setAttribute("aria-pressed", "true");
     reset();
   });
@@ -309,8 +343,12 @@ function installKeyboard() {
       if (kind !== "keydown" || event.isComposing || composing) return;
       const keys = {Enter: "Return", Tab: "Tab", Backspace: "BackSpace", Delete: "Delete",
                     ArrowLeft: "Left", ArrowRight: "Right", ArrowUp: "Up", ArrowDown: "Down"};
+      if (event.key === "Enter") {
+        event.preventDefault(); input.blur(); clear(); return;
+      }
       if (keys[event.key]) {
         event.preventDefault();
+        if (event.key === "Tab") clipboardRequest++;
         queue([KeyTable[`XK_${keys[event.key]}`]]);
         reset();
       }
@@ -318,9 +356,11 @@ function installKeyboard() {
   }
   input.addEventListener("beforeinput", event => {
     if (!editorReady() || event.isComposing || composing) return;
+    if (["insertLineBreak", "insertParagraph"].includes(event.inputType)) {
+      event.preventDefault(); input.blur(); clear(); return;
+    }
     rememberEdit();
-    const keys = {deleteContentBackward: "BackSpace", deleteContentForward: "Delete",
-                  insertLineBreak: "Return", insertParagraph: "Return"};
+    const keys = {deleteContentBackward: "BackSpace", deleteContentForward: "Delete"};
     if (keys[event.inputType] && event.cancelable) {
       event.preventDefault();
       queue([KeyTable[`XK_${keys[event.inputType]}`]]);
@@ -360,11 +400,20 @@ function installKeyboard() {
     reset();
     send(text);
   });
-  for (const button of panel.querySelectorAll("[data-key]")) {
-    // Keep the native input focused (and its keyboard visible) while pressing a remote editing key.
-    button.addEventListener("pointerdown", event => event.preventDefault());
-    button.addEventListener("click", () => queue([KeyTable[`XK_${button.dataset.key}`]], false));
-  }
+  paste.addEventListener("pointerdown", event => event.preventDefault());
+  paste.addEventListener("click", async () => {
+    if (!editorReady() || !navigator.clipboard?.readText) return;
+    const origin = UI.rfb, editGeneration = generation, request = ++clipboardRequest;
+    try {
+      const text = await navigator.clipboard.readText();
+      if (request !== clipboardRequest || origin !== UI.rfb || editGeneration !== generation || !editorReady()) return;
+      composing = false; reset(); send(text);
+    } catch (_) {
+      if (request === clipboardRequest && editorReady())
+        feedback.textContent = "Paste was not allowed. Allow clipboard access and try Paste again.";
+    }
+  });
+  screen.addEventListener("pointerdown", () => { cancelTyping(); if (ownsFocus) reset(); }, true);
   const stockButton = document.getElementById("noVNC_keyboard_button");
   if (stockButton) stockButton.addEventListener("click", event => {
     event.stopImmediatePropagation();
@@ -374,9 +423,17 @@ function installKeyboard() {
     document.documentElement.style.setProperty("--signin-keyboard-height", `${panel.offsetHeight}px`);
   });
   observer.observe(panel);
+  const viewportObserver = new ResizeObserver(fitWidth);
+  viewportObserver.observe(viewport);
+  const canvasObserver = new MutationObserver(fitWidth);
+  canvasObserver.observe(screen, {subtree:true, childList:true, attributes:true, attributeFilter:["width", "height"]});
+  fitWidth();
   const timer = setInterval(sync, 250);
   document.addEventListener("visibilitychange", () => { if (document.hidden) { clear(); input.blur(); } });
-  window.addEventListener("pagehide", () => { clear(); input.blur(); clearInterval(timer); observer.disconnect(); });
+  window.addEventListener("pagehide", () => {
+    clear(); input.blur(); clearInterval(timer); observer.disconnect();
+    viewportObserver.disconnect(); canvasObserver.disconnect();
+  });
   sync();
 }
 if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", installKeyboard, {once: true});

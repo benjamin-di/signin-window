@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.8.3] - 2026-11-15
+
+### Fixed
+
+- Keep remote sign-in readable on phones with a compact header, on-demand help, Keyboard and Zoom controls, and explicit Paste while typing; physical-device acceptance remains necessary (#10).
+- Fit the remote desktop to its width instead of shrinking the whole page when a software keyboard opens; allow one-finger panning of the view and retain two-finger remote scrolling (#10).
+- Hide the native keyboard bridge and duplicate editing buttons; Done dismisses the keyboard without submitting the provider's form (#10).
+- Fence requested clipboard reads against field changes, viewer replacement and keyboard dismissal. Clipboard access happens only on an explicit paste action (#10).
+- Cancel a deferred clipboard read before Tab changes the remote field, while preserving accepted queued edits (#10).
+- Keep saving progress visible after the live viewer closes (#10).
+- Match the phone's virtual display to Chromium's minimum width so sign-in fields are not cropped on the right (#10).
+
+### Upgrade
+
+- Action required: none.
+- Rollback: compatible with 0.8.2; it restores the previous viewer layout without changing stored account or provider state.
+
+[0.8.3]: https://github.com/benjamin-di/signin-window/releases/tag/v0.8.3
+
 ## [0.8.2] - 2026-11-13
 
 ### Fixed

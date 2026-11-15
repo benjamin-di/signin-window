@@ -58,7 +58,8 @@ from .connections import PageIdentity
 log = logging.getLogger("signin_window")
 
 #: Window sizes for the person's screen: the display is made this size, and so should the browser window be.
-LAYOUTS: dict[str, tuple[int, int]] = {"desktop": (1280, 860), "phone": (430, 900)}
+# Chromium's minimum window width is 500; a narrower display crops the form before the viewer can scale it.
+LAYOUTS: dict[str, tuple[int, int]] = {"desktop": (1280, 860), "phone": (500, 900)}
 #: Open windows: they hold a slot and can still end either way. ``saving``: the person has signed in and the runner
 #: is keeping the session (a kept session); the live view is closed and a cancel no longer interrupts it.
 ACTIVE = ("starting", "waiting", "saving")

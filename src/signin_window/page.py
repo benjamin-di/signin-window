@@ -42,7 +42,8 @@ class PageText:
     title: str = "Connect your {service} account"
     help_html: str = (
         "Sign in to {service} in the remote browser below. Use a password or verification code; device passkeys "
-        "do not work in this window. Tap a remote field, then Show keyboard to type or paste on your phone. "
+        "do not work in this window. Tap a remote field, then Keyboard to type on your phone; Paste is available "
+        "while the keyboard is open. Drag to move the view, or use two fingers to scroll the remote page. "
         "On a computer, you can also paste with Ctrl+V or Cmd+V."
     )
     intro_html: str = "Connect {service} for <b>{label}</b>. Sign in to the account you want this application to use."
@@ -145,9 +146,9 @@ def render(text: PageText, label: str | None) -> str:
     )
 
 
-_BODY = """<header><h1>{{HEADING}}</h1>
-<p>{{HELP}}</p>
-<div class=bar hidden><span id=host>{{HOST}}</span><span id=status role=status aria-live=polite></span></div></header>
+_BODY = """<header><div class=heading><h1>{{HEADING}}</h1>
+<div class=bar hidden><span id=host>{{HOST}}</span><span id=status role=status aria-live=polite></span></div></div>
+<details id=signin-help><summary aria-label="Sign-in help">?</summary><div>{{HELP}}</div></details></header>
 <main id=intro class=msg><p>{{INTRO}}</p>
 <button id=go>{{BUTTON}}</button></main>
 <div id=view></div>
@@ -160,29 +161,34 @@ _PAGE = """<!doctype html><html lang=en><meta charset=utf-8>
 <title>{{TITLE}}</title>
 <style>
 :root{color-scheme:light;font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;color:#141414}
-html,body{margin:0;height:100%;background:#f4f4f4}
+html,body{margin:0;height:100%;background:#f4f4f4;overflow:hidden}
 body{display:flex;flex-direction:column;height:var(--signin-viewport-height,100dvh)}
-header{flex-shrink:0}
-header{padding:12px 16px 8px;background:#fff;border-bottom:1px solid #ddd}
-h1{font-size:18px;margin:0 0 4px}
-header p{margin:0 0 8px;font-size:14px;color:#4b4b4b;max-width:62em}
-.bar{display:flex;justify-content:space-between;gap:12px;font-size:13px}
-#host{color:#1a7f37;font-weight:600}#status{color:#4b4b4b;text-align:right}
+header{flex-shrink:0;display:flex;align-items:center;gap:6px;padding:6px 10px 6px 16px;
+ background:#fff;border-bottom:1px solid #ddd}
+.heading{flex:1;min-width:0}h1{font-size:16px;margin:0;overflow-wrap:anywhere}
+.bar{font-size:12px}#host{color:#1a7f37}#status{display:block;color:#4b4b4b}
+body.viewer-active #status{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+#signin-help summary{list-style:none;display:flex;align-items:center;justify-content:center;
+ width:44px;height:44px;cursor:pointer;font-weight:700;border-radius:8px}
+#signin-help summary::-webkit-details-marker{display:none}
+#signin-help[open] summary{background:#eef2f3}
+#signin-help>div{position:absolute;top:64px;right:12px;z-index:20;box-sizing:border-box;width:360px;
+ max-width:calc(100% - 24px);padding:16px;border:1px solid #ddd;border-radius:12px;background:#fff;
+ box-shadow:0 8px 24px #0002;font-size:14px;max-height:60dvh;overflow:auto}
 #view{flex:1;min-height:0;display:flex}
 #view iframe{flex:1;border:0;width:100%;height:100%;background:#fff}
-.msg{margin:auto;padding:28px 20px;text-align:center;max-width:26em;width:100%;box-sizing:border-box}
+.msg{margin:auto;padding:28px 20px;text-align:center;max-width:26em;width:100%;box-sizing:border-box;overflow:auto}
 .msg h1{font-size:22px}.ok{font-size:44px;color:#1a7f37;margin:0}
 button,.button{font:inherit;font-weight:600;margin-top:14px;min-height:44px;padding:12px 18px;border-radius:8px;
  border:1px solid #141414;background:#141414;color:#fff}
 .msg button,.msg .button{display:inline-block;width:100%;box-sizing:border-box;text-decoration:none}
-header button{font-size:14px;margin:8px 0}
+header button{font-size:24px;margin:0;padding:4px;width:44px;height:44px;min-width:44px;
+ background:transparent;color:#141414;border:0;font-weight:400}
 a:focus-visible,button:focus-visible{outline:3px solid #a35d00;outline-offset:3px}
 #recovery{margin:0;padding:12px 16px;background:#fff3d9;color:#5d400a}#recovery button{margin:4px 8px;font-size:14px}
 input{font:inherit;width:100%;box-sizing:border-box;padding:10px;margin-top:10px;border:1px solid #999;
  border-radius:6px}
-body.keyboard-open header p{display:none}
 [hidden]{display:none!important}
-@media (max-width:600px){header p{font-size:14px}.bar{flex-wrap:wrap}#status{text-align:left}}
 </style>
 {{BODY}}
 {{SCRIPT}}
@@ -240,6 +246,7 @@ function finish(html) {
   clearTimeout(pollTimer);
   $("recovery").hidden = true;
   $("view").replaceChildren(); viewer = false;
+  document.body.classList.remove('viewer-active');
   $("view").hidden = true;
   $("intro").hidden = true;
   document.querySelector("header .bar").hidden = true;
@@ -288,9 +295,14 @@ function show(s) {
   }
   if (s.host) $("host").textContent = (secure && secure.test(s.host) ? "🔒 " : "") + s.host;
   $("status").textContent = CONFIG.text[s.state] || "";
-  if (s.state === "saving") { $("view").replaceChildren(); viewer = false; }
+  if (s.state === "saving") {
+    $("view").replaceChildren(); viewer = false;
+    document.body.classList.remove('viewer-active');
+  }
   if (s.state === "waiting" && !viewer) {
     viewer = true;
+    document.body.classList.add('viewer-active');
+    $("signin-help").open = false;
     const frame = document.createElement("iframe");
     const q = new URLSearchParams({autoconnect: 1, resize: "scale", reconnect: 1, reconnect_delay: 1500,
                                    path: "../vnc", show_dot: 1});  // relative to the viewer's own address
@@ -331,7 +343,9 @@ async function begin() {
 }
 $("go").addEventListener("click", begin);
 const cancel = document.createElement("button");
-cancel.textContent = "Cancel sign-in";
+cancel.textContent = "×";
+cancel.setAttribute("aria-label", "Cancel sign-in");
+cancel.title = "Cancel sign-in";
 cancel.hidden = true;
 document.querySelector("header").appendChild(cancel);
 cancel.addEventListener("click", async () => {

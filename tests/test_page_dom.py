@@ -65,6 +65,57 @@ def test_auto_start_resumes_an_active_attempt_instead_of_starting_another():
     assert posts == [] and not intro
 
 
+def test_waiting_page_gives_the_viewer_space_and_keeps_help_on_demand(browser_page):
+    def serve(route):
+        if route.request.url == LINK:
+            route.fulfill(
+                content_type="text/html",
+                body=render(PageText(service="Example", reconnect=True, auto_start=True), "Example"),
+            )
+        elif route.request.url.endswith("/state"):
+            route.fulfill(content_type="application/json", body=json.dumps({"state": "waiting", "host": "example.com"}))
+        else:
+            route.abort()
+
+    browser_page.set_viewport_size({"width": 390, "height": 844})
+    browser_page.route("**/*", serve)
+    browser_page.goto(LINK)
+    browser_page.locator("iframe").wait_for()
+    assert browser_page.locator("header").bounding_box()["height"] < 80
+    assert browser_page.locator("iframe").bounding_box()["height"] > 700
+    assert browser_page.locator("#signin-help").evaluate("e => e.open") is False
+    browser_page.get_by_text("?", exact=True).click()
+    assert browser_page.locator("#signin-help").evaluate("e => e.open") is True
+    browser_page.get_by_role("button", name="Cancel sign-in", exact=True).wait_for()
+
+
+@pytest.mark.parametrize("initial", ["waiting", "saving"])
+def test_saving_disposes_the_viewer_and_keeps_progress_readable(browser_page, initial):
+    state = {"value": initial}
+
+    def serve(route):
+        if route.request.url == LINK:
+            route.fulfill(content_type="text/html", body=render(PageText(service="Example", auto_start=True), "Sam"))
+        elif route.request.url.endswith("/state"):
+            route.fulfill(content_type="application/json", body=json.dumps({"state": state["value"]}))
+        else:
+            route.abort()
+
+    browser_page.route("**/*", serve)
+    browser_page.goto(LINK)
+    if initial == "waiting":
+        browser_page.locator("iframe").wait_for()
+    state["value"] = "saving"
+    browser_page.wait_for_function("document.getElementById('status').textContent.includes('Saving')")
+    assert browser_page.locator("iframe").count() == 0
+    status = browser_page.locator("#status")
+    assert status.bounding_box()["height"] > 12
+    assert status.evaluate("e => getComputedStyle(e).clipPath") == "none"
+    state["value"] = "connected"
+    browser_page.get_by_role("heading", name="Connection saved").wait_for()
+    assert browser_page.locator("iframe").count() == 0
+
+
 @pytest.fixture
 def browser_page():
     with sync_api.sync_playwright() as driver:
@@ -313,7 +364,7 @@ def test_recovering_a_waiting_viewer_restores_cancel_and_hides_the_intro(browser
     browser_page.get_by_role("button", name="Check sign-in status").click()
     browser_page.get_by_role("button", name="Cancel sign-in", exact=True).wait_for()
     assert not browser_page.locator("#intro").is_visible()
-    assert browser_page.locator("header .bar").is_visible()
+    assert browser_page.get_by_role("heading", level=1).is_visible()
 
 
 def test_status_updates_do_not_erase_unsent_form_changes(browser_page):

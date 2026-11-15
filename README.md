@@ -424,9 +424,13 @@ sudo .venv/bin/python -m signin_window.browser install-policy && uv run --group 
 `scripts/e2e.py` runs the whole path with real browsers and a stand-in site: a link, its live view, paste, a
 mobile typing, password/code paste, editing keys, hand-over and closing the page; CI runs it on every change.
 
-On a phone, tap the field in the remote page, then **Show keyboard** above the viewer. Type or use the
-keyboard’s Paste menu in the masked input. Edits go directly to the remote page; **Tab**, **Enter** and
-**Backspace** act on that page. The input clears after each edit and when the viewer loses focus or disconnects.
+On a phone, tap the field in the remote page, then **Keyboard** below the viewer. Type directly into the selected
+remote field; **Paste** appears while the keyboard is open and reads the clipboard only when pressed. **Done**
+dismisses the keyboard without submitting the remote form. The native editor stays out of the page layout and
+clears after each edit and when the viewer loses focus or disconnects. Use the site's own buttons to continue.
+The viewer fits the remote display to the available width, preserving its scale when the keyboard opens.
+**Zoom** enlarges it; drag with one finger to move the view, or use two fingers to scroll the remote page.
+The header's **?** keeps the application's sign-in guidance available without crowding the remote form.
 The native editor supports printable ASCII text. It rejects an entire edit containing other characters with
 visible feedback because the virtual display can drop their keysyms; it never sends just the supported characters.
 The warning remains while typing continues. Hide and reopen the keyboard to clear it before retrying the field.

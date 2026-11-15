@@ -178,6 +178,16 @@ async def main(windows_box: list) -> int:
         print("live view connected through the link")
 
         canvas = await frame.wait_for_selector("#noVNC_container canvas")
+        await frame.wait_for_function("document.querySelector('canvas').getBoundingClientRect().width > 300")
+        remote_width = await remote["page"].evaluate("innerWidth")
+        assert await canvas.evaluate("e => e.width") >= remote_width, "remote display crops the browser's right edge"
+        full = await canvas.bounding_box()
+        await page.set_viewport_size({"width": 390, "height": 480})
+        await page.wait_for_timeout(150)
+        reduced = await canvas.bounding_box()
+        assert full and reduced and abs(full["width"] - reduced["width"]) < 2, "keyboard shrink scales the form down"
+        await page.set_viewport_size({"width": 390, "height": 844})
+        print("phone display covers the browser and the viewer preserves readable width when height shrinks")
 
         # Real noVNC -> relay -> service -> x11vnc -> synthetic remote Chromium fields.
         # DOM focus and emulated touch cannot prove an actual iOS software keyboard opens.
@@ -216,30 +226,28 @@ async def main(windows_box: list) -> int:
             UI.closeControlbarTimeout = setTimeout(UI.closeControlbar, 150);
           }, {capture: true, once: true});
         }""")
-        await frame.get_by_role("button", name="Show keyboard", exact=True).click()
+        await frame.get_by_role("button", name="Keyboard", exact=True).click()
         await page.keyboard.insert_text("user@example.com")
         await wait_for(lambda: remote_value("#f", "user@example.com"), "mobile text did not reach the remote field")
-        await frame.get_by_role("button", name="Tab", exact=True).click()
+        await page.keyboard.press("Tab")
         await mobile_paste("Synthetic!9")
         await wait_for(
             lambda: remote_value("#password", "Synthetic!9"), "password paste did not reach the remote field"
         )
-        await frame.get_by_role("button", name="Backspace", exact=True).click()
+        await page.keyboard.press("Backspace")
         await page.keyboard.insert_text("8")
         await wait_for(lambda: remote_value("#password", "Synthetic!8"), "remote password editing failed")
-        await frame.get_by_role("button", name="Tab", exact=True).click()
+        await page.keyboard.press("Tab")
         await mobile_paste("000123")
         await wait_for(lambda: remote_value("#code", "000123"), "verification paste did not reach the remote field")
         for _ in range(2):
             await page.keyboard.press("Backspace")
         await wait_for(lambda: remote_value("#code", "0001"), "repeated native Backspace did not edit the remote field")
-        await frame.get_by_role("button", name="Enter", exact=True).click()
-        assert await frame.locator("#signin_input").input_value() == "_"
-        await frame.get_by_role("button", name="Hide keyboard", exact=True).click()
+        await page.keyboard.press("Enter")
         assert await frame.locator("#signin_input").input_value() == ""
         await remote["page"].fill("#f", "")
         await select_first_field()
-        await frame.get_by_role("button", name="Show keyboard", exact=True).click()
+        await frame.get_by_role("button", name="Keyboard", exact=True).click()
         await page.keyboard.press("Control+a")
         await page.keyboard.insert_text("_Synthetic9")
         await wait_for(lambda: remote_value("#f", "_Synthetic9"), "native replacement changed a leading underscore")
@@ -287,7 +295,7 @@ async def main(windows_box: list) -> int:
             assert await remote_value("#f", "Ab9!"), f"unsupported native {mode} sent a partial credential"
             assert await frame.locator("#signin_feedback").inner_text(), f"native {mode} gave no refusal feedback"
             assert await frame.locator("#signin_input").input_value() == "_"
-        await frame.get_by_role("button", name="Hide keyboard", exact=True).click()
+        await frame.get_by_role("button", name="Done", exact=True).click()
         print("mobile text, masked password paste/edit, Tab, verification paste and repeated Backspace passed real VNC")
         await page.set_viewport_size({"width": 1280, "height": 800})
         await remote["page"].fill("#f", "")
