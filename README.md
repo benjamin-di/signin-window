@@ -416,7 +416,9 @@ Report vulnerabilities privately ([SECURITY.md](SECURITY.md)).
 ```sh
 make bootstrap   # uv sync --locked
 make check       # lint, format, tests
-uv sync --group browser && uv run playwright install chromium && uv run pytest tests/test_paste_dom.py tests/test_mobile_dom.py
+uv sync --group browser
+uv run playwright install --with-deps chromium webkit
+uv run pytest tests/test_paste_dom.py tests/test_mobile_dom.py tests/test_paste_touch.py
 NOVNC_DIR=/opt/novnc uv run --group browser python scripts/e2e.py   # with Xvfb and x11vnc installed
 sudo .venv/bin/python -m signin_window.browser install-policy && uv run --group browser python scripts/browser_check.py
 ```

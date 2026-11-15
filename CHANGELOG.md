@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.4] - 2026-11-15
+
+### Fixed
+
+- Restore touch activation of Paste, Zoom and Done in WebKit by preserving the native click while retaining keyboard focus (#10).
+- Cover touch activation in Chromium and WebKit, including repeated paste and keyboard dismissal (#10).
+
+### Upgrade
+
+- Action required: none.
+- Rollback: compatible with 0.8.3; no stored state or public API changes.
+
 ## [0.8.3] - 2026-11-15
 
 ### Fixed

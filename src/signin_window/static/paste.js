@@ -206,7 +206,8 @@ function installKeyboard() {
     screen.style.width = `${width}px`;
     screen.style.height = `${Math.ceil(width * canvas.height / canvas.width)}px`;
   }
-  zoom.addEventListener("pointerdown", event => event.preventDefault());
+  // Keep editor focus on mouse presses; cancelling pointerdown suppresses touch clicks in WebKit.
+  zoom.addEventListener("mousedown", event => event.preventDefault());
   zoom.addEventListener("click", () => {
     zoomed = !zoomed;
     zoom.textContent = zoomed ? "Reset zoom" : "Zoom";
@@ -312,7 +313,7 @@ function installKeyboard() {
     reset();
     send(text);
   }
-  show.addEventListener("pointerdown", event => {
+  show.addEventListener("mousedown", event => {
     if (document.activeElement === input) event.preventDefault();
   });
   show.addEventListener("click", () => {
@@ -400,7 +401,7 @@ function installKeyboard() {
     reset();
     send(text);
   });
-  paste.addEventListener("pointerdown", event => event.preventDefault());
+  paste.addEventListener("mousedown", event => event.preventDefault());
   paste.addEventListener("click", async () => {
     if (!editorReady() || !navigator.clipboard?.readText) return;
     const origin = UI.rfb, editGeneration = generation, request = ++clipboardRequest;
