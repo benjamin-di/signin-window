@@ -454,7 +454,10 @@ class OAuthManager:
                 not isinstance(value, dict)
                 or value.get("issuer") != self.config.issuer
                 or "S256" not in value.get("code_challenge_methods_supported", [])
-                or self.config.auth_method not in value.get("token_endpoint_auth_methods_supported", [])
+                or (
+                    self.config.auth_method != "private_key_jwt"
+                    and self.config.auth_method not in value.get("token_endpoint_auth_methods_supported", [])
+                )
             ):
                 raise OAuthError()
             for field_name in ("authorization_endpoint", "token_endpoint", "jwks_uri"):

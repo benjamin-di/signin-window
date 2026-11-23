@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.5] - 2026-11-23
+
+### Fixed
+
+- Allow `private_key_jwt` OAuth discovery when an identity provider supports RFC 7523 federated client assertions without advertising `private_key_jwt` in `token_endpoint_auth_methods_supported`.
+
+### Upgrade
+
+- Action required: none.
+- Rollback: compatible with 0.8.4; no stored state or public API changes.
+
 ## [0.8.4] - 2026-11-15
 
 ### Fixed

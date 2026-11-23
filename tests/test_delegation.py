@@ -983,6 +983,28 @@ def test_private_key_jwt_uses_signed_assertions_for_exchange_refresh_and_revocat
             jwt.decode(endpoint_assertion, public_key, algorithms=["RS256"], audience=config.issuer)
         with pytest.raises(jwt.InvalidAudienceError):
             jwt.decode(signed, public_key, algorithms=["RS256"], audience=endpoint)
+
+
+def test_private_key_jwt_allows_discovery_without_advertised_method(config, tmp_path, monkeypatch):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    encoded = key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    )
+    config = replace(config, client_secret="", client_private_key=encoded)
+    provider = Provider(config)
+    provider.metadata_changes["token_endpoint_auth_methods_supported"] = [
+        "client_secret_basic",
+        "client_secret_post",
+        "none",
+    ]
+    transport = httpx2.MockTransport(provider)
+    real_oauth = OAuth2Client
+    monkeypatch.setattr(oauth, "OAuth2Client", lambda *args, **kwargs: real_oauth(*args, **kwargs, transport=transport))
+    monkeypatch.setattr(OAuthManager, "_http", lambda _: httpx2.Client(transport=transport))
+    manager = OAuthManager(config, tmp_path)
+    connected(manager, provider, "user-a")
+    assert manager.connected("user-a")
+    assert [endpoint for endpoint, _, _ in provider.client_assertions] == [ISSUER + "/token"]
     assert "PRIVATE KEY" not in repr(config)
 
 
