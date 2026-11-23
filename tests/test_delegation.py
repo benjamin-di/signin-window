@@ -1005,6 +1005,30 @@ def test_private_key_jwt_allows_discovery_without_advertised_method(config, tmp_
     connected(manager, provider, "user-a")
     assert manager.connected("user-a")
     assert [endpoint for endpoint, _, _ in provider.client_assertions] == [ISSUER + "/token"]
+
+
+def test_prove_owner_accepts_streamable_http_sse_initialize_response(config, tmp_path, monkeypatch):
+    provider = Provider(config)
+
+    def transport_handler(request):
+        if str(request.url) == config.resource:
+            payload = json.dumps(
+                {"jsonrpc": "2.0", "id": "delegated-oauth", "result": {"protocolVersion": "2025-03-26"}}
+            )
+            return httpx2.Response(
+                200,
+                content=(f"event: message\ndata: {payload}\n\n").encode(),
+                headers={"Content-Type": "text/event-stream", config.owner_header: "user-a"},
+            )
+        return provider(request)
+
+    transport = httpx2.MockTransport(transport_handler)
+    real_oauth = OAuth2Client
+    monkeypatch.setattr(oauth, "OAuth2Client", lambda *args, **kwargs: real_oauth(*args, **kwargs, transport=transport))
+    monkeypatch.setattr(OAuthManager, "_http", lambda _: httpx2.Client(transport=transport))
+    manager = OAuthManager(config, tmp_path)
+    connected(manager, provider, "user-a")
+    assert manager.connected("user-a")
     assert "PRIVATE KEY" not in repr(config)
 
 

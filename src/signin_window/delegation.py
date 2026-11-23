@@ -582,6 +582,40 @@ class OAuthManager:
             raise OAuthError()
         return {"token": dict(token), "subject": access["sub"], "expires_at": access["exp"], "nonce": nonce}
 
+    @staticmethod
+    def _parse_mcp_response(response, expected_id):
+        if response.status_code != 200:
+            raise OAuthError()
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if content_type != "text/event-stream":
+            value = response.json()
+            if not isinstance(value, dict):
+                raise OAuthError()
+            return value
+        events, data_lines = [], []
+        for raw_line in response.text.splitlines():
+            line = raw_line.rstrip("\r")
+            if not line:
+                if data_lines:
+                    events.append("\n".join(data_lines))
+                    data_lines = []
+            elif line.startswith("data:"):
+                payload = line[5:]
+                data_lines.append(payload[1:] if payload.startswith(" ") else payload)
+        if data_lines:
+            events.append("\n".join(data_lines))
+        parsed = []
+        for event in events:
+            item = json.loads(event)
+            if isinstance(item, dict):
+                parsed.append(item)
+        for item in parsed:
+            if item.get("id") == expected_id:
+                return item
+        if len(parsed) == 1:
+            return parsed[0]
+        raise OAuthError()
+
     def _prove_owner(self, owner, token):
         message = {
             "jsonrpc": "2.0",
@@ -599,7 +633,7 @@ class OAuthManager:
                 json=message,
                 headers={"Authorization": "Bearer " + token, "Accept": "application/json, text/event-stream"},
             )
-        value = response.json()
+        value = self._parse_mcp_response(response, message["id"])
         if (
             response.headers.get(self.config.owner_header) != owner
             or response.headers.get("Mcp-Session-Id")

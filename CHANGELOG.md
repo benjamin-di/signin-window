@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.6] - 2026-11-23
+
+### Fixed
+
+- Parse `text/event-stream` MCP Streamable HTTP `initialize` responses in `OAuthManager._prove_owner` in addition to `application/json`, while retaining all owner-header, session, JSON-RPC id, and error checks.
+
+### Upgrade
+
+- Action required: none.
+- Rollback: compatible with 0.8.5; no stored state or public API changes.
+
 ## [0.8.5] - 2026-11-23
 
 ### Fixed
