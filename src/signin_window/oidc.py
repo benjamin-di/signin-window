@@ -49,11 +49,12 @@ _PENDING_SECONDS = 600
 RECENT_AUTHENTICATION_SECONDS = 300
 
 
+_PENDING_KEYS = ("next", "reauth_started", "pending_expires")
+
+
 def _drop_pending(session):
     """Forget an unfinished sign-in attempt without touching a verified identity."""
-    for key in [
-        key for key in session if key in ("next", "reauth_started", "pending_expires") or key.startswith("_state_")
-    ]:
+    for key in [key for key in session if key in _PENDING_KEYS or key.startswith("_state_")]:
         del session[key]
 
 
@@ -127,6 +128,13 @@ class BrowserStore:
             raise ValueError("Browser state must be an owned private file (0600)")
         with self.db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, data TEXT, expires REAL)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires)")
+            db.execute("CREATE TABLE IF NOT EXISTS revocations (id TEXT PRIMARY KEY, expires REAL)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_revocations_expires ON revocations(expires)")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS session_families (id TEXT PRIMARY KEY, family TEXT NOT NULL, expires REAL)"
+            )
+            db.execute("CREATE INDEX IF NOT EXISTS idx_session_families_family ON session_families(family)")
 
     @contextmanager
     def db(self):
@@ -175,6 +183,91 @@ class BrowserStore:
     def delete(self, sid):
         with self.db() as db:
             db.execute("DELETE FROM sessions WHERE id=?", (self.digest(sid),))
+
+    def revoke(self, sid):
+        if not isinstance(sid, str) or not _SID.fullmatch(sid):
+            return
+        now = self.clock()
+        dig = self.digest(sid)
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT family FROM session_families WHERE id=?", (dig,)).fetchone()
+            family = row[0] if row else None
+            db.execute("DELETE FROM sessions WHERE id=?", (dig,))
+            db.execute("DELETE FROM revocations WHERE expires<=?", (now,))
+            db.execute("DELETE FROM session_families WHERE expires<=?", (now,))
+            db.execute("INSERT OR REPLACE INTO revocations VALUES (?,?)", (dig, now + _PENDING_SECONDS))
+            if family:
+                db.execute("INSERT OR REPLACE INTO revocations VALUES (?,?)", (family, now + _PENDING_SECONDS))
+                members = [
+                    r[0] for r in db.execute("SELECT id FROM session_families WHERE family=?", (family,)).fetchall()
+                ]
+                for member_id in members:
+                    db.execute("INSERT OR REPLACE INTO revocations VALUES (?,?)", (member_id, now + _PENDING_SECONDS))
+                db.execute(
+                    "DELETE FROM sessions WHERE id IN (SELECT id FROM session_families WHERE family=?)",
+                    (family,),
+                )
+                db.execute("DELETE FROM session_families WHERE family=?", (family,))
+
+    def save_if_not_revoked(self, sid, data, old_sid=""):
+        """Atomically verify ``old_sid`` and its family were not revoked and persist ``sid`` in one transaction."""
+        import json
+
+        if not _SID.fullmatch(sid):
+            raise ValueError("Invalid browser session reference")
+        expires = min(self.clock() + _MAX_AGE, float(data.get("expires", self.clock() + _MAX_AGE)))
+        pending = data.get("pending_expires")
+        if isinstance(pending, int | float) and not isinstance(pending, bool) and math.isfinite(pending):
+            expires = min(self.clock() + _MAX_AGE, max(expires, pending))
+        now = self.clock()
+        dig = self.digest(sid)
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            family = data.get("_family") if isinstance(data.get("_family"), str) else None
+            if old_sid and isinstance(old_sid, str) and _SID.fullmatch(old_sid):
+                old_dig = self.digest(old_sid)
+                if family is None:
+                    row = db.execute("SELECT family FROM session_families WHERE id=?", (old_dig,)).fetchone()
+                    if row:
+                        family = row[0]
+                revoked = db.execute("SELECT 1 FROM revocations WHERE id=? AND expires>?", (old_dig, now)).fetchone()
+                if revoked is not None:
+                    return False
+                db.execute("DELETE FROM sessions WHERE id=?", (old_dig,))
+            if family is None:
+                family = "fam:" + secrets.token_urlsafe(18)
+            else:
+                fam_revoked = db.execute("SELECT 1 FROM revocations WHERE id=? AND expires>?", (family, now)).fetchone()
+                if fam_revoked is not None:
+                    return False
+            stored = {**data, "_family": family}
+            encoded = json.dumps(stored)
+            if not math.isfinite(expires) or len(encoded) > 65536:
+                raise ValueError("Browser session exceeds its bounds")
+            db.execute("DELETE FROM sessions WHERE expires<=?", (now,))
+            db.execute("DELETE FROM session_families WHERE expires<=?", (now,))
+            db.execute(
+                "DELETE FROM sessions WHERE id IN (SELECT id FROM sessions ORDER BY expires DESC LIMIT -1 OFFSET 4095)"
+            )
+            db.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?)", (dig, encoded, expires))
+            fam_exp = max(expires, now + _PENDING_SECONDS)
+            db.execute("INSERT OR REPLACE INTO session_families VALUES (?,?,?)", (dig, family, fam_exp))
+            if old_sid and isinstance(old_sid, str) and _SID.fullmatch(old_sid):
+                db.execute(
+                    "INSERT OR REPLACE INTO session_families VALUES (?,?,?)",
+                    (self.digest(old_sid), family, fam_exp),
+                )
+        return True
+
+    def is_revoked(self, sid):
+        if not isinstance(sid, str) or not _SID.fullmatch(sid):
+            return False
+        with self.db() as db:
+            row = db.execute(
+                "SELECT 1 FROM revocations WHERE id=? AND expires>?", (self.digest(sid), self.clock())
+            ).fetchone()
+        return row is not None
 
     def consume(self, sid):
         """Claim a pending callback once, including concurrent requests in other workers."""
@@ -386,6 +479,7 @@ class BrowserAuth:
                     identity=self.page_identity,
                 ),
                 status_code=503,
+                headers=PAGE_HEADERS,
             )
 
     async def callback(self, request: Request):
@@ -412,7 +506,11 @@ class BrowserAuth:
             )
             # From here the provider has vouched for a person; refusing that identity ends any earlier session.
             refused = True
-            info = token.get("userinfo") or {}
+            if not isinstance(token, dict) or not isinstance(token.get("id_token"), str) or not token["id_token"]:
+                raise ValueError("verified id_token is required")
+            info = token.get("userinfo")
+            if not isinstance(info, dict) or not info:
+                raise ValueError("verified id_token claims are required")
             sub, groups = info.get("sub"), info.get("groups", [])
             if (
                 info.get("iss") != self.config.issuer
@@ -453,7 +551,10 @@ class BrowserAuth:
                 and math.isfinite(authenticated)
                 and now - RECENT_AUTHENTICATION_SECONDS <= authenticated <= now + 5
             )
+            prev_family = request.session.get("_family")
             request.session.clear()
+            if isinstance(prev_family, str) and prev_family:
+                request.session["_family"] = prev_family
             request.session.update(
                 issuer=self.config.issuer,
                 sub=sub,
@@ -463,12 +564,12 @@ class BrowserAuth:
                 expires=expires,
                 claims={name: info[name] for name in self.config.claim_names if name in info},
                 auth_time=authenticated,
-                # A step-up proves now; otherwise a provider-verified recent authentication counts from its own time.
-                reauthenticated_at=now if reauth_started is not None else (min(authenticated, now) if recent else None),
+                # Record provider-verified auth_time (clamped to now) so delayed callbacks cannot extend freshness.
+                reauthenticated_at=min(authenticated, now) if (reauth_started is not None or recent) else None,
             )
             if self.on_sign_in is not None:
                 refused = True  # A host refusal must not save the newly verified identity.
-                self.on_sign_in(dict(request.session))
+                self.on_sign_in({k: v for k, v in request.session.items() if k != "_family"})
                 refused = False
             request.scope["rotate_browser_session"] = True
             return RedirectResponse(destination, status_code=303)
@@ -491,11 +592,13 @@ class BrowserAuth:
                     identity=self.page_identity,
                 ),
                 status_code=403,
+                headers=PAGE_HEADERS,
             )
 
     async def logout(self, request: Request):
         if not self.origin_ok(request):
-            return Response("Request refused", status_code=403)
+            return self.refused(request)
+        self.store.revoke(request.cookies.get(self.cookie, ""))
         request.session.clear()
         # Not the home page: a host that sends signed-out visitors straight to sign-in would sign them back in.
         return HTMLResponse(
@@ -505,7 +608,8 @@ class BrowserAuth:
                 f'<p><a class="button" href="{html.escape(self.prefix)}/connections/login">'
                 "Sign in to Connections</a></p>",
                 identity=self.page_identity,
-            )
+            ),
+            headers=PAGE_HEADERS,
         )
 
     def routes(self, prefix="/connections"):
@@ -532,15 +636,20 @@ class BrowserAuth:
                     if scope.get("keep_browser_session"):
                         pass  # Leave the stored row and the cookie exactly as they are.
                     elif data != original or scope.get("rotate_browser_session"):
-                        auth.store.delete(old)
+                        saved = False
                         sid = secrets.token_urlsafe(32)
+                        if old and original and not scope.get("rotate_browser_session") and data:
+                            if not auth.store.consume(old):
+                                data = {k: v for k, v in data.items() if k in _PENDING_KEYS or k.startswith("_state_")}
                         if data:
-                            auth.store.save(sid, data)
+                            saved = auth.store.save_if_not_revoked(sid, data, old_sid=old)
+                        elif old:
+                            auth.store.delete(old)
                         cookie = Response()
                         cookie.set_cookie(
                             auth.cookie,
-                            sid if data else "",
-                            max_age=_MAX_AGE if data else 0,
+                            sid if saved else "",
+                            max_age=_MAX_AGE if saved else 0,
                             path="/",
                             httponly=True,
                             samesite="lax",

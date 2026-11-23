@@ -212,6 +212,7 @@ class Windows:
         self.display_base, self.vnc_base = display_base, vnc_base
         self._clock = clock
         self._windows: dict[str, Window] = {}
+        self._cleanup_tasks: set[asyncio.Future[Any]] = set()
         self._guard = threading.Lock()
 
     async def start(self, layout: str = "desktop", params: Mapping[str, Any] | None = None) -> Window:
@@ -235,12 +236,54 @@ class Windows:
             window = Window(secrets.token_urlsafe(18), layout, free[0], now, now + self.limit, params, key,
                             display_base=self.display_base, vnc_base=self.vnc_base)  # fmt: skip
             self._windows[window.id] = window
+
+        async def _startup_display() -> None:
+            try:
+                await asyncio.to_thread(self.start_display, window)
+            except BaseException:
+                await self._end_async(window, "failed", "display")
+                raise
+            if window.cancelled.is_set():
+                await self._end_async(window, "cancelled")
+                return
+            task = asyncio.create_task(self._run(window))
+            window.task = task
+
+            def _ensure_ended(finished: asyncio.Task[Any]) -> None:
+                if window.ended_at is None:
+                    self._end(window, "expired" if self._clock() > window.deadline else "cancelled")
+
+            task.add_done_callback(_ensure_ended)
+            if window.cancelled.is_set() and not task.done():
+                task.cancel()
+
+        startup_task = asyncio.create_task(_startup_display())
+        self._cleanup_tasks.add(startup_task)
+        startup_task.add_done_callback(self._cleanup_tasks.discard)
         try:
-            await asyncio.to_thread(self.start_display, window)
-        except Exception:
-            self._end(window, "failed", "display")
+            await asyncio.shield(startup_task)
+        except BaseException:
+            with self._guard:
+                self._cancel(window)
+
+            async def _drain_startup() -> None:
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(startup_task)
+                if window.task is not None:
+                    with self._guard:
+                        self._cancel(window)
+                    with contextlib.suppress(BaseException):
+                        await asyncio.shield(window.task)
+                if window.ended_at is None:
+                    await self._end_async(window, "failed", "display")
+
+            cleanup_task = asyncio.create_task(_drain_startup())
+            self._cleanup_tasks.add(cleanup_task)
+            cleanup_task.add_done_callback(self._cleanup_tasks.discard)
+            with contextlib.suppress(asyncio.CancelledError):
+                with CancelScope(shield=True):
+                    await asyncio.shield(cleanup_task)
             raise
-        window.task = asyncio.create_task(self._run(window))
         return window
 
     def get(self, window_id: str) -> Window | None:
@@ -259,13 +302,15 @@ class Windows:
             window.state, window.ended_at = "closed", self._clock()
             return result
 
-    async def close(self, window_id: str) -> None:
-        """Cancel a window that is still open, or drop a session nobody took."""
+    async def close(self, window_id: str, *, cancel_only: bool = False) -> None:
+        """Cancel a window that is still open, or drop a session nobody took (unless ``cancel_only``)."""
         with self._guard:
             window = self._windows.get(window_id)
             if window is None:
                 return
             if window.state == "signed_in":
+                if cancel_only:
+                    return
                 window.result = None
                 window.state, window.ended_at = "closed", self._clock()
                 return
@@ -287,6 +332,8 @@ class Windows:
             for task in pending:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+        while self._cleanup_tasks:
+            await asyncio.gather(*(asyncio.shield(t) for t in list(self._cleanup_tasks)), return_exceptions=True)
 
     @contextlib.asynccontextmanager
     async def lifespan(self):
@@ -300,7 +347,8 @@ class Windows:
             while True:
                 with self._guard:
                     self._reap()
-                await asyncio.sleep(0.1)
+                    has_active = any(w.state in ACTIVE for w in self._windows.values())
+                await asyncio.sleep(0.1 if has_active else 0.5)
 
         watchdog = asyncio.create_task(supervise())
         try:
@@ -345,12 +393,29 @@ class Windows:
     # -- the runner ---------------------------------------------------------------------------------------------
 
     async def _run(self, window: Window) -> None:
-        locked = False
+        state_lock = threading.Lock()
+        lock_state = {"held": False, "abandoned": False}
         try:
             if self.lock is not None:
-                locked = await asyncio.to_thread(self.lock.acquire, True, self.lock_wait)
-                if not locked:
-                    self._end(window, "busy")
+                lock = self.lock
+                wait = self.lock_wait
+
+                def _acquire_guarded() -> bool:
+                    got = lock.acquire(True, wait)
+                    if not got:
+                        return False
+                    with state_lock:
+                        if lock_state["abandoned"]:
+                            lock.release()
+                            return False
+                        lock_state["held"] = True
+                        return True
+
+                got_lock = await asyncio.to_thread(_acquire_guarded)
+                if not got_lock:
+                    if window.cancelled.is_set():
+                        raise asyncio.CancelledError
+                    await self._end_async(window, "busy")
                     return
             if window.cancelled.is_set():
                 raise asyncio.CancelledError
@@ -359,21 +424,27 @@ class Windows:
             else:
                 result = await self._in_thread(window)
             if window._outcome is not None:
-                self._end(window, *window._outcome)
+                await self._end_async(window, *window._outcome)
             elif isinstance(result, dict) and not window.cancelled.is_set():
-                self._end(window, "signed_in", result=result)
+                await self._end_async(window, "signed_in", result=result)
             else:
-                self._end(window, "failed", window.error or "no_session")
+                await self._end_async(window, "failed", window.error or "no_session")
         except asyncio.CancelledError:
             if window._outcome is not None:  # it finished all the same (a kept session being saved)
-                self._end(window, *window._outcome)
+                await self._end_async(window, *window._outcome)
             else:
-                self._end(window, "expired" if self._clock() > window.deadline else "cancelled")
+                await self._end_async(window, "expired" if self._clock() > window.deadline else "cancelled")
         except Exception as exc:
             log.warning("window %s failed: %s", window.id[:6], type(exc).__name__)
-            self._end(window, "failed", window.error or type(exc).__name__)
+            await self._end_async(window, "failed", window.error or type(exc).__name__)
         finally:
-            if locked:
+            release = False
+            with state_lock:
+                lock_state["abandoned"] = True
+                if lock_state["held"]:
+                    lock_state["held"] = False
+                    release = True
+            if release and self.lock is not None:
                 self.lock.release()
 
     async def _in_thread(self, window: Window) -> dict[str, Any] | None:
@@ -389,17 +460,42 @@ class Windows:
                 worker.result()  # retrieve a cooperative runner's cancellation failure
             raise
 
-    def _end(self, window: Window, state: str, error: str | None = None, result: dict[str, Any] | None = None) -> None:
-        if window.ended_at is not None:
-            return
-        now = self._clock()
-        window.state, window.error, window.ended_at = state, error or window.error, now
-        if result is not None:
-            window.result, window.result_at = result, now
+    def _claim_end(
+        self, window: Window, state: str, error: str | None = None, result: dict[str, Any] | None = None
+    ) -> list[str] | None:
+        with self._guard:
+            if window.ended_at is not None:
+                return None
+            now = self._clock()
+            window.state, window.error, window.ended_at = state, error or window.error, now
+            if result is not None:
+                window.result, window.result_at = result, now
+            profiles = list(window.profiles)
+            window.profiles.clear()
+            return profiles
+
+    def _cleanup_resources(self, window: Window, profiles: list[str]) -> None:
         self.stop_display(window)
-        for path in window.profiles:
+        for path in profiles:
             shutil.rmtree(path, ignore_errors=True)
-        window.profiles.clear()
+
+    def _end(self, window: Window, state: str, error: str | None = None, result: dict[str, Any] | None = None) -> None:
+        profiles = self._claim_end(window, state, error, result)
+        if profiles is None:
+            return
+        self._cleanup_resources(window, profiles)
+        log.info("window %s ended: %s%s", window.id[:6], state, f" ({window.error})" if window.error else "")
+
+    async def _end_async(
+        self, window: Window, state: str, error: str | None = None, result: dict[str, Any] | None = None
+    ) -> None:
+        profiles = self._claim_end(window, state, error, result)
+        if profiles is None:
+            return
+        cleanup = asyncio.ensure_future(asyncio.to_thread(self._cleanup_resources, window, profiles))
+        self._cleanup_tasks.add(cleanup)
+        cleanup.add_done_callback(self._cleanup_tasks.discard)
+        await asyncio.shield(cleanup)
         log.info("window %s ended: %s%s", window.id[:6], state, f" ({window.error})" if window.error else "")
 
     # -- the display and its remote-desktop server --------------------------------------------------------------
@@ -520,17 +616,35 @@ import RFB from '/novnc/core/rfb.js';
 const id = location.pathname.split('/')[2], t = new URLSearchParams(location.search).get('t');
 history.replaceState(null, '', location.pathname);  // keep the token out of the address bar
 const ws = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host;
-let rfb = null;
+let rfb = null, failures = 0;
 const status = document.getElementById('status');
 async function poll() {
-  let s;
-  try { s = await (await fetch(`/view/${id}/state?t=${encodeURIComponent(t)}`)).json(); } catch (e) { s = {}; }
+  let s = null;
+  try {
+    const resp = await fetch(`/view/${id}/state?t=${encodeURIComponent(t)}`, {cache: 'no-store'});
+    if (!resp.ok) throw new Error(String(resp.status));
+    s = await resp.json();
+    failures = 0;
+  } catch (e) {
+    failures += 1;
+    status.textContent = failures >= 5
+      ? 'Unable to check sign-in status. Reload or return to your application.'
+      : 'Reconnecting to check sign-in status…';
+    setTimeout(poll, Math.min(1000 * 2 ** Math.min(failures - 1, 3), 8000));
+    return;
+  }
   if (s.host) document.getElementById('url').textContent = s.host;
   if (s.state === 'waiting' && !rfb) {
     rfb = new RFB(document.getElementById('screen'), `${ws}/logins/${id}/vnc?t=${encodeURIComponent(t)}`);
     rfb.scaleViewport = true; rfb.resizeSession = false; rfb.focusOnClick = true;
   }
-  if (s.state && !['starting', 'waiting'].includes(s.state)) {
+  if (s.state === 'saving') {
+    if (rfb) { rfb.disconnect(); rfb = null; }
+    status.textContent = 'Sign-in complete. Saving your connection…';
+    setTimeout(poll, 1000);
+    return;
+  }
+  if (s.state && !['starting', 'waiting', 'saving'].includes(s.state)) {
     if (rfb) rfb.disconnect();
     document.getElementById('screen').remove();
     const d = document.getElementById('done'); d.style.display = 'block';
@@ -637,7 +751,12 @@ def build_app(
         return JSONResponse(session, headers={"Cache-Control": "no-store"})
 
     async def close(request: Request) -> Response:
-        await windows.close(request.path_params["id"])
+        cancel_only = request.query_params.get("cancel_only") == "1"
+        await windows.close(request.path_params["id"], cancel_only=cancel_only)
+        return Response(status_code=204)
+
+    async def cancel_window(request: Request) -> Response:
+        await windows.close(request.path_params["id"], cancel_only=True)
         return Response(status_code=204)
 
     def viewable(window_id: str, view_token: str) -> Window | None:
@@ -681,6 +800,7 @@ def build_app(
         Route("/logins", start, methods=["POST"]),
         Route("/logins/{id}", state, methods=["GET"]),
         Route("/logins/{id}", close, methods=["DELETE"]),
+        Route("/logins/{id}/cancel", cancel_window, methods=["POST"]),
         Route("/logins/{id}/result", result, methods=["POST"]),
         WebSocketRoute("/logins/{id}/vnc", vnc),
         *routes,

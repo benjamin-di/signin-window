@@ -66,6 +66,7 @@ log = logging.getLogger("signin_window")
 LINK_ID = re.compile(r"[A-Za-z0-9_-]{32,64}\Z")
 FIELD = re.compile(r"[a-z_][a-z0-9_]{0,39}\Z")
 ACTIVE = ("starting", "waiting", "saving")
+CANCELLABLE = ("starting", "waiting")
 FINAL = ("connected",)
 MISS_WINDOW, MISSES_PER_ADDRESS, MISSES_TOTAL = 10 * 60, 20, 200  # requests for ids that do not exist
 HEADERS = {
@@ -135,6 +136,10 @@ class Link:
     shown: dict[str, str] = field(default_factory=dict)
     starts: int = 0
     closed: bool = False  # replaced by a newer link or expired: it opens nothing any more
+    closing: bool = False  # cancellation/retirement pending backend confirmation
+    viewer_revoked: bool = False  # live viewer access revoked for the current window
+    next_poll: float = 0.0
+    poll_failures: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     context: AttemptContext | None = field(default=None, repr=False)
 
@@ -210,6 +215,7 @@ class Relay:
         parts = urlsplit(public_url)
         self._origin = f"{parts.scheme}://{parts.netloc}"
         self._links: dict[str, Link] = {}
+        self._retired: dict[str, Link] = {}
         self._made: dict[str, collections.deque] = {}
         self._misses = Misses()
         self._lock = threading.Lock()
@@ -230,8 +236,12 @@ class Relay:
         async def follow():
             while not stop.is_set():
                 await anyio.to_thread.run_sync(self.tick)
+                with self._lock:
+                    has_work = bool(self._retired) or any(
+                        link.state in ACTIVE and link.window_id is not None for link in self._links.values()
+                    )
                 with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(stop.wait(), timeout=0.1)
+                    await asyncio.wait_for(stop.wait(), timeout=0.25 if has_work else 1.0)
 
         task = asyncio.create_task(follow())
         try:
@@ -241,11 +251,33 @@ class Relay:
             await task  # never abandon a completion hook in a worker during shutdown
 
     def tick(self) -> None:
+        now = self._clock()
         with self._lock:
-            self._expire(self._clock())
+            self._expire(now)
             links = list(self._links.values())
+            retired = list(self._retired.values())
         for link in links:
-            self.advance(link)
+            if not link.closing and link.next_poll <= now:
+                self.advance(link)
+        for link in retired:
+            if link.next_poll <= now:
+                if link.closing:
+                    self._retire(link)
+                else:
+                    self.advance(link)
+            if link.lock.acquire(blocking=False):
+                try:
+                    if not link.closing and (link.state not in ACTIVE or link.window_id is None):
+                        with self._lock:
+                            self._retired.pop(link.id, None)
+                finally:
+                    link.lock.release()
+
+    def _track_retired_locked(self, link: Link, *, reset_poll: bool = True) -> list[Link]:
+        if reset_poll:
+            link.next_poll = 0.0
+        self._retired[link.id] = link
+        return []
 
     def create(self, key: str, *, params: dict[str, Any] | None = None, label: str | None = None,
                context: AttemptContext | None = None) -> Link:  # fmt: skip
@@ -254,29 +286,44 @@ class Relay:
         if self._authorize is not None and (context is None or not context.owner):
             raise ValueError("authenticated links require a host-assigned owner")
         now = self._clock()
+        evicted_retired: list[Link] = []
         with self._lock:
             made = self._made.setdefault(key, collections.deque())
             while made and now - made[0] > 3600:
                 made.popleft()
             if len(made) >= self.links_per_hour:
                 raise LinkLimited(key)
-            made.append(now)
             self._expire(now)
+            if len(self._retired) >= self.max_links:
+                raise LinkLimited(key)
+            made.append(now)
+            to_retire: list[Link] = []
             replaced = [link for link in self._links.values() if link.key == key]
             for link in replaced:
                 self._links.pop(link.id, None)
                 link.closed = True
+                link.view_token = None
+                if link.window_id is not None:
+                    self._track_retired_locked(link)
+                    if link.state != "saving":
+                        to_retire.append(link)
             while len(self._links) >= self.max_links:
                 oldest = self._links.pop(min(self._links.values(), key=lambda link: link.created).id)
                 oldest.closed = True
-                replaced.append(oldest)
+                oldest.view_token = None
+                if oldest.window_id is not None:
+                    self._track_retired_locked(oldest)
+                    if oldest.state != "saving":
+                        to_retire.append(oldest)
             link_id = secrets.token_urlsafe(24)
             link = Link(link_id, key, now, now + self.link_ttl, f"{self.public_url}/{link_id}", dict(params or {}),
                         key if label is None else label)  # fmt: skip
             self._links[link.id] = link
             link.context = context
-        for old in replaced:
+        for old in to_retire:
             threading.Thread(target=self._retire, args=(old,), daemon=True).start()
+        for old in evicted_retired:
+            threading.Thread(target=self._retire, args=(old,), kwargs={"force": True}, daemon=True).start()
         log.info("a sign-in link for %s", key)
         return link
 
@@ -290,7 +337,11 @@ class Relay:
         for link in [x for x in self._links.values() if now > x.expires]:
             self._links.pop(link.id, None)
             link.closed = True
-            threading.Thread(target=self._retire, args=(link,), daemon=True).start()
+            if link.state == "saving" and link.window_id is not None:
+                link.view_token = None
+                self._track_retired_locked(link)
+            else:
+                threading.Thread(target=self._retire, args=(link,), daemon=True).start()
 
     def find(self, link_id: str, address: str) -> Link | str:
         """The open link with this id, else "expired", or "limited" once this address asked for too many ids that
@@ -305,21 +356,80 @@ class Relay:
             self._misses.record(address, now)
             return "expired" if allowed else "limited"
 
-    def _retire(self, link: Link) -> None:
+    def _retire(self, link: Link, *, force: bool = False) -> None:
         """Close a replaced or expired link's window, once any start or poll on it has finished."""
         with link.lock:
-            self._close(link)
+            self._close(link, force=force)
 
-    def _close(self, link: Link) -> None:
+    def _backend_close(self, window_id: str, *, cancel_only: bool) -> bool:
+        """Return True if a cancel/close was issued, False if the backend lacks atomic cancel_only."""
+        if cancel_only:
+            sig = inspect.signature(self.backend.close)
+            if "cancel_only" in sig.parameters:
+                self.backend.close(window_id, cancel_only=True)  # type: ignore[call-arg]
+                return True
+            return False
+        self.backend.close(window_id)
+        return True
+
+    def _close(self, link: Link, *, force: bool = False) -> None:
         """Close the link's window, if one is open (hold ``link.lock``)."""
-        if link.window_id:
+        # Revoke live viewer access immediately regardless of backend disposition.
+        link.view_token = None
+        link.viewer_revoked = True
+        if not force and link.window_id is not None:
+            if link.state == "saving":
+                link.closing = False
+                with self._lock:
+                    self._track_retired_locked(link)
+                return
+            # Ask the backend to cancel only cancellable windows (preserving saving/signed_in
+            # atomically under service._guard), then read its resulting disposition.
             try:
-                self.backend.close(link.window_id)
+                issued = self._backend_close(link.window_id, cancel_only=True)
+                window = self.backend.state(link.window_id)
+            except LoginUnavailable:
+                link.closing = True
+                link.poll_failures += 1
+                link.next_poll = self._clock() + min(1.0 * (2 ** min(link.poll_failures - 1, 3)), 8.0)
+                with self._lock:
+                    self._track_retired_locked(link, reset_poll=False)
+                return
+            live_state = str(window.get("state") or "")
+            if live_state in ("starting", "waiting"):
+                if not issued:
+                    # Custom backend lacks atomic cancel_only: revoke viewer access and retain in _retired
+                    # until polling observes the backend's terminal outcome (never issue an unconditional close).
+                    link.closing = False
+                    link.next_poll = self._clock() + 1.0
+                    with self._lock:
+                        self._track_retired_locked(link, reset_poll=False)
+                    return
+                # Backend returned before cancellation completed (e.g. 10s wait expired); keep tracking.
+                link.closing = True
+                link.next_poll = self._clock() + 1.0
+                with self._lock:
+                    self._track_retired_locked(link, reset_poll=False)
+                return
+            elif live_state not in ("cancelled", "closed", "unknown", ""):
+                # Preserve saving, signed_in, and completed kept-session outcomes (e.g. connected) for normal hooks.
+                if live_state in ("saving", "signed_in"):
+                    link.state = "saving"
+                link.closing = False
+                with self._lock:
+                    self._track_retired_locked(link)
+                return
+        elif link.window_id:
+            try:
+                self._backend_close(link.window_id, cancel_only=False)
             except LoginUnavailable:
                 pass
-        link.window_id, link.view_token = None, None
-        if link.state in ACTIVE:
+        link.closing = False
+        link.window_id = None
+        if link.state in CANCELLABLE or (force and link.state in ACTIVE):
             link.state = "cancelled"
+        with self._lock:
+            self._retired.pop(link.id, None)
 
     # -- the sign-in ----------------------------------------------------------------------------------------------
 
@@ -350,7 +460,11 @@ class Relay:
                 link.state = "failed"
                 return
             link.window_id, link.state, link.host = window["id"], "starting", ""
+            link.viewer_revoked = False
             link.view_token = str(window["view_token"]) if window.get("view_token") else None  # or in a later state
+            if link.closed:
+                self._close(link)
+                return
             log.info("%s opened a sign-in window", link.key)
 
     def advance(self, link: Link) -> None:
@@ -358,28 +472,48 @@ class Relay:
         if not link.lock.acquire(blocking=False):
             return  # another poll is already on it
         try:
-            if link.state not in ACTIVE or link.window_id is None:
+            if link.closing or link.state not in ACTIVE or link.window_id is None:
                 return
+            now = self._clock()
             try:
                 window = self.backend.state(link.window_id)
             except LoginUnavailable:
-                link.state = "failed"
+                # Keep transient backend failures recoverable across multiple retries.
+                link.poll_failures += 1
+                backoff = min(1.0 * (2 ** min(link.poll_failures - 1, 3)), 8.0)
+                link.next_poll = now + backoff
+                if link.poll_failures >= 5 and now > link.expires + 60:
+                    link.window_id, link.view_token = None, None
+                    link.state = "failed"
                 return
             link.host = str(window.get("host") or "")[:100]
             state = str(window.get("state") or "")
             if state in ACTIVE:
+                link.poll_failures = 0
+                link.next_poll = now + 1.0
                 link.state = state
-                if not link.view_token and window.get("view_token"):  # a backend that has it only once the view is up
+                if state == "saving":
+                    link.view_token = None
+                elif not link.view_token and not link.closed and not link.viewer_revoked and window.get("view_token"):
                     link.view_token = str(window["view_token"])
                 return
-            window_id, link.window_id, link.view_token = link.window_id, None, None
+            window_id = link.window_id
             if state == "signed_in":
                 try:
                     session = self.backend.result(window_id)
                 except LoginUnavailable:
+                    # Keep window_id intact for retry while within bounded failure budget.
+                    link.poll_failures += 1
+                    link.next_poll = now + min(1.0 * (2 ** min(link.poll_failures - 1, 3)), 8.0)
+                    if link.poll_failures < 5 or now <= link.expires + 60:
+                        return
                     session = None
+                link.poll_failures = 0
+                link.window_id, link.view_token = None, None
                 outcome = self._run_hook(self._on_signed_in, link, session) if session else "failed"
             else:
+                link.poll_failures = 0
+                link.window_id, link.view_token = None, None
                 outcome = self._run_hook(self._on_ended or self._kept, link, window)
             link.state = outcome
             log.info("%s: sign-in %s", link.key, outcome)
@@ -526,21 +660,25 @@ class Relay:
                     await ws.send_bytes(data)
 
             async def watch():
-                while await self._allowed(ws, link, "vnc"):
+                while (
+                    not link.closed
+                    and not link.closing
+                    and link.state == "waiting"
+                    and link.view_token is not None
+                    and await self._allowed(ws, link, "vnc")
+                ):
                     await asyncio.sleep(0.25)
 
             tasks = []
             try:
-                if self._authorize is None:
-                    await self.backend.bridge(link.window_id, link.view_token, ws)
-                else:
-                    tasks = [
-                        asyncio.create_task(self.backend.bridge(link.window_id, link.view_token, GuardedSocket())),
-                        asyncio.create_task(watch()),
-                    ]
-                    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                    for task in done:
-                        task.result()
+                socket = ws if self._authorize is None else GuardedSocket()
+                tasks = [
+                    asyncio.create_task(self.backend.bridge(link.window_id, link.view_token, socket)),
+                    asyncio.create_task(watch()),
+                ]
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    task.result()
             except (LoginUnavailable, WebSocketDisconnect):
                 pass
             finally:

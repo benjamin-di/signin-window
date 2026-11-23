@@ -163,17 +163,17 @@ _PAGE = """<!doctype html><html lang=en><meta charset=utf-8>
 :root{color-scheme:light;font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;color:#141414}
 html,body{margin:0;height:100%;background:#f4f4f4;overflow:hidden}
 body{display:flex;flex-direction:column;height:var(--signin-viewport-height,100dvh)}
-header{flex-shrink:0;display:flex;align-items:center;gap:6px;padding:6px 10px 6px 16px;
+header{position:relative;flex-shrink:0;display:flex;align-items:center;gap:6px;padding:6px 10px 6px 16px;
  background:#fff;border-bottom:1px solid #ddd}
 .heading{flex:1;min-width:0}h1{font-size:16px;margin:0;overflow-wrap:anywhere}
 .bar{font-size:12px}#host{color:#1a7f37}#status{display:block;color:#4b4b4b}
-body.viewer-active #status{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+body.viewer-active #status:not(.warn){position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
 #signin-help summary{list-style:none;display:flex;align-items:center;justify-content:center;
  width:44px;height:44px;cursor:pointer;font-weight:700;border-radius:8px}
 #signin-help summary::-webkit-details-marker{display:none}
 #signin-help[open] summary{background:#eef2f3}
-#signin-help>div{position:absolute;top:64px;right:12px;z-index:20;box-sizing:border-box;width:360px;
- max-width:calc(100% - 24px);padding:16px;border:1px solid #ddd;border-radius:12px;background:#fff;
+#signin-help>div{position:absolute;top:100%;right:12px;margin-top:4px;z-index:20;box-sizing:border-box;width:360px;
+ max-width:calc(100vw - 24px);padding:16px;border:1px solid #ddd;border-radius:12px;background:#fff;
  box-shadow:0 8px 24px #0002;font-size:14px;max-height:60dvh;overflow:auto}
 #view{flex:1;min-height:0;display:flex}
 #view iframe{flex:1;border:0;width:100%;height:100%;background:#fff}
@@ -232,8 +232,12 @@ async function request(path, options = {}, allowEmpty = false) {
 }
 const post = (path, data) => request(path, {method: "POST", headers: {"content-type": "application/json"},
                                          body: JSON.stringify(data || {})});
-const AGAIN = `<button onclick="location.reload()">Try again</button>`;
+const AGAIN = `<button type="button" data-retry>Try again</button>`;
 const secure = CONFIG.secureHost ? new RegExp(CONFIG.secureHost) : null;
+let currentState = "ready";
+function updateCancel() {
+  cancel.hidden = over || $("intro").hidden === false || currentState === "saving";
+}
 function outcome(s) {
   if (!Object.hasOwn(CONFIG.outcomes, s.state)) return null;
   const template = CONFIG.outcomes[s.state];
@@ -251,10 +255,32 @@ function finish(html) {
   $("intro").hidden = true;
   document.querySelector("header .bar").hidden = true;
   const done = $("done"); done.innerHTML = html; done.hidden = false;
+  const retryBtn = done.querySelector("button[data-retry]");
+  if (retryBtn) {
+    retryBtn.addEventListener("click", async () => {
+      if (window.signinBeforeStart && !(await window.signinBeforeStart())) return;
+      try {
+        const probe = await fetch(base, {cache: "no-store", redirect: "manual"});
+        if ([404, 410].includes(probe.status)) {
+          over = false;
+          finish(CONFIG.outcomes.expired);
+          return;
+        }
+      } catch (_) {}
+      over = false;
+      failures = 0;
+      cancellationUncertain = false;
+      currentState = "ready";
+      done.hidden = true;
+      $("view").hidden = false;
+      begin(true);
+    });
+  }
   if (CONFIG.returnUrl) {
     const back = document.createElement("a"); back.href = CONFIG.returnUrl;
     back.textContent = "Back to Connections"; back.className = "button"; done.appendChild(back);
   }
+  updateCancel();
   const heading = done.querySelector("h1");
   if (heading) { heading.tabIndex = -1; heading.focus(); }
 }
@@ -283,6 +309,8 @@ function pause(message, cancellation = false) {
 }
 function show(s) {
   if (over) return true;
+  currentState = s.state;
+  $("status").classList.remove("warn");
   if (!cancellationUncertain) $("recovery").hidden = true;
   const ended = outcome(s);
   if (ended !== null) {
@@ -298,6 +326,10 @@ function show(s) {
   if (s.state === "saving") {
     $("view").replaceChildren(); viewer = false;
     document.body.classList.remove('viewer-active');
+    const savingMsg = document.createElement("div");
+    savingMsg.className = "msg";
+    savingMsg.textContent = CONFIG.text.saving;
+    $("view").appendChild(savingMsg);
   }
   if (s.state === "waiting" && !viewer) {
     viewer = true;
@@ -309,8 +341,9 @@ function show(s) {
     frame.src = `${base}/novnc/vnc.html?${q}`;
     frame.title = CONFIG.frameTitle;
     frame.allow = "clipboard-read";
-    $("view").appendChild(frame);
+    $("view").replaceChildren(frame);
   }
+  updateCancel();
   return false;
 }
 async function poll() {
@@ -322,6 +355,7 @@ async function poll() {
   } catch (error) {
     if (recover(error)) return;
     failures += 1;
+    $("status").classList.add("warn");
     $("status").textContent = 'We could not check your progress. Trying again…';
     if (failures >= 3) {
       pause('We cannot check your progress right now. Your sign-in may still be running.');
@@ -330,18 +364,22 @@ async function poll() {
   }
   pollTimer = setTimeout(poll, Math.min(1500 * 2 ** failures, 6000));
 }
-async function begin() {
-  if (window.signinBeforeStart && !(await window.signinBeforeStart())) return;
+async function begin(skipBeforeStart = false) {
+  if (!skipBeforeStart && window.signinBeforeStart && !(await window.signinBeforeStart())) return;
+  currentState = "starting";
   $("intro").hidden = true;
   document.querySelector("header .bar").hidden = false;
   $("status").textContent = CONFIG.text.starting;
+  updateCancel();
   const layout = Math.min(innerWidth, screen.width) < 700 ? "phone" : "desktop";
   try {
     if (show(await post("start", {layout}))) return;
-  } catch (error) { if (recover(error)) return; }
+  } catch (error) {
+    if (recover(error)) return;
+  }
   poll();
 }
-$("go").addEventListener("click", begin);
+$("go").addEventListener("click", () => begin());
 const cancel = document.createElement("button");
 cancel.textContent = "×";
 cancel.setAttribute("aria-label", "Cancel sign-in");
@@ -363,7 +401,10 @@ cancel.addEventListener("click", async () => {
 if (CONFIG.reconnect) {
   (async () => {
     const s = await request('state');
-    if (s.state !== "ready") {
+    const retryable = (
+      Object.hasOwn(CONFIG.outcomes, s.state) && !CONFIG.noRetry.includes(s.state) && s.state !== "unavailable"
+    );
+    if (s.state !== "ready" && !retryable) {
       $("intro").hidden = true;
       document.querySelector("header .bar").hidden = false;
       if (!show(s)) poll();
@@ -371,9 +412,6 @@ if (CONFIG.reconnect) {
   })().catch(error => {
     if (!recover(error)) pause('We could not load your sign-in status. Check its status before starting again.');
   });
-  setInterval(() => {
-    cancel.hidden = over || $("intro").hidden === false || $("status").textContent === CONFIG.text.saving;
-  }, 250);
 } else {
   addEventListener("pagehide", () => { if (!over && navigator.sendBeacon) navigator.sendBeacon(`${base}/cancel`); });
   if (CONFIG.autoStart) begin();

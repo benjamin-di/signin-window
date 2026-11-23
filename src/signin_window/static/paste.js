@@ -81,13 +81,29 @@ function releaseHeldKeys() {
 }
 
 function type(text) {
-  if (!connected() || typeof text !== "string") return;
+  if (!connected() || typeof text !== "string" || !text) return;
+  const feedback = document.getElementById("signin_feedback");
   text = text.replace(/\r\n?/g, "\n").replace(/\n+$/, "");
-  const chars = Array.from(text).slice(0, MAX_CHARS);
-  enqueue(chars.map(ch => {
-    const cp = ch.codePointAt(0);
-    return SPECIAL[ch] ?? (cp < 0x20 || cp === 0x7f ? 0 : keysyms.lookup(cp));
-  }));
+  if (!text) return;
+  if (/[\u0000-\u001f\u007f]/u.test(text)) {
+    if (feedback) feedback.textContent = "Text containing line breaks, tabs or control characters was not pasted.";
+    return;
+  }
+  const chars = Array.from(text);
+  if (chars.length > MAX_CHARS) {
+    if (feedback) feedback.textContent = "Text was not pasted. Paste at most 1000 characters at a time.";
+    return;
+  }
+  const keys = chars.map(ch => keysyms.lookup(ch.codePointAt(0)));
+  if (keys.some(k => !k)) {
+    if (feedback) feedback.textContent = "Text was not pasted. This remote keyboard supports standard printable characters only.";
+    return;
+  }
+  if (!enqueue(keys)) {
+    if (feedback) feedback.textContent = "Paste was not sent. Wait for pending typing to finish.";
+  } else if (feedback && feedback.textContent.startsWith("Text ") || feedback && feedback.textContent.startsWith("Paste ")) {
+    feedback.textContent = "";
+  }
 }
 
 // While the text is being typed, no key reaches noVNC: a held Ctrl repeating its key-down would press Ctrl on the
@@ -414,7 +430,12 @@ function installKeyboard() {
         feedback.textContent = "Paste was not allowed. Allow clipboard access and try Paste again.";
     }
   });
-  screen.addEventListener("pointerdown", () => { cancelTyping(); if (ownsFocus) reset(); }, true);
+  screen.addEventListener("pointerdown", () => {
+    const interrupted = pending.length > 0;
+    cancelTyping();
+    if (interrupted) feedback.textContent = "Typing was interrupted before finishing. Check the remote field.";
+    if (ownsFocus) reset();
+  }, true);
   const stockButton = document.getElementById("noVNC_keyboard_button");
   if (stockButton) stockButton.addEventListener("click", event => {
     event.stopImmediatePropagation();

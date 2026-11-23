@@ -3,6 +3,8 @@ window's end runs the consumer's hook, whose state the link takes; the session n
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
@@ -45,10 +47,13 @@ class FakeBackend:
     def result(self, window_id: str) -> dict | None:
         return self.results.pop(window_id, None)
 
-    def close(self, window_id: str) -> None:
+    def close(self, window_id: str, *, cancel_only: bool = False) -> None:
         self.closed.append(window_id)
         if self.states.get(window_id, {}).get("state") == "waiting":
             self.states[window_id] = {"state": "cancelled"}
+        elif not cancel_only and self.states.get(window_id, {}).get("state") == "signed_in":
+            self.results.pop(window_id, None)
+            self.states[window_id] = {"state": "closed"}
 
     def static(self, path: str, window_id: str | None = None) -> tuple[int, bytes, str]:
         self.static_for = window_id
@@ -198,6 +203,168 @@ def test_the_link_expires(relay, http, clock):
     link = relay.create("alice")
     clock.now += relay.link_ttl + 1
     assert http.get(path(link)).status_code == 404 and link.closed
+
+
+def test_a_saving_window_past_link_ttl_completes_once_and_clears_retired(backend, stored, clock):
+    calls: list[str] = []
+
+    def on_signed_in(link: Link, session: dict) -> str:
+        calls.append(link.id)
+        stored[link.key] = session
+        return "connected"
+
+    relay = make_relay(backend, stored, clock, on_signed_in=on_signed_in)
+    http = TestClient(Starlette(routes=relay.routes("/connect")))
+    link = relay.create("alice")
+    start(http, link)
+    backend.states["window-0000000000"] = {"state": "saving", "host": "www.example.com"}
+    assert state(http, link)["state"] == "saving"
+    clock.now += relay.link_ttl + 1
+    assert http.get(path(link)).status_code == 404 and link.closed
+    assert backend.closed == [] and link.state == "saving"
+    backend.hand_over("window-0000000000")
+    relay.tick()
+    assert calls == [link.id]
+    assert stored == {"alice": SESSION}
+    assert link.state == "connected"
+    assert relay._retired == {}
+    relay.tick()
+    assert calls == [link.id]
+    assert http.get(path(link)).status_code == 404
+
+
+def test_a_replaced_saving_window_cannot_overwrite_newer_generation_or_disconnect(backend, clock):
+    generation = {"alice": 1}
+    disconnected = {"alice": False}
+    stored: dict[str, dict] = {}
+    calls: list[tuple[str, int]] = []
+
+    def on_signed_in(link: Link, session: dict) -> str:
+        gen = link.params["generation"]
+        calls.append((link.id, gen))
+        if disconnected[link.key] or gen != generation[link.key]:
+            return "failed"
+        stored[link.key] = session
+        return "connected"
+
+    relay = make_relay(backend, stored, clock, on_signed_in=on_signed_in)
+    http = TestClient(Starlette(routes=relay.routes("/connect")))
+    first = relay.create("alice", params={"generation": 1})
+    start(http, first)
+    backend.states["window-0000000000"] = {"state": "saving", "host": "www.example.com"}
+    assert state(http, first)["state"] == "saving"
+
+    # Replacement link advances generation; expired/replaced public link stays unusable.
+    generation["alice"] = 2
+    second = relay.create("alice", params={"generation": 2})
+    assert http.get(path(first)).status_code == 404 and first.closed
+    start(http, second)
+    newer_session = {"cookies": [{"name": "sid", "value": "gen-2"}]}
+    backend.hand_over("window-0000000001", newer_session)
+    assert state(http, second)["state"] == "connected"
+    assert stored == {"alice": newer_session}
+
+    # Stale saving window completes after replacement: consumer generation fence rejects it.
+    backend.hand_over("window-0000000000", {"cookies": [{"name": "sid", "value": "gen-1"}]})
+    relay.tick()
+    assert stored == {"alice": newer_session}
+    assert first.state == "failed"
+    assert relay._retired == {}
+
+    # Disconnect while another saving window expires: revoked authority prevents restoring access.
+    generation["alice"] = 3
+    third = relay.create("alice", params={"generation": 3})
+    start(http, third)
+    backend.states["window-0000000002"] = {"state": "saving", "host": "www.example.com"}
+    assert state(http, third)["state"] == "saving"
+    disconnected["alice"] = True
+    stored.clear()
+    clock.now += relay.link_ttl + 1
+    assert http.get(path(third)).status_code == 404
+    backend.hand_over("window-0000000002", {"cookies": [{"name": "sid", "value": "gen-3"}]})
+    relay.tick()
+    assert stored == {}
+    assert third.state == "failed"
+    assert relay._retired == {}
+    assert [gen for _, gen in calls] == [2, 1, 3]
+
+
+def test_retired_saving_windows_are_not_evicted_by_low_max_links(backend, stored, clock):
+    relay = make_relay(backend, stored, clock, max_links=1, links_per_hour=10)
+    http = TestClient(Starlette(routes=relay.routes("/connect")))
+    link = relay.create("user-0")
+    start(http, link)
+    backend.states["window-0000000000"] = {"state": "saving", "host": "www.example.com"}
+    assert state(http, link)["state"] == "saving"
+    clock.now += relay.link_ttl + 1
+    relay.tick()
+    assert link.id in relay._retired
+    # At max_links=1, admitting a new link is refused rather than evicting accepted saving work.
+    with pytest.raises(LinkLimited):
+        relay.create("user-1")
+    backend.hand_over("window-0000000000")
+    clock.now += 2
+    relay.tick()
+    assert stored == {"user-0": SESSION}
+    assert relay._retired == {}
+    # Once reconciled, new links are admitted again.
+    next_link = relay.create("user-1")
+    assert next_link.key == "user-1"
+
+
+def test_retirement_reconciles_save_started_between_polls(backend, stored, clock):
+    relay = make_relay(backend, stored, clock, links_per_hour=10)
+    http = TestClient(Starlette(routes=relay.routes("/connect")))
+    first = relay.create("alice")
+    start(http, first)
+    assert state(http, first)["state"] == "waiting"
+    # Backend advances to saving between relay polls; link.state is still "waiting".
+    backend.states["window-0000000000"] = {"state": "saving", "host": "www.example.com"}
+    relay.create("alice")
+    deadline = time.monotonic() + 2
+    while first.id not in relay._retired and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert first.id in relay._retired
+    assert first.view_token is None
+    backend.hand_over("window-0000000000")
+    clock.now += 2
+    relay.tick()
+    assert stored == {"alice": SESSION}
+    assert first.state == "connected"
+    assert relay._retired == {}
+
+
+def test_transient_state_read_failure_recovers_for_retired_window(backend, stored, clock):
+    relay = make_relay(backend, stored, clock, links_per_hour=10)
+    http = TestClient(Starlette(routes=relay.routes("/connect")))
+    link = relay.create("alice")
+    start(http, link)
+    backend.states["window-0000000000"] = {"state": "saving", "host": "www.example.com"}
+    assert state(http, link)["state"] == "saving"
+    clock.now += relay.link_ttl + 1
+    relay.tick()
+    assert link.id in relay._retired
+
+    original_state = backend.state
+    fail = {"once": True}
+
+    def flaky_state(window_id):
+        if fail["once"]:
+            fail["once"] = False
+            raise LoginUnavailable("transient")
+        return original_state(window_id)
+
+    backend.state = flaky_state
+    clock.now += 2
+    relay.tick()
+    # Transient failure keeps the retired window alive instead of dropping it.
+    assert link.id in relay._retired
+    assert link.state == "saving"
+    backend.hand_over("window-0000000000")
+    clock.now += 5
+    relay.tick()
+    assert stored == {"alice": SESSION}
+    assert relay._retired == {}
 
 
 def test_start_sends_the_links_params_and_the_layout(relay, http, backend):

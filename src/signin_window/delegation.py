@@ -41,6 +41,9 @@ from .connections import PageIdentity
 
 MAX_BODY = 65536
 LIFETIME = 600
+BROWSER_IDLE_LIFETIME = 7 * 24 * 60 * 60
+BROWSER_ABSOLUTE_LIFETIME = 30 * 24 * 60 * 60
+MAX_BROWSER_LIFETIME = 90 * 24 * 60 * 60
 LOCK_WAIT = 30
 COOKIE = "__Secure-delegated-oauth"
 IDENTITY_SCOPES = {"openid", "profile", "email", "offline_access"}
@@ -135,6 +138,8 @@ class OAuthConfig:
     owner_header: str = "X-Authenticated-User"
     cookie_name: str = COOKIE
     callback_path: str = "/oauth/callback"
+    browser_idle_lifetime: int = BROWSER_IDLE_LIFETIME
+    browser_absolute_lifetime: int = BROWSER_ABSOLUTE_LIFETIME
 
     @property
     def auth_method(self):
@@ -184,6 +189,12 @@ class OAuthConfig:
             or len(scopes) != len(set(scopes))
             or bool(set(scopes) & IDENTITY_SCOPES)
             or any(not re.fullmatch(r"[A-Za-z0-9:._-]{1,128}", s) for s in scopes)
+        ):
+            raise OAuthError("oauth_configuration_invalid")
+        if (
+            type(self.browser_idle_lifetime) is not int
+            or type(self.browser_absolute_lifetime) is not int
+            or not LIFETIME <= self.browser_idle_lifetime <= self.browser_absolute_lifetime <= MAX_BROWSER_LIFETIME
         ):
             raise OAuthError("oauth_configuration_invalid")
         try:
@@ -288,7 +299,16 @@ class OAuthManager:
                 CREATE TABLE IF NOT EXISTS capabilities (
                     digest TEXT PRIMARY KEY, kind TEXT NOT NULL, owner TEXT NOT NULL,
                     expires REAL NOT NULL, encrypted BLOB NOT NULL);
+                CREATE INDEX IF NOT EXISTS idx_capabilities_expires ON capabilities(expires);
+                CREATE INDEX IF NOT EXISTS idx_capabilities_owner ON capabilities(owner);
             """)
+        self._metadata_cache = None
+        self._keys_cache = {}
+        self._client_kid = (
+            public_client_jwk(self.config.client_private_key)["kid"]
+            if self.config.client_private_key is not None
+            else None
+        )
 
     @contextmanager
     def _db(self):
@@ -381,20 +401,24 @@ class OAuthManager:
             account["encrypted"],
         )
 
-    def _save(self, account, grant=None):
+    def _save(self, account, grant=None, *, db=None):
         encrypted = self._encrypt(
             "grant",
             account["owner"],
             [account["subject"], account["generation"], account["status"]],
             {"disconnected": True} if grant is None else grant,
         )
-        with self._db() as db:
-            db.execute(
-                "INSERT INTO accounts VALUES (?,?,?,?,?) ON CONFLICT(owner) DO UPDATE SET "
-                "subject=excluded.subject,generation=excluded.generation,status=excluded.status,"
-                "encrypted=excluded.encrypted",
-                (account["owner"], account["subject"], account["generation"], account["status"], encrypted),
-            )
+        sql = (
+            "INSERT INTO accounts VALUES (?,?,?,?,?) ON CONFLICT(owner) DO UPDATE SET "
+            "subject=excluded.subject,generation=excluded.generation,status=excluded.status,"
+            "encrypted=excluded.encrypted"
+        )
+        params = (account["owner"], account["subject"], account["generation"], account["status"], encrypted)
+        if db is not None:
+            db.execute(sql, params)
+            return
+        with self._db() as conn:
+            conn.execute(sql, params)
 
     def _cap(self, kind, token, *, consume=False):
         if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
@@ -409,22 +433,30 @@ class OAuthManager:
                 db.execute("DELETE FROM capabilities WHERE digest=?", (digest,))
         return row["owner"], payload
 
-    def _new_cap(self, kind, owner, payload):
+    def _new_cap(self, kind, owner, payload, *, lifetime=None, db=None, now=None):
         token = secrets.token_urlsafe(32)
-        self._write_cap(kind, token, owner, payload)
+        self._write_cap(kind, token, owner, payload, lifetime=lifetime, db=db, now=now)
         return token
 
-    def _write_cap(self, kind, token, owner, payload):
+    def _write_cap(self, kind, token, owner, payload, *, lifetime=None, db=None, now=None):
         digest = _hash(kind + ":" + token)
-        expires = time.time() + LIFETIME
-        with self._db() as db:
-            db.execute("DELETE FROM capabilities WHERE expires<=?", (time.time(),))
-            if db.execute("SELECT COUNT(*) FROM capabilities WHERE owner=?", (owner,)).fetchone()[0] >= 32:
+
+        def write(conn):
+            current = time.time() if now is None else now
+            expires = current + (LIFETIME if lifetime is None else lifetime)
+            conn.execute("DELETE FROM capabilities WHERE expires<=?", (current,))
+            if conn.execute("SELECT COUNT(*) FROM capabilities WHERE owner=?", (owner,)).fetchone()[0] >= 32:
                 raise OAuthError("oauth_busy")
-            db.execute(
+            conn.execute(
                 "INSERT OR REPLACE INTO capabilities VALUES (?,?,?,?,?)",
                 (digest, kind, owner, expires, self._encrypt(kind, owner, [digest, expires], payload)),
             )
+
+        if db is not None:
+            write(db)
+            return
+        with self._db() as conn:
+            write(conn)
 
     def connected(self, owner):
         return self._account(_owner(owner))["status"] == "connected"
@@ -446,7 +478,10 @@ class OAuthManager:
             raise OAuthError("oauth_configuration_invalid")
         return value
 
-    def _metadata(self):
+    def _metadata(self, *, force_refresh=False):
+        now = time.monotonic()
+        if not force_refresh and self._metadata_cache is not None and now < self._metadata_cache[0]:
+            return self._metadata_cache[1]
         try:
             with self._http() as client:
                 value = client.get(self.config.issuer + "/.well-known/openid-configuration").json()
@@ -464,6 +499,7 @@ class OAuthManager:
                 self._endpoint(value[field_name])
             if "revocation_endpoint" in value:
                 self._endpoint(value["revocation_endpoint"])
+            self._metadata_cache = (now + 300.0, value)
             return value
         except Exception:
             raise OAuthError() from None
@@ -488,14 +524,19 @@ class OAuthManager:
                 PrivateKeyJWT(
                     token_endpoint=self.config.issuer,
                     alg="RS256",
-                    headers={"kid": public_client_jwk(self.config.client_private_key)["kid"]},
+                    headers={"kid": self._client_kid},
                 )
             )
         return client
 
-    def _keys(self, metadata):
+    def _keys(self, metadata, *, force_refresh=False):
+        jwks_uri = metadata["jwks_uri"]
+        now = time.monotonic()
+        cached = self._keys_cache.get(jwks_uri)
+        if not force_refresh and cached is not None and now < cached[0]:
+            return cached[1]
         with self._http() as client:
-            value = client.get(metadata["jwks_uri"]).json()
+            value = client.get(jwks_uri).json()
         if not isinstance(value, dict) or not isinstance(value.get("keys"), list) or not 1 <= len(value["keys"]) <= 16:
             raise OAuthError()
         keys = {}
@@ -517,6 +558,7 @@ class OAuthManager:
             if key.key_size < 2048:
                 raise OAuthError()
             keys[value["kid"]] = key
+        self._keys_cache[jwks_uri] = (now + 300.0, keys)
         return keys
 
     def _decode(self, value, keys, audience, *, access=False):
@@ -530,14 +572,17 @@ class OAuthManager:
             or header.get("kid") not in keys
         ):
             raise OAuthError()
-        claims = jwt.decode(
-            value,
-            keys[header["kid"]],
-            algorithms=["RS256"],
-            issuer=self.config.issuer,
-            audience=audience,
-            options={"require": ["iss", "sub", "aud", "exp", "iat"]},
-        )
+        try:
+            claims = jwt.decode(
+                value,
+                keys[header["kid"]],
+                algorithms=["RS256"],
+                issuer=self.config.issuer,
+                audience=audience,
+                options={"require": ["iss", "sub", "aud", "exp", "iat"]},
+            )
+        except Exception:
+            raise OAuthError() from None
         if (
             not isinstance(claims["sub"], str)
             or not 1 <= len(claims["sub"]) <= 255
@@ -558,29 +603,43 @@ class OAuthManager:
     def _validate(self, token, metadata, nonce, *, subject=None, initial=False):
         if not isinstance(token, dict) or str(token.get("token_type", "")).lower() != "bearer":
             raise OAuthError()
-        keys = self._keys(metadata)
-        access, _ = self._decode(token.get("access_token"), keys, self.config.resource, access=True)
-        scopes = access.get("scope", "").split()
-        required = set(self.config.scope.split()) - IDENTITY_SCOPES
-        if (
-            not required <= set(scopes)
-            or not set(scopes) <= set(self.config.scope.split()) | {"openid", "offline_access"}
-            or ("client_id" in access and access["client_id"] != self.config.client_id)
-            or (subject is not None and access["sub"] != subject)
-        ):
-            raise OAuthError()
-        if initial or token.get("id_token"):
-            claims, header = self._decode(token.get("id_token"), keys, self.config.client_id)
-            params = {"client_id": self.config.client_id, "access_token": token["access_token"]}
-            if initial or "nonce" in claims:
-                params["nonce"] = nonce
-            CodeIDToken(claims, header, params=params).validate()
-            if claims["sub"] != access["sub"]:
+
+        def _check(keys):
+            access, _ = self._decode(token.get("access_token"), keys, self.config.resource, access=True)
+            scopes = access.get("scope", "").split()
+            required = set(self.config.scope.split()) - IDENTITY_SCOPES
+            if (
+                not required <= set(scopes)
+                or not set(scopes) <= set(self.config.scope.split()) | {"openid", "offline_access"}
+                or ("client_id" in access and access["client_id"] != self.config.client_id)
+                or (subject is not None and access["sub"] != subject)
+            ):
                 raise OAuthError()
+            if initial or token.get("id_token"):
+                claims, header = self._decode(token.get("id_token"), keys, self.config.client_id)
+                params = {"client_id": self.config.client_id, "access_token": token["access_token"]}
+                if initial or "nonce" in claims:
+                    params["nonce"] = nonce
+                CodeIDToken(claims, header, params=params).validate()
+                if claims["sub"] != access["sub"]:
+                    raise OAuthError()
+            return access
+
+        try:
+            access = _check(self._keys(metadata))
+        except OAuthError:
+            # Refresh JWKS once in case the provider rotated signing keys while cached.
+            access = _check(self._keys(metadata, force_refresh=True))
         refresh = token.get("refresh_token")
         if not isinstance(refresh, str) or not 16 <= len(refresh) <= 16384:
             raise OAuthError()
-        return {"token": dict(token), "subject": access["sub"], "expires_at": access["exp"], "nonce": nonce}
+        return {
+            "token": dict(token),
+            "subject": access["sub"],
+            "expires_at": access["exp"],
+            "nonce": nonce,
+            "scope": self.config.scope,
+        }
 
     @staticmethod
     def _parse_mcp_response(response, expected_id):
@@ -606,12 +665,13 @@ class OAuthManager:
             events.append("\n".join(data_lines))
         parsed = []
         for event in events:
+            if not event.strip():
+                continue
             item = json.loads(event)
             if isinstance(item, dict):
+                if item.get("id") == expected_id:
+                    return item
                 parsed.append(item)
-        for item in parsed:
-            if item.get("id") == expected_id:
-                return item
         if len(parsed) == 1:
             return parsed[0]
         raise OAuthError()
@@ -808,11 +868,41 @@ class OAuthManager:
             if account["status"] != "connected":
                 raise OAuthError()
             grant = self._grant(account)
+            if (
+                grant.get("subject") == account["subject"]
+                and isinstance(grant.get("expires_at"), int | float)
+                and grant["expires_at"] >= time.time() + minimum_ttl
+                and isinstance(grant.get("token"), dict)
+                and str(grant["token"].get("token_type", "")).lower() == "bearer"
+                and isinstance(grant["token"].get("access_token"), str)
+                and grant["token"]["access_token"]
+            ):
+                if grant.get("scope") == self.config.scope:
+                    return grant["token"]["access_token"]
+                if grant.get("scope") is None:
+                    # Legacy pre-upgrade grant without persisted scope: validate access token once and backfill.
+                    try:
+                        metadata = self._metadata()
+                        keys = self._keys(metadata)
+                        try:
+                            access, _ = self._decode(
+                                grant["token"]["access_token"], keys, self.config.resource, access=True
+                            )
+                        except OAuthError:
+                            keys = self._keys(metadata, force_refresh=True)
+                            access, _ = self._decode(
+                                grant["token"]["access_token"], keys, self.config.resource, access=True
+                            )
+                        scopes = set(access.get("scope", "").split())
+                        required = set(self.config.scope.split()) - IDENTITY_SCOPES
+                        if required <= scopes <= set(self.config.scope.split()) | {"openid", "offline_access"}:
+                            grant = dict(grant, scope=self.config.scope)
+                            self._save(account, grant)
+                            return grant["token"]["access_token"]
+                    except Exception:  # noqa: S110 -- fall through to refresh on legacy-grant validation failure
+                        pass
             try:
                 metadata = self._metadata()
-                if grant["expires_at"] >= time.time() + minimum_ttl:
-                    self._validate(grant["token"], metadata, grant["nonce"], subject=account["subject"])
-                    return grant["token"]["access_token"]
             except Exception:
                 raise OAuthError() from None
             # Commit uncertainty BEFORE a one-use refresh leaves this process.
@@ -827,16 +917,18 @@ class OAuthManager:
                         resource=self.config.resource,
                     )
                 new = self._validate(token, metadata, grant["nonce"], subject=account["subject"])
-                if new["expires_at"] < time.time() + minimum_ttl:
-                    raise OAuthError()
+                # Persist the validated rotated grant BEFORE checking caller-specific minimum_ttl,
+                # so a caller requesting a longer lifetime does not discard a valid rotation.
                 account["status"] = "connected"
                 self._save(account, new)
-                return new["token"]["access_token"]
             except BaseException:
                 account["status"] = "uncertain"
                 account["generation"] = str(int(account["generation"]) + 1)
                 self._save(account, grant)
                 raise OAuthError() from None
+            if new["expires_at"] < time.time() + minimum_ttl:
+                raise OAuthError()
+            return new["token"]["access_token"]
 
 
 def _headers(manager):
@@ -871,9 +963,8 @@ def _page(manager, csrf=None, connected=False, *, failed=False, identity: PageId
             )
     return HTMLResponse(
         stamp(
-            "<!doctype html><title>Application connection</title><h1>Application connection</h1>"
-            + f"<p>{text}</p>"
-            + forms,
+            '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">'
+            "<title>Application connection</title><h1>Application connection</h1>" + f"<p>{text}</p>" + forms,
             identity,
             inline_style=False,
         ),

@@ -19,7 +19,7 @@ from typing import Generic, TypeVar
 from .state import PrivateStateError, atomic_private_write, exclusive_lock, read_private_file
 
 _KEY = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
-_MAX_BYTES = 64 * 1024
+_MAX_BYTES = 512 * 1024  # accommodates up to 10,000 ISO-8601 timestamps (~380 KiB)
 _T = TypeVar("_T")
 
 

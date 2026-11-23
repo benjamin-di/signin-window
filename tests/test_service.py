@@ -549,3 +549,66 @@ def test_direct_view_without_identity_keeps_the_existing_shell(tmp_path):
         started = client.post("/logins", json={}, headers=AUTH).json()
         response = client.get(f"/view/{started['id']}?t={started['view_token']}")
         assert response.text == service.VIEW_PAGE.replace("{{TITLE}}", "Sign in")
+
+
+def test_close_all_drains_display_startup_handoff():
+    async def exercise():
+        started = threading.Event()
+        release = threading.Event()
+        stopped = []
+
+        async def runner(window):
+            window.waiting()
+            await asyncio.Event().wait()
+
+        windows = Windows(runner)
+
+        def slow_start_display(window):
+            started.set()
+            release.wait(timeout=2)
+
+        windows.start_display = slow_start_display
+        windows.stop_display = lambda window: stopped.append(window.id)
+
+        start_task = asyncio.create_task(windows.start())
+        await asyncio.to_thread(started.wait, 2)
+        close_task = asyncio.create_task(windows.close_all())
+        await asyncio.sleep(0.02)
+        assert not close_task.done()
+        release.set()
+        await asyncio.wait_for(close_task, timeout=2)
+        try:
+            await asyncio.wait_for(start_task, timeout=2)
+        except asyncio.CancelledError:
+            pass
+        assert len(stopped) == 1
+        assert all(w.ended_at is not None for w in windows._windows.values())
+
+    asyncio.run(exercise())
+
+
+def test_cancelling_start_during_display_startup_stops_display_and_runner():
+    async def exercise():
+        started = threading.Event()
+        release = threading.Event()
+        stopped = []
+
+        async def runner(window):
+            window.waiting()
+            await asyncio.Event().wait()
+
+        windows = Windows(runner)
+        windows.start_display = lambda window: (started.set(), release.wait(timeout=2))
+        windows.stop_display = lambda window: stopped.append(window.id)
+
+        start_task = asyncio.create_task(windows.start())
+        await asyncio.to_thread(started.wait, 2)
+        start_task.cancel()
+        await asyncio.sleep(0.02)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(start_task, timeout=2)
+        assert len(stopped) == 1
+        assert all(w.ended_at is not None for w in windows._windows.values())
+
+    asyncio.run(exercise())

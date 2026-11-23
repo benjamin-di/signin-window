@@ -8,7 +8,9 @@ orders starts and owner revocation barriers without relying on wall-clock races.
 from __future__ import annotations
 
 import hmac
+import re
 import secrets
+import time
 from contextlib import contextmanager
 
 from .delegation import OAuthError, OAuthManager, _hash, _owner
@@ -77,10 +79,22 @@ class DirectOAuthManager(OAuthManager):
             self._store_sequence(db, "owner:" + owner, self._advance(db))
 
     def _clear(self, account):
-        # Called while the inherited per-owner lock is held. Commit the barrier
-        # before clearing: even a crash cannot let an older direct flow install.
-        self._mark_barrier(account["owner"])
-        return super()._clear(account)
+        # Called while the inherited per-owner lock is held. Commit the barrier,
+        # disconnected account, and capability cleanup atomically so a failed
+        # cleanup leaves the grant available for retry and provider revocation.
+        try:
+            token = self._grant(account).get("token") if account["encrypted"] else None
+        except OAuthError:
+            token = None
+        account.update(generation=str(int(account["generation"]) + 1), status="disconnected")
+        with self._db() as db:
+            self._store_sequence(db, "owner:" + account["owner"], self._advance(db))
+            self._save(account, db=db)
+            db.execute(
+                "DELETE FROM capabilities WHERE owner=? AND kind IN ('state', 'direct-browser')",
+                (account["owner"],),
+            )
+        return token
 
     def new_browser(self):
         csrf = secrets.token_urlsafe(32)
@@ -94,9 +108,60 @@ class DirectOAuthManager(OAuthManager):
         except OAuthError:
             _, session = self._cap("direct-entry", cookie)
             return {"owner": None, "csrf": session["csrf"]}
-        if session["generation"] != self.revision(owner) or not self.connected(owner):
+        absolute_expires = session.get("absolute_expires")
+        if (
+            session["generation"] != self.revision(owner)
+            or not self.connected(owner)
+            or (absolute_expires is not None and absolute_expires <= time.time())
+        ):
             raise OAuthError("oauth_connection_invalid")
         return {"owner": owner, "csrf": session["csrf"]}
+
+    def touch_browser_session(self, cookie):
+        """Extend a valid authenticated browser session's idle expiry up to its absolute cap.
+
+        Returns the new remaining lifetime in seconds when extended, or ``None``
+        when no refresh is needed yet. Raises ``OAuthError`` for invalid,
+        expired, unauthenticated or revoked cookies.
+        """
+        if not isinstance(cookie, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", cookie):
+            raise OAuthError("oauth_connection_invalid")
+        digest = _hash("direct-browser:" + cookie)
+        with self._db() as db:
+            now = time.time()
+            row = db.execute(
+                "SELECT owner, expires FROM capabilities WHERE digest=? AND kind='direct-browser'", (digest,)
+            ).fetchone()
+            if not row or row["expires"] <= now:
+                raise OAuthError("oauth_connection_invalid")
+            owner = row["owner"]
+        with self._lock(owner):
+            with self._db() as db:
+                now = time.time()
+                row = db.execute(
+                    "SELECT * FROM capabilities WHERE digest=? AND kind='direct-browser'", (digest,)
+                ).fetchone()
+                if not row or row["expires"] <= now:
+                    raise OAuthError("oauth_connection_invalid")
+                session = self._decrypt("direct-browser", owner, [digest, row["expires"]], row["encrypted"])
+                absolute_expires = session.get("absolute_expires")
+                if (
+                    session["generation"] != self.revision(owner)
+                    or not self.connected(owner)
+                    or (absolute_expires is not None and absolute_expires <= now)
+                ):
+                    raise OAuthError("oauth_connection_invalid")
+                if absolute_expires is None:
+                    return None
+                idle = self.config.browser_idle_lifetime
+                target = min(now + idle, absolute_expires)
+                if row["expires"] - now > idle * 0.75 or target <= row["expires"]:
+                    return None
+                db.execute(
+                    "UPDATE capabilities SET expires=?, encrypted=? WHERE digest=? AND kind='direct-browser'",
+                    (target, self._encrypt("direct-browser", owner, [digest, target], session), digest),
+                )
+            return max(1, int(target - now))
 
     def authorize(self, cookie, csrf):
         session = self.browser_session(cookie)
@@ -196,18 +261,42 @@ class DirectOAuthManager(OAuthManager):
                     subject=grant["subject"], generation=str(int(account["generation"]) + 1), status="connected"
                 )
                 csrf = secrets.token_urlsafe(32)
-                authenticated = self._new_cap(
-                    "direct-browser",
-                    owner,
-                    {
-                        "csrf": csrf,
-                        "generation": account["generation"],
-                    },
-                )
                 kind = "direct-browser" if session["owner"] is not None else "direct-entry"
-                self._cap(kind, cookie, consume=True)
-                self._mark_barrier(owner)
-                self._save(account, grant)
+                incoming_digest = _hash(kind + ":" + cookie)
+                with self._db() as db:
+                    now = time.time()
+                    incoming_row = db.execute(
+                        "SELECT * FROM capabilities WHERE digest=? AND kind=?",
+                        (incoming_digest, kind),
+                    ).fetchone()
+                    if not incoming_row or incoming_row["expires"] <= now:
+                        raise OAuthError("oauth_connection_invalid")
+                    incoming_payload = self._decrypt(
+                        kind,
+                        incoming_row["owner"],
+                        [incoming_digest, incoming_row["expires"]],
+                        incoming_row["encrypted"],
+                    )
+                    if kind == "direct-browser":
+                        incoming_abs = incoming_payload.get("absolute_expires")
+                        if incoming_abs is not None and incoming_abs <= now:
+                            raise OAuthError("oauth_connection_invalid")
+                    db.execute("DELETE FROM capabilities WHERE digest=? AND kind=?", (incoming_digest, kind))
+                    db.execute("DELETE FROM capabilities WHERE owner=? AND kind='direct-browser'", (owner,))
+                    authenticated = self._new_cap(
+                        "direct-browser",
+                        owner,
+                        {
+                            "csrf": csrf,
+                            "generation": account["generation"],
+                            "absolute_expires": now + self.config.browser_absolute_lifetime,
+                        },
+                        lifetime=self.config.browser_idle_lifetime,
+                        db=db,
+                        now=now,
+                    )
+                    self._store_sequence(db, "owner:" + owner, self._advance(db))
+                    self._save(account, grant, db=db)
                 return authenticated, {"owner": owner, "csrf": csrf}
         except Exception:
             if token is not None:

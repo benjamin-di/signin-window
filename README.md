@@ -326,13 +326,20 @@ Shutting the service down closes its windows. `LoginClient.request(method, path)
 ## The relay, in your server
 
 ```python
+import contextlib
+from starlette.applications import Starlette
+
 from signin_window.client import LoginClient
 from signin_window.page import PageText
-from signin_window.relay import Relay
+from signin_window.relay import AttemptContext, Relay
 
 
 def store(link, session):
-    save_session(link.key, session["cookies"])  # yours
+    # Acquire your account lock and check link.context.target against the current
+    # revision/barrier atomically with writing the session, so a retired link that
+    # finishes saving after a disconnect or newer sign-in cannot overwrite newer state.
+    if not publish_if_revision_matches(link.key, link.context.target, session["cookies"]):
+        return "cancelled"
     return "connected"
 
 
@@ -342,9 +349,21 @@ relay = Relay(
     text=PageText(service="Example", secure_host=r"(^|\.)example\.com$"),
     on_signed_in=store,
 )
-app.routes.extend(relay.routes("/connect"))  # outside your server's bearer
 
-link = relay.create(account_id)  # in your connect tool
+
+@contextlib.asynccontextmanager
+async def lifespan(_app):
+    async with relay.lifespan():
+        yield
+
+
+app = Starlette(routes=[*relay.routes("/connect")], lifespan=lifespan)
+
+# Allocate a fresh revision under your publication lock and commit it only if create() succeeds.
+with account_lock(account_id):
+    next_rev = next_revision(account_id)
+    link = relay.create(account_id, context=AttemptContext(owner=account_id, target=next_rev))
+    commit_revision(account_id, next_rev)
 return {"url": link.url, "expires_at": link.expires_at}
 ```
 
@@ -763,8 +782,17 @@ csrf)` starts consent, and `finish_direct_callback(cookie, parameters)` returns
 a rotated authenticated cookie and owner session. The owner comes only from
 signed claims plus the configured resource's owner proof. Forms never choose it.
 
-`browser_session(cookie)` validates the saved generation. `current_identity(owner)`
-rechecks current signed claims and resource admission. Before a final local
+`browser_session(cookie)` validates the saved generation and hard absolute
+expiry without writing state. Authenticated `direct-browser` sessions default
+to a 7-day sliding idle timeout (`browser_idle_lifetime`) and a 30-day hard
+absolute cap (`browser_absolute_lifetime`) on `OAuthConfig`, while handshake
+tokens (`direct-entry` and `direct-state`) keep the 10-minute `LIFETIME`. On
+authenticated interactive routes (not zero-write endpoints), call
+`touch_browser_session(cookie)` after verifying access; when it returns a
+positive remaining lifetime in seconds, re-set the browser cookie with that
+`Max-Age` (and use `config.browser_idle_lifetime` on the initial callback
+cookie). `current_identity(owner)` rechecks current signed claims and resource
+admission. Before a final local
 control write, use `management_session(cookie, csrf)` as a context manager to
 serialize the write with reconnect and disconnect; perform network admission
 checks before entering and never call token/refresh methods while holding it.

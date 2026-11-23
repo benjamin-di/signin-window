@@ -82,8 +82,8 @@ class LocalBackend:
 
         return self._run(take())
 
-    def close(self, window_id: str) -> None:
-        self._run(self.windows.close(window_id))
+    def close(self, window_id: str, *, cancel_only: bool = False) -> None:
+        self._run(self.windows.close(window_id, cancel_only=cancel_only))
 
     def static(self, path: str, window_id: str | None = None) -> tuple[int, bytes, str]:
         import mimetypes
@@ -209,11 +209,17 @@ class LoginClient:
             raise LoginUnavailable(f"result {status}")
         return body
 
-    def close(self, window_id: str) -> None:
-        try:
-            self._call("DELETE", f"/logins/{self._id(window_id)}")
-        except LoginUnavailable:
-            pass
+    def close(self, window_id: str, *, cancel_only: bool = False) -> None:
+        if cancel_only:
+            # Distinct endpoint so older login services (plain-text 404/405) never raise "not json"
+            # and never run a destructive DELETE on signed_in results.
+            status, _, _ = self._raw("POST", f"/logins/{self._id(window_id)}/cancel")
+            if status in (200, 204, 404, 405):
+                return
+            raise LoginUnavailable(f"cancel {status}")
+        status, _, _ = self._raw("DELETE", f"/logins/{self._id(window_id)}")
+        if status not in (200, 204, 404):
+            raise LoginUnavailable(f"close {status}")
 
     def static(self, path: str, window_id: str | None = None) -> tuple[int, bytes, str]:
         """One of noVNC's files, for a person's viewer: (status, body, content type). The service serves the same files

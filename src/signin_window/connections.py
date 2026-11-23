@@ -71,9 +71,17 @@ _SCRIPT = """(() => {
     const replacement = matches[key.position];
     (replacement || content).focus({preventScroll: true});
   }
+  let pollTimer = null;
+  function schedulePoll(delay) {
+    clearTimeout(pollTimer);
+    if (!content.hasAttribute('data-refresh') || document.hidden) return;
+    pollTimer = setTimeout(poll, delay);
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && content.hasAttribute('data-refresh') && !polling) schedulePoll(500);
+  });
   async function poll() {
-    if (!content.hasAttribute('data-refresh') || polling) return;
-    if (document.hidden) { setTimeout(poll, 2000); return; }
+    if (!content.hasAttribute('data-refresh') || polling || document.hidden) return;
     polling = true;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
@@ -116,7 +124,7 @@ _SCRIPT = """(() => {
       failures += 1;
       if (failures >= 3) { recover('We could not refresh the status. Your sign-in may still be running.'); return; }
     } finally { clearTimeout(timeout); polling = false; }
-    if (content.hasAttribute('data-refresh')) setTimeout(poll, Math.min(2000 * 2 ** failures, 8000));
+    if (content.hasAttribute('data-refresh')) schedulePoll(Math.min(2000 * 2 ** failures, 8000));
   }
   document.addEventListener('click', async event => {
     const button = event.target.closest('button[data-copy-code]');
@@ -130,7 +138,7 @@ _SCRIPT = """(() => {
       button.textContent = 'Code selected — copy it manually';
     }
   });
-  if (content.hasAttribute('data-refresh')) setTimeout(poll, 2000);
+  if (content.hasAttribute('data-refresh')) schedulePoll(2000);
 })();"""
 
 # An exact hash allows only this fixed script, without allowing arbitrary inline scripts or new routes.

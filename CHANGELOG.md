@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.9.0] - 2026-11-24
+
+### Added
+
+- Separate authenticated `DirectOAuthManager` browser session lifetimes (`browser_idle_lifetime` defaulting to 7 days sliding and `browser_absolute_lifetime` defaulting to 30 days hard cap) from the 10-minute OAuth handshake `LIFETIME`.
+- Add `DirectOAuthManager.touch_browser_session(cookie)` to extend idle expiry under the per-owner lock (throttled until >25% of the idle window elapses, capped at `absolute_expires`) while keeping `browser_session()` strictly read-only.
+
+### Fixed
+
+- Reclaim superseded `direct-browser` session rows atomically during callback grant replacement and disconnect so repeated sign-ins cannot exhaust the per-owner capability budget.
+- Leave legacy pre-upgrade `direct-browser` cookies without `absolute_expires` unextended, and recheck encrypted `absolute_expires` inside the final callback transaction.
+
+### Upgrade
+
+- Action required: none (applications that want sliding browser cookies should set `Max-Age` to `config.browser_idle_lifetime` on callback and call `touch_browser_session(cookie)` on interactive authenticated routes).
+- Rollback: compatible with 0.8.8; existing grants remain readable and browser sessions with `absolute_expires` remain valid under 0.8.8 until their DB `expires` deadline or re-login.
+
+## [0.8.8] - 2026-11-24
+
+### Security
+
+- Require verified `id_token` in OIDC callbacks, record provider `auth_time` for step-up freshness, revoke entire session families atomically on logout, and bind scope in encrypted delegation grants with legacy backfill
+- Track `viewer_revoked` on `Link` and terminate both authenticated and capability-only VNC bridges when a link is retired, closing, or saving
+
+### Fixed
+
+- Reconcile sign-in saves that begin between relay polls via atomic `cancel_only` (`POST /logins/{id}/cancel`), enforce `max_links` at admission instead of evicting saving windows, and survive transient `LoginUnavailable` state/result polls (#14)
+- Fix profile-lock cancellation leaks, display-startup cancellation draining, and `VIEW_PAGE` `saving` handling in `service.py`
+- Cache OIDC metadata/JWKS/client `kid` in `delegation.py`, persist valid refreshes before `minimum_ttl` checks, skip empty SSE events, add SQLite indexes, and add mobile viewport metadata
+- Fix `Try again` infinite loop under `reconnect=True` and `max_starts` exhaustion, replace 250ms cancel polling, pause hidden-tab polling in `connections.py`, validate desktop paste whole-value in `paste.js`, and raise `AttemptBudget` `_MAX_BYTES` to 512 KiB for 10,000-entry ledgers
+
+### Upgrade
+
+- Action required: mount `relay.lifespan()` in your ASGI application so retired saving windows finish reconciliation without an open browser page, and ensure `on_signed_in` hooks fence publication against the current account revision/disconnect barrier under the account lock.
+- Rollback: compatible with 0.8.7 for ordinary sessions; `AttemptBudget` ledgers that grow past 64 KiB (> ~1,800 entries in a single rolling window) cannot be read by versions before 0.8.8.
+
+## [0.8.7] - 2026-11-23
+
+### Fixed
+
+- Keep tracking sign-in windows that are already `saving` when their link expires, is replaced, or is evicted, while keeping expired and replaced public URLs unusable and removing completed retired entries (#8)
+
+### Upgrade
+
+- Action required: mount `relay.lifespan()` in your ASGI application so retired saving windows finish reconciliation without an open browser page, and ensure `on_signed_in` hooks fence publication against the current account revision/disconnect barrier (for example via `link.context.target`) under the account lock so a retired completion cannot overwrite newer state.
+- Rollback: compatible with 0.8.6; no state or configuration format changes.
+
 ## [0.8.6] - 2026-11-23
 
 ### Fixed
