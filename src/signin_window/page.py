@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from dataclasses import dataclass, field
 
 from ._identity import stamp
@@ -42,9 +43,9 @@ class PageText:
     title: str = "Connect your {service} account"
     help_html: str = (
         "Sign in to {service} in the remote browser below. Use a password or verification code; device passkeys "
-        "do not work in this window. Tap a remote field, then Keyboard to type on your phone; Paste is available "
-        "while the keyboard is open. Drag to move the view, or use two fingers to scroll the remote page. "
-        "On a computer, you can also paste with Ctrl+V or Cmd+V."
+        "do not work in this window. On a phone, tap a remote field then Paste to paste directly, or tap Keyboard "
+        "to type. Drag to pan when zoomed or when the keyboard is open, or use two fingers to scroll the remote "
+        "page. On a computer, you can also paste with Ctrl+V or Cmd+V."
     )
     intro_html: str = "Connect {service} for <b>{label}</b>. Sign in to the account you want this application to use."
     button: str = "Continue to {service}'s sign-in"
@@ -80,6 +81,8 @@ class PageText:
 
     #: Optional host application identity, also shown on expired and unavailable pages.
     identity: PageIdentity | None = None
+    #: Optional concise inline guidance shown while the remote window is active (plain text, escaped).
+    notice: str = ""
 
     def with_outcomes(self, **outcomes: str) -> PageText:
         """A copy with more (or other) outcome messages."""
@@ -96,6 +99,10 @@ class PageText:
         return markup.replace("{service}", html.escape(self.service)).replace("{label}", html.escape(label))
 
 
+def _fill_slots(template: str, slots: dict[str, str]) -> str:
+    return re.sub(r"\{\{(" + "|".join(slots) + r")\}\}", lambda match: slots[match.group(1)], template)
+
+
 def render(text: PageText, label: str | None) -> str:
     """The link's page; ``label`` None is the expired page."""
     if label is None:
@@ -107,15 +114,19 @@ def render(text: PageText, label: str | None) -> str:
         body = f"<main class=msg>{text.html(text.outcomes.get('expired', DEFAULT_OUTCOMES['expired']))}{back}</main>"
         title = text.plain(text.title.replace(" {label}", "")).strip()  # no link, no label
         return stamp(
-            _PAGE.replace("{{TITLE}}", html.escape(title)).replace("{{BODY}}", body).replace("{{SCRIPT}}", ""),
+            _fill_slots(_PAGE, {"TITLE": html.escape(title), "BODY": body, "SCRIPT": ""}),
             text.identity,
         )
-    body = (
-        _BODY.replace("{{HEADING}}", html.escape(text.plain(text.title, label)))
-        .replace("{{HELP}}", text.html(text.help_html, label))
-        .replace("{{HOST}}", html.escape(text.plain(text.host_label, label)))
-        .replace("{{INTRO}}", text.html(text.intro_html, label))
-        .replace("{{BUTTON}}", html.escape(text.plain(text.button, label)))
+    body = _fill_slots(
+        _BODY,
+        {
+            "HEADING": html.escape(text.plain(text.title, label)),
+            "HELP": text.html(text.help_html, label),
+            "HOST": html.escape(text.plain(text.host_label, label)),
+            "NOTICE": html.escape(text.plain(text.notice, label)),
+            "INTRO": text.html(text.intro_html, label),
+            "BUTTON": html.escape(text.plain(text.button, label)),
+        },
     )
     config = {
         "text": {
@@ -131,6 +142,7 @@ def render(text: PageText, label: str | None) -> str:
         "reconnect": text.reconnect,
         "autoStart": text.auto_start,
         "returnUrl": text.return_url,
+        "notice": bool(text.notice.strip()),
     }
     # JSON in a script element: "</" would end it, so it is escaped.
     script = (
@@ -141,14 +153,15 @@ def render(text: PageText, label: str | None) -> str:
         + _SCRIPT
     )
     title = html.escape(text.plain(text.title, label))
-    return stamp(
-        _PAGE.replace("{{TITLE}}", title).replace("{{BODY}}", body).replace("{{SCRIPT}}", script), text.identity
-    )
+    return stamp(_fill_slots(_PAGE, {"TITLE": title, "BODY": body, "SCRIPT": script}), text.identity)
 
 
 _BODY = """<header><div class=heading><h1>{{HEADING}}</h1>
 <div class=bar hidden><span id=host>{{HOST}}</span><span id=status role=status aria-live=polite></span></div></div>
 <details id=signin-help><summary aria-label="Sign-in help">?</summary><div>{{HELP}}</div></details></header>
+<p id=notice hidden>{{NOTICE}}</p>
+<div id=layout-mismatch role=status hidden><span id=layout-mismatch-text></span>
+<button type=button id=layout-switch></button></div>
 <main id=intro class=msg><p>{{INTRO}}</p>
 <button id=go>{{BUTTON}}</button></main>
 <div id=view></div>
@@ -168,6 +181,12 @@ header{position:relative;flex-shrink:0;display:flex;align-items:center;gap:6px;p
 .heading{flex:1;min-width:0}h1{font-size:16px;margin:0;overflow-wrap:anywhere}
 .bar{font-size:12px}#host{color:#1a7f37}#status{display:block;color:#4b4b4b}
 body.viewer-active #status:not(.warn){position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+#notice{flex-shrink:0;margin:0;padding:6px 16px;background:#f8f9fa;border-bottom:1px solid #e5e7eb;
+ color:#4b5563;font-size:13px;line-height:1.35}
+#layout-mismatch{flex-shrink:0;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
+ padding:8px 16px;background:#eef4ff;border-bottom:1px solid #c7d9ff;color:#19396b;font-size:13px}
+#layout-switch{margin:0;min-height:36px;padding:6px 12px;font-size:13px;border-radius:6px;
+ border:1px solid #2358bd;background:#2358bd;color:#fff;cursor:pointer}
 #signin-help summary{list-style:none;display:flex;align-items:center;justify-content:center;
  width:44px;height:44px;cursor:pointer;font-weight:700;border-radius:8px}
 #signin-help summary::-webkit-details-marker{display:none}
@@ -176,14 +195,15 @@ body.viewer-active #status:not(.warn){position:absolute;width:1px;height:1px;ove
  max-width:calc(100vw - 24px);padding:16px;border:1px solid #ddd;border-radius:12px;background:#fff;
  box-shadow:0 8px 24px #0002;font-size:14px;max-height:60dvh;overflow:auto}
 #view{flex:1;min-height:0;display:flex}
-#view iframe{flex:1;border:0;width:100%;height:100%;background:#fff}
+#view iframe{flex:1;border:0;width:100%;height:100%;background:#f4f4f4}
 .msg{margin:auto;padding:28px 20px;text-align:center;max-width:26em;width:100%;box-sizing:border-box;overflow:auto}
 .msg h1{font-size:22px}.ok{font-size:44px;color:#1a7f37;margin:0}
 button,.button{font:inherit;font-weight:600;margin-top:14px;min-height:44px;padding:12px 18px;border-radius:8px;
- border:1px solid #141414;background:#141414;color:#fff}
+ border:1px solid #141414;background:#141414;color:#fff;cursor:pointer}
 .msg button,.msg .button{display:inline-block;width:100%;box-sizing:border-box;text-decoration:none}
-header button{font-size:24px;margin:0;padding:4px;width:44px;height:44px;min-width:44px;
- background:transparent;color:#141414;border:0;font-weight:400}
+header button{font-size:22px;margin:0;padding:4px;width:44px;height:44px;min-width:44px;
+ background:transparent;color:#141414;border:0;font-weight:400;border-radius:8px}
+header button:hover{background:#eef2f3}
 a:focus-visible,button:focus-visible{outline:3px solid #a35d00;outline-offset:3px}
 #recovery{margin:0;padding:12px 16px;background:#fff3d9;color:#5d400a}#recovery button{margin:4px 8px;font-size:14px}
 input{font:inherit;width:100%;box-sizing:border-box;padding:10px;margin-top:10px;border:1px solid #999;
@@ -234,9 +254,29 @@ const post = (path, data) => request(path, {method: "POST", headers: {"content-t
                                          body: JSON.stringify(data || {})});
 const AGAIN = `<button type="button" data-retry>Try again</button>`;
 const secure = CONFIG.secureHost ? new RegExp(CONFIG.secureHost) : null;
-let currentState = "ready";
-function updateCancel() {
-  cancel.hidden = over || $("intro").hidden === false || currentState === "saving";
+const desiredLayout = () => Math.min(innerWidth, screen.width) < 700 ? "phone" : "desktop";
+let currentState = "ready", activeLayout = "", canRestart = false, closingActive = false;
+let opGen = 0, cancelGen = 0, busyAction = false, restarting = false, pendingRestart = false;
+function setActionDisabled(disabled) {
+  restart.disabled = disabled;
+  cancel.disabled = disabled;
+  $("layout-switch").disabled = disabled;
+}
+function updateChrome() {
+  const hideControls = over || $("intro").hidden === false || currentState === "saving";
+  cancel.hidden = hideControls;
+  restart.hidden = hideControls || !canRestart || closingActive || !["starting", "waiting"].includes(currentState);
+  $("notice").hidden = !CONFIG.notice || !["starting", "waiting"].includes(currentState) || over || closingActive;
+  const mismatch = !over && !busyAction && !closingActive && canRestart
+    && ["starting", "waiting"].includes(currentState)
+    && (activeLayout === "phone" || activeLayout === "desktop") && activeLayout !== desiredLayout();
+  $("layout-mismatch").hidden = !mismatch;
+  if (mismatch) {
+    const target = desiredLayout();
+    $("layout-mismatch-text").textContent = activeLayout === "phone"
+      ? "This sign-in opened in mobile view." : "This sign-in opened in desktop view.";
+    $("layout-switch").textContent = target === "desktop" ? "Switch to desktop view" : "Switch to mobile view";
+  }
 }
 function outcome(s) {
   if (!Object.hasOwn(CONFIG.outcomes, s.state)) return null;
@@ -247,7 +287,11 @@ function outcome(s) {
 function finish(html) {
   if (over) return;
   over = true;
+  opGen += 1;
   clearTimeout(pollTimer);
+  activeLayout = "";
+  closingActive = false;
+  pendingRestart = false;
   $("recovery").hidden = true;
   $("view").replaceChildren(); viewer = false;
   document.body.classList.remove('viewer-active');
@@ -271,6 +315,9 @@ function finish(html) {
       failures = 0;
       cancellationUncertain = false;
       currentState = "ready";
+      canRestart = false;
+      closingActive = false;
+      pendingRestart = false;
       done.hidden = true;
       $("view").hidden = false;
       begin(true);
@@ -280,7 +327,7 @@ function finish(html) {
     const back = document.createElement("a"); back.href = CONFIG.returnUrl;
     back.textContent = "Back to Connections"; back.className = "button"; done.appendChild(back);
   }
-  updateCancel();
+  updateChrome();
   const heading = done.querySelector("h1");
   if (heading) { heading.tabIndex = -1; heading.focus(); }
 }
@@ -309,50 +356,78 @@ function pause(message, cancellation = false) {
 }
 function show(s) {
   if (over) return true;
+  if (pendingRestart && (s.state === "cancelled" || s.state === "ready")) {
+    pendingRestart = false;
+    closingActive = false;
+    failures = 0;
+    cancellationUncertain = false;
+    begin(true);
+    return true;
+  }
   currentState = s.state;
+  activeLayout = (s.layout === "phone" || s.layout === "desktop") ? s.layout : "";
+  if (typeof s.can_restart === "boolean") canRestart = s.can_restart;
+  else if (s.state === "waiting") canRestart = true;
+  closingActive = Boolean(s.closing) && ["starting", "waiting"].includes(s.state);
+  if (closingActive || s.state === "saving") cancelGen += 1;
   $("status").classList.remove("warn");
   if (!cancellationUncertain) $("recovery").hidden = true;
   const ended = outcome(s);
   if (ended !== null) {
+    pendingRestart = false;
     finish(ended);
     return true;
   }
+  if (s.state === "saving" || (s.state === "waiting" && !closingActive)) pendingRestart = false;
   if (s.state !== 'ready' && s.state !== 'new') {
     $("intro").hidden = true;
     document.querySelector("header .bar").hidden = false;
   }
   if (s.host) $("host").textContent = (secure && secure.test(s.host) ? "🔒 " : "") + s.host;
-  $("status").textContent = CONFIG.text[s.state] || "";
-  if (s.state === "saving") {
+  $("status").textContent = closingActive
+    ? (pendingRestart ? "Restarting sign-in…" : "Closing previous sign-in…")
+    : (CONFIG.text[s.state] || "");
+  if (s.state === "saving" || closingActive) {
     $("view").replaceChildren(); viewer = false;
     document.body.classList.remove('viewer-active');
-    const savingMsg = document.createElement("div");
-    savingMsg.className = "msg";
-    savingMsg.textContent = CONFIG.text.saving;
-    $("view").appendChild(savingMsg);
+    if (s.state === "saving") {
+      const savingMsg = document.createElement("div");
+      savingMsg.className = "msg";
+      savingMsg.textContent = CONFIG.text.saving;
+      $("view").appendChild(savingMsg);
+    }
   }
-  if (s.state === "waiting" && !viewer) {
+  if (s.state === "waiting" && !closingActive && !viewer) {
     viewer = true;
     document.body.classList.add('viewer-active');
     $("signin-help").open = false;
     const frame = document.createElement("iframe");
     const q = new URLSearchParams({autoconnect: 1, resize: "scale", reconnect: 1, reconnect_delay: 1500,
-                                   path: "../vnc", show_dot: 1});  // relative to the viewer's own address
+                                   path: "../vnc", quality: 8, show_dot: 0});  // relative to the viewer's own address
     frame.src = `${base}/novnc/vnc.html?${q}`;
     frame.title = CONFIG.frameTitle;
     frame.allow = "clipboard-read";
     $("view").replaceChildren(frame);
   }
-  updateCancel();
+  updateChrome();
   return false;
 }
 async function poll() {
   clearTimeout(pollTimer);
-  if (over) return;
+  if (over || restarting) return;
+  const gen = opGen, cGen = cancelGen;
   try {
-    if (show(await request('state'))) return;
+    const state = await request('state');
+    if (gen !== opGen || over || restarting) return;
+    // Ignore stale pre-cancel/pre-saving active polls; never block saving or terminal outcomes.
+    if (cGen !== cancelGen && ["starting", "waiting"].includes(state.state) && !state.closing) {
+      pollTimer = setTimeout(poll, 500);
+      return;
+    }
+    if (show(state)) return;
     failures = 0;
   } catch (error) {
+    if (gen !== opGen || over || restarting) return;
     if (recover(error)) return;
     failures += 1;
     $("status").classList.add("warn");
@@ -362,42 +437,144 @@ async function poll() {
       return;
     }
   }
-  pollTimer = setTimeout(poll, Math.min(1500 * 2 ** failures, 6000));
+  const baseDelay = (currentState === "starting" || closingActive) && failures === 0 ? 500 : 1500;
+  pollTimer = setTimeout(poll, Math.min(baseDelay * 2 ** failures, 6000));
 }
 async function begin(skipBeforeStart = false) {
   if (!skipBeforeStart && window.signinBeforeStart && !(await window.signinBeforeStart())) return;
+  const gen = ++opGen;
+  clearTimeout(pollTimer);
   currentState = "starting";
+  activeLayout = desiredLayout();
+  canRestart = false;
+  closingActive = false;
+  pendingRestart = false;
   $("intro").hidden = true;
   document.querySelector("header .bar").hidden = false;
   $("status").textContent = CONFIG.text.starting;
-  updateCancel();
-  const layout = Math.min(innerWidth, screen.width) < 700 ? "phone" : "desktop";
+  updateChrome();
+  const layout = desiredLayout();
   try {
-    if (show(await post("start", {layout}))) return;
+    const started = await post("start", {layout});
+    if (gen !== opGen || over) return;
+    if (show(started)) return;
   } catch (error) {
+    if (gen !== opGen || over) return;
     if (recover(error)) return;
   }
-  poll();
+  if (gen === opGen && !over) poll();
+}
+async function restartAttempt() {
+  if (over || busyAction || currentState === "saving" || !canRestart) return;
+  busyAction = true;
+  setActionDisabled(true);
+  let gen = opGen;
+  try {
+    if (window.signinBeforeStart && !(await window.signinBeforeStart())) return;
+    if (over || currentState === "saving" || !canRestart) return;
+    restarting = true;
+    pendingRestart = true;
+    gen = ++opGen;
+    cancelGen += 1;
+    clearTimeout(pollTimer);
+    $("view").replaceChildren(); viewer = false;
+    document.body.classList.remove('viewer-active');
+    $("layout-mismatch").hidden = true;
+    $("status").textContent = CONFIG.text.starting;
+    const cancelled = await request('cancel', {
+      method: 'POST', headers: {"content-type": "application/json"}, body: JSON.stringify({for_restart: true}),
+    }, true);
+    if (gen !== opGen || over) return;
+    let state = cancelled || await request('state');
+    if (gen !== opGen || over) return;
+    // Wait with the viewer detached while deferred cancellation settles on the login service.
+    if (["starting", "waiting"].includes(state.state) && state.closing) {
+      closingActive = true;
+      for (let step = 0; step < 15 && ["starting", "waiting"].includes(state.state) && state.closing; step++) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        if (gen !== opGen || over) return;
+        state = await request('state');
+        if (gen !== opGen || over) return;
+      }
+      if (["starting", "waiting"].includes(state.state) && state.closing) {
+        restarting = false;
+        busyAction = false;
+        pause('We could not finish restarting the previous sign-in yet. Check its status before trying again.', true);
+        return;
+      }
+    }
+    if (state.state !== "cancelled" && state.state !== "ready") {
+      pendingRestart = false;
+      restarting = false;
+      busyAction = false;
+      if (!show(state)) poll();
+      return;
+    }
+    failures = 0;
+    cancellationUncertain = false;
+    pendingRestart = false;
+    restarting = false;
+    busyAction = false;
+    await begin(true);
+  } catch (error) {
+    restarting = false;
+    busyAction = false;
+    if (gen === opGen && !over && !recover(error))
+      pause('We could not restart the sign-in. Check its status before trying again.', true);
+  } finally {
+    restarting = false;
+    busyAction = false;
+    setActionDisabled(false);
+    updateChrome();
+  }
 }
 $("go").addEventListener("click", () => begin());
+$("layout-switch").addEventListener("click", () => restartAttempt());
+const restart = document.createElement("button");
+restart.textContent = "↻";
+restart.setAttribute("aria-label", "Restart sign-in");
+restart.title = "Restart sign-in";
+restart.hidden = true;
 const cancel = document.createElement("button");
 cancel.textContent = "×";
 cancel.setAttribute("aria-label", "Cancel sign-in");
 cancel.title = "Cancel sign-in";
 cancel.hidden = true;
-document.querySelector("header").appendChild(cancel);
+const header = document.querySelector("header");
+header.appendChild(restart);
+header.appendChild(cancel);
+restart.addEventListener("click", () => restartAttempt());
 cancel.addEventListener("click", async () => {
-  cancel.disabled = true;
+  if (over || busyAction) return;
+  busyAction = true;
+  pendingRestart = false;
+  const cGen = ++cancelGen;
+  const gen = opGen;
+  setActionDisabled(true);
   try {
     const result = await request('cancel', {method: 'POST'}, true);
-    if (over || (result && show(result))) return;
+    if (gen !== opGen || over) return;
+    if (result && show(result)) return;
     const state = await request('state');
-    if (!over && !show(state)) poll();
+    if (gen !== opGen || over) return;
+    if (cGen !== cancelGen && ["starting", "waiting"].includes(state.state) && !state.closing) {
+      busyAction = false;
+      poll();
+      return;
+    }
+    busyAction = false;
+    if (!show(state)) poll();
   } catch (error) {
-    if (!over && !recover(error))
+    busyAction = false;
+    if (gen === opGen && !over && !recover(error))
       pause('We could not confirm the cancellation. Check the sign-in status before trying again.', true);
-  } finally { cancel.disabled = false; }
+  } finally {
+    busyAction = false;
+    setActionDisabled(false);
+    updateChrome();
+  }
 });
+addEventListener("resize", updateChrome);
 if (CONFIG.reconnect) {
   (async () => {
     const s = await request('state');

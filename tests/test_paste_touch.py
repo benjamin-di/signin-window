@@ -51,10 +51,17 @@ def test_touch_paste_and_controls_preserve_native_editor(engine):
             page.goto("https://viewer.example/vnc.html")
             page.get_by_role("button", name="Copy test text", exact=True).tap()
             page.get_by_role("button", name="Copied", exact=True).wait_for()
+            # Direct one-tap paste works on touch without opening the software keyboard first.
+            page.get_by_role("button", name="Paste", exact=True).tap()
+            page.wait_for_function(
+                "text => document.documentElement.dataset.typed === text",
+                arg="SyntheticPaste9!",
+                timeout=3000,
+            )
             page.get_by_role("button", name="Keyboard", exact=True).tap()
             editor = page.locator("#signin_input")
             assert editor.evaluate("e => document.activeElement === e")
-            for count in (1, 2):
+            for count in (2, 3):
                 page.get_by_role("button", name="Paste", exact=True).tap()
                 page.wait_for_function(
                     "text => document.documentElement.dataset.typed === text",
@@ -70,6 +77,6 @@ def test_touch_paste_and_controls_preserve_native_editor(engine):
             page.get_by_role("button", name="Done", exact=True).tap()
             assert editor.input_value() == ""
             assert page.get_by_role("button", name="Keyboard", exact=True).count() == 1
-            assert page.get_by_role("button", name="Paste", exact=True).is_hidden()
+            assert page.get_by_role("button", name="Paste", exact=True).is_visible()
         finally:
             browser.close()

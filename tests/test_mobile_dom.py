@@ -412,3 +412,215 @@ def test_full_queue_refusal_is_visible_for_every_editing_entrypoint(mobile, acti
         action,
     )
     assert "Input was not sent" in mobile.locator("#signin_feedback").inner_text()
+
+
+def _desktop_viewer(mobile_browser, *, viewport, canvas_size):
+    modules = dict(MODULES)
+    modules["/core/input/keysym.js"] = """export default {
+      XK_Return: 0xff0d, XK_Tab: 0xff09, XK_BackSpace: 0xff08, XK_Delete: 0xffff,
+      XK_Left: 0xff51, XK_Right: 0xff53, XK_Up: 0xff52, XK_Down: 0xff54,
+      XK_Shift_L: 0xffe1, XK_Control_L: 0xffe3, XK_Control_R: 0xffe4,
+      XK_Alt_L: 0xffe9, XK_Super_L: 0xffeb, XK_Super_R: 0xffec,
+    };"""
+    cw, ch = canvas_size
+    html = VIEWER.replace(
+        "<body></body>",
+        f"<body><div id=noVNC_container><canvas width={cw} height={ch} tabindex=0></canvas></div></body>",
+    ).replace("viewOnly: false,", "viewOnly: false, focusOnClick: true,")
+    files = {"/vnc.html": ("text/html", html), "/paste.js": ("text/javascript", ADD_ON.read_text())}
+    files.update({path: ("text/javascript", body) for path, body in modules.items()})
+
+    def serve(route):
+        url = urlsplit(route.request.url)
+        found = files.get(url.path) if url.netloc == "viewer.example" else None
+        if found:
+            route.fulfill(content_type=found[0], body=found[1])
+        else:
+            route.abort()
+
+    context = mobile_browser.new_context(viewport=viewport, has_touch=False)
+    page = context.new_page()
+    page.route("**/*", serve)
+    page.goto("https://viewer.example/vnc.html")
+    page.wait_for_timeout(100)
+    return context, page
+
+
+def test_desktop_viewer_fits_without_clipping_and_hides_mobile_toolbar(mobile_browser):
+    # 1080p desktop viewing 1280x860 stream: exact 1:1 native fit, centered, no bottom keyboard bar.
+    ctx, page = _desktop_viewer(mobile_browser, viewport={"width": 1920, "height": 960}, canvas_size=(1280, 860))
+    try:
+        box = page.locator("#noVNC_container").bounding_box()
+        assert box["width"] <= 1282 and box["height"] <= 862
+        assert box["width"] >= 1278 and box["height"] >= 858
+        assert page.locator("#signin_keyboard").is_hidden()
+        assert page.locator("#signin_viewport").evaluate("e => e.scrollHeight <= e.clientHeight")
+    finally:
+        ctx.close()
+
+    # Laptop viewport (1440x760) viewing 1280x860 stream: scales down proportionally, zero vertical clipping.
+    ctx, page = _desktop_viewer(mobile_browser, viewport={"width": 1440, "height": 760}, canvas_size=(1280, 860))
+    try:
+        box = page.locator("#noVNC_container").bounding_box()
+        assert box["height"] <= 760
+        assert box["width"] < 1280
+        assert page.locator("#signin_viewport").evaluate("e => e.scrollHeight <= e.clientHeight")
+    finally:
+        ctx.close()
+
+    # Desktop viewing a 500x900 phone stream: never stretches to 1920px wide.
+    ctx, page = _desktop_viewer(mobile_browser, viewport={"width": 1920, "height": 900}, canvas_size=(500, 900))
+    try:
+        box = page.locator("#noVNC_container").bounding_box()
+        assert box["width"] <= 502 and box["height"] <= 878
+        assert page.locator("#signin_viewport").evaluate("e => e.scrollHeight <= e.clientHeight")
+    finally:
+        ctx.close()
+
+
+def test_touch_drag_passes_through_when_viewport_does_not_overflow(mobile_browser):
+    ctx = mobile_browser.new_context(viewport={"width": 1280, "height": 960}, has_touch=True)
+    try:
+        modules = dict(MODULES)
+        modules["/core/input/keysym.js"] = """export default {
+          XK_Return: 0xff0d, XK_Tab: 0xff09, XK_BackSpace: 0xff08, XK_Delete: 0xffff,
+          XK_Left: 0xff51, XK_Right: 0xff53, XK_Up: 0xff52, XK_Down: 0xff54,
+          XK_Shift_L: 0xffe1, XK_Control_L: 0xffe3, XK_Control_R: 0xffe4,
+          XK_Alt_L: 0xffe9, XK_Super_L: 0xffeb, XK_Super_R: 0xffec,
+        };"""
+        html = VIEWER.replace(
+            "<body></body>",
+            "<body><div id=noVNC_container><canvas width=500 height=900 tabindex=0></canvas></div></body>",
+        ).replace("viewOnly: false,", "viewOnly: false, focusOnClick: true,")
+        files = {"/vnc.html": ("text/html", html), "/paste.js": ("text/javascript", ADD_ON.read_text())}
+        files.update({path: ("text/javascript", body) for path, body in modules.items()})
+
+        def serve(route):
+            url = urlsplit(route.request.url)
+            found = files.get(url.path) if url.netloc == "viewer.example" else None
+            if found:
+                route.fulfill(content_type=found[0], body=found[1])
+            else:
+                route.abort()
+
+        page = ctx.new_page()
+        page.route("**/*", serve)
+        page.goto("https://viewer.example/vnc.html")
+        page.wait_for_timeout(100)
+        # Viewport fits the canvas with no scrollbars, so 1-finger drag reaches the remote canvas.
+        assert page.locator("#signin_viewport").evaluate("e => e.scrollHeight <= e.clientHeight")
+        page.evaluate("""() => {
+          const canvas = document.querySelector('canvas');
+          canvas.addEventListener('gesturestart', () => {document.documentElement.dataset.remoteDrag = 'yes';});
+          canvas.dispatchEvent(new CustomEvent('gesturestart', {detail:{type:'drag', clientX:50, clientY:200}}));
+        }""")
+        assert page.locator("html").get_attribute("data-remote-drag") == "yes"
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize(
+    "transition", ["field", "tab", "enter", "replacement", "pointer_swap", "held_tab", "held_enter", "disconnect"]
+)
+def test_closed_editor_one_tap_paste_is_fenced_against_destination_and_viewer_changes(mobile, transition):
+    # Dismiss the native editor so Paste runs in closed-editor one-tap mode.
+    mobile.get_by_role("button", name="Done", exact=True).click()
+    assert mobile.locator("#signin_input").input_value() == ""
+    mobile.evaluate(
+        "() => {navigator.clipboard.readText = () => new Promise(resolve => {window.finishPaste = resolve;});}"
+    )
+    paste_btn = mobile.get_by_role("button", name="Paste", exact=True)
+    if transition == "pointer_swap":
+        paste_btn.dispatch_event("pointerdown")
+        mobile.evaluate("testUI.rfb = {...testUI.rfb}")
+        paste_btn.dispatch_event("click")
+        mobile.wait_for_timeout(100)
+        assert mobile.evaluate("typeof window.finishPaste") == "undefined"
+        assert mobile.locator("html").get_attribute("data-typed") == ""
+        return
+    if transition == "held_tab":
+        paste_btn.focus()
+        paste_btn.dispatch_event("pointerdown")
+        mobile.keyboard.press("Tab")
+        paste_btn.dispatch_event("pointerup")
+        paste_btn.dispatch_event("click")
+        mobile.wait_for_timeout(100)
+        assert mobile.evaluate("typeof window.finishPaste") == "undefined"
+        assert mobile.locator("html").get_attribute("data-typed") == ""
+        return
+    if transition == "held_enter":
+        paste_btn.focus()
+        paste_btn.evaluate(
+            """btn => {
+          btn.dispatchEvent(new PointerEvent('pointerdown', {pointerId: 2, bubbles: true}));
+          window.dispatchEvent(new PointerEvent('pointerup', {pointerId: 1, bubbles: true}));
+          btn.dispatchEvent(new PointerEvent('pointerdown', {pointerId: 3, bubbles: true}));
+          btn.dispatchEvent(new PointerEvent('pointerup', {pointerId: 3, bubbles: true}));
+          btn.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+        }"""
+        )
+        mobile.keyboard.press("Enter")
+        paste_btn.evaluate(
+            """btn => {
+          btn.dispatchEvent(new PointerEvent('pointerup', {pointerId: 2, bubbles: true}));
+          btn.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+        }"""
+        )
+        mobile.wait_for_timeout(100)
+        assert mobile.evaluate("typeof window.finishPaste") == "undefined"
+        assert mobile.locator("html").get_attribute("data-typed") == ""
+        return
+    paste_btn.click()
+    if transition == "field":
+        mobile.locator("canvas").dispatch_event("pointerdown")
+    elif transition == "tab":
+        mobile.locator("canvas").focus()
+        mobile.keyboard.press("Tab")
+    elif transition == "enter":
+        mobile.locator("canvas").focus()
+        mobile.keyboard.press("Enter")
+    elif transition == "replacement":
+        mobile.evaluate("testUI.rfb = {...testUI.rfb}")
+    else:
+        mobile.evaluate("testUI.rfb._rfbConnectionState = 'disconnected'")
+    mobile.evaluate("finishPaste('NeverSendClosed9')")
+    mobile.wait_for_timeout(100)
+    assert mobile.locator("html").get_attribute("data-typed") == ""
+
+
+def test_zoom_recomputes_base_fit_when_viewport_width_changes(mobile_browser):
+    ctx = mobile_browser.new_context(viewport={"width": 390, "height": 844}, has_touch=True)
+    try:
+        modules = dict(MODULES)
+        modules["/core/input/keysym.js"] = """export default {
+          XK_Return: 0xff0d, XK_Tab: 0xff09, XK_BackSpace: 0xff08, XK_Delete: 0xffff,
+          XK_Left: 0xff51, XK_Right: 0xff53, XK_Up: 0xff52, XK_Down: 0xff54,
+          XK_Shift_L: 0xffe1, XK_Control_L: 0xffe3, XK_Control_R: 0xffe4,
+          XK_Alt_L: 0xffe9, XK_Super_L: 0xffeb, XK_Super_R: 0xffec,
+        };"""
+        html = VIEWER.replace(
+            "<body></body>",
+            "<body><div id=noVNC_container><canvas width=500 height=900 tabindex=0></canvas></div></body>",
+        ).replace("viewOnly: false,", "viewOnly: false, focusOnClick: true,")
+        files = {"/vnc.html": ("text/html", html), "/paste.js": ("text/javascript", ADD_ON.read_text())}
+        files.update({path: ("text/javascript", body) for path, body in modules.items()})
+
+        def serve(route):
+            url = urlsplit(route.request.url)
+            found = files.get(url.path) if url.netloc == "viewer.example" else None
+            if found:
+                route.fulfill(content_type=found[0], body=found[1])
+            else:
+                route.abort()
+
+        page = ctx.new_page()
+        page.route("**/*", serve)
+        page.goto("https://viewer.example/vnc.html")
+        page.get_by_role("button", name="Zoom", exact=True).click()
+        page.wait_for_timeout(100)
+        assert page.locator("#noVNC_container").bounding_box()["width"] == 546
+        page.set_viewport_size({"width": 320, "height": 844})
+        page.wait_for_timeout(100)
+        assert page.locator("#noVNC_container").bounding_box()["width"] == 448
+    finally:
+        ctx.close()

@@ -659,3 +659,527 @@ def test_connection_actions_remain_accessible_and_consistent_at_phone_widths(bro
     browser_page.keyboard.press("Tab")
     assert link.evaluate("el => document.activeElement === el")
     assert link.evaluate("el => getComputedStyle(el).outlineWidth") == "3px"
+
+
+def test_notice_and_layout_mismatch_switcher_restart_into_current_layout(browser_page):
+    state = {"state": "waiting", "host": "auth.example.com", "layout": "phone"}
+    events = []
+
+    def serve(route):
+        path = urlsplit(route.request.url).path
+        if path == urlsplit(LINK).path:
+            route.fulfill(
+                content_type="text/html",
+                body=render(
+                    PageText(
+                        service="Example",
+                        reconnect=True,
+                        auto_start=True,
+                        notice="Use SMS or password — passkeys unavailable here.",
+                    ),
+                    "Sam",
+                ),
+            )
+        elif path.endswith("/state"):
+            route.fulfill(content_type="application/json", body=json.dumps(state))
+        elif path.endswith("/cancel"):
+            events.append(("cancel", None))
+            state["state"] = "cancelled"
+            state.pop("layout", None)
+            route.fulfill(status=204)
+        elif path.endswith("/start"):
+            body = json.loads(route.request.post_data or "{}")
+            events.append(("start", body.get("layout")))
+            state["state"] = "waiting"
+            state["layout"] = body.get("layout")
+            route.fulfill(content_type="application/json", body=json.dumps(state))
+        else:
+            route.abort()
+
+    browser_page.set_viewport_size({"width": 1280, "height": 860})
+    browser_page.route("**/*", serve)
+    browser_page.goto(LINK)
+    browser_page.locator("iframe").wait_for()
+    iframe_src = browser_page.locator("iframe").get_attribute("src")
+    assert "quality=8" in iframe_src and "show_dot=0" in iframe_src
+    assert browser_page.locator("#notice").is_visible()
+    assert "passkeys unavailable" in browser_page.locator("#notice").inner_text()
+    switch_btn = browser_page.get_by_role("button", name="Switch to desktop view", exact=True)
+    switch_btn.wait_for()
+    assert "mobile view" in browser_page.locator("#layout-mismatch-text").inner_text()
+    switch_btn.click()
+    browser_page.locator("iframe").wait_for()
+    assert browser_page.locator("#layout-mismatch").is_hidden()
+    assert events == [("cancel", None), ("start", "desktop")]
+    # Header Restart button cleanly cancels and starts again.
+    browser_page.get_by_role("button", name="Restart sign-in", exact=True).click()
+    browser_page.locator("iframe").wait_for()
+    assert events == [("cancel", None), ("start", "desktop"), ("cancel", None), ("start", "desktop")]
+    # Finishing hides the notice bar.
+    state["state"] = "connected"
+    browser_page.get_by_role("heading", name="Connection saved", exact=True).wait_for()
+    assert browser_page.locator("#notice").is_hidden()
+
+
+def test_restart_preserves_completion_if_signin_finished_during_cancel(browser_page):
+    starts = []
+
+    def serve(route):
+        path = urlsplit(route.request.url).path
+        if path == urlsplit(LINK).path:
+            route.fulfill(content_type="text/html", body=render(PageText(reconnect=True), "Sam"))
+        elif path.endswith("/cancel"):
+            route.fulfill(status=204)
+        elif path.endswith("/state"):
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps({"state": "connected" if starts else "waiting", "layout": "desktop"}),
+            )
+        elif path.endswith("/start"):
+            starts.append("start")
+            route.fulfill(content_type="application/json", body=json.dumps({"state": "starting"}))
+        else:
+            route.abort()
+
+    browser_page.route("**/*", serve)
+    browser_page.goto(LINK)
+    browser_page.locator("iframe").wait_for()
+    starts.append("cancel-next")
+    browser_page.get_by_role("button", name="Restart sign-in", exact=True).click()
+    browser_page.get_by_role("heading", name="Connection saved", exact=True).wait_for()
+    assert "start" not in starts
+
+
+def test_stale_poll_response_cannot_cancel_a_completed_restart(browser_page):
+    held = []
+    phase = {"step": "initial"}
+
+    def serve(route):
+        path = urlsplit(route.request.url).path
+        if path == urlsplit(LINK).path:
+            route.fulfill(content_type="text/html", body=render(PageText(reconnect=True), "Sam"))
+        elif path.endswith("/cancel"):
+            phase["step"] = "cancelled"
+            route.fulfill(status=204)
+        elif path.endswith("/start"):
+            phase["step"] = "restarted"
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps({"state": "waiting", "layout": "desktop", "can_restart": True}),
+            )
+        elif path.endswith("/state"):
+            if phase["step"] == "initial":
+                phase["step"] = "hold_next"
+                route.fulfill(
+                    content_type="application/json",
+                    body=json.dumps({"state": "waiting", "layout": "desktop", "can_restart": True}),
+                )
+            elif phase["step"] == "hold_next":
+                held.append(route)
+            elif phase["step"] == "cancelled":
+                route.fulfill(content_type="application/json", body=json.dumps({"state": "cancelled"}))
+            else:
+                route.fulfill(
+                    content_type="application/json",
+                    body=json.dumps({"state": "waiting", "layout": "desktop", "can_restart": True}),
+                )
+        else:
+            route.abort()
+
+    browser_page.route("**/*", serve)
+    browser_page.goto(LINK)
+    browser_page.locator("iframe").wait_for()
+    browser_page.wait_for_timeout(1700)
+    assert held
+    browser_page.get_by_role("button", name="Restart sign-in", exact=True).click()
+    browser_page.locator("iframe").wait_for()
+    # Release the stale pre-restart poll as cancelled; the replacement viewer must survive.
+    held[0].fulfill(content_type="application/json", body=json.dumps({"state": "cancelled"}))
+    browser_page.wait_for_timeout(250)
+    assert browser_page.locator("iframe").count() == 1
+    assert browser_page.locator("#done").is_hidden()
+
+
+def test_restart_respects_can_restart_budget_and_before_start_hook(browser_page):
+    events = []
+    hook_js = (
+        "window.beforeCalls = 0; "
+        "window.signinBeforeStart = async () => { window.beforeCalls++; return window.allowBeforeStart; };"
+    )
+
+    def serve(route):
+        path = urlsplit(route.request.url).path
+        if path == urlsplit(LINK).path:
+            route.fulfill(
+                content_type="text/html",
+                body=render(PageText(reconnect=True, script_extra=hook_js), "Sam"),
+            )
+        elif path.endswith("/state"):
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps({"state": "waiting", "layout": "phone", "can_restart": False}),
+            )
+        else:
+            if route.request.method == "POST":
+                events.append(path)
+            route.abort()
+
+    browser_page.set_viewport_size({"width": 1280, "height": 860})
+    browser_page.route("**/*", serve)
+    browser_page.goto(LINK)
+    browser_page.locator("iframe").wait_for()
+    assert browser_page.get_by_role("button", name="Restart sign-in", exact=True).is_hidden()
+    assert browser_page.locator("#layout-mismatch").is_hidden()
+
+    # Now allow restart but decline via signinBeforeStart: must not cancel the active window.
+    browser_page.unroute("**/*")
+
+    def serve_allowed(route):
+        path = urlsplit(route.request.url).path
+        if path == urlsplit(LINK).path:
+            route.fulfill(
+                content_type="text/html",
+                body=render(
+                    PageText(reconnect=True, script_extra="window.allowBeforeStart = false; " + hook_js), "Sam"
+                ),
+            )
+        elif path.endswith("/state"):
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps({"state": "waiting", "layout": "phone", "can_restart": True}),
+            )
+        else:
+            if route.request.method == "POST":
+                events.append(path)
+            route.fulfill(status=204)
+
+    browser_page.route("**/*", serve_allowed)
+    browser_page.goto(LINK)
+    browser_page.locator("iframe").wait_for()
+    browser_page.get_by_role("button", name="Restart sign-in", exact=True).click()
+    browser_page.wait_for_timeout(150)
+    assert browser_page.evaluate("window.beforeCalls") == 1
+    assert events == []
+    assert browser_page.locator("iframe").count() == 1
+
+
+def test_deferred_cancellation_keeps_viewer_detached_and_starts_once_cancelled(browser_page):
+    calls = []
+    cancel_polls = {"n": 0}
+
+    def serve(route):
+        path = urlsplit(route.request.url).path
+        if path == urlsplit(LINK).path:
+            route.fulfill(content_type="text/html", body=render(PageText(reconnect=True), "Sam"))
+        elif path.endswith("/cancel"):
+            calls.append("cancel")
+            cancel_polls["n"] = 1
+            route.fulfill(status=204)
+        elif path.endswith("/start"):
+            calls.append("start")
+            cancel_polls["n"] = 99
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps({"state": "waiting", "layout": "desktop", "can_restart": True}),
+            )
+        elif path.endswith("/state"):
+            if cancel_polls["n"] == 0:
+                route.fulfill(
+                    content_type="application/json",
+                    body=json.dumps({"state": "waiting", "layout": "desktop", "can_restart": True}),
+                )
+            elif cancel_polls["n"] == 1:
+                cancel_polls["n"] = 2
+                route.fulfill(
+                    content_type="application/json",
+                    body=json.dumps({"state": "waiting", "layout": "desktop", "closing": True, "can_restart": True}),
+                )
+            elif cancel_polls["n"] == 2:
+                cancel_polls["n"] = 3
+                route.fulfill(content_type="application/json", body=json.dumps({"state": "cancelled"}))
+            else:
+                route.fulfill(
+                    content_type="application/json",
+                    body=json.dumps({"state": "waiting", "layout": "desktop", "can_restart": True}),
+                )
+        else:
+            route.abort()
+
+    browser_page.route("**/*", serve)
+    browser_page.goto(LINK)
+    browser_page.locator("iframe").wait_for()
+    browser_page.get_by_role("button", name="Restart sign-in", exact=True).click()
+    browser_page.wait_for_timeout(300)
+    assert browser_page.locator("iframe").count() == 0
+    browser_page.locator("iframe").wait_for(timeout=5000)
+    assert calls == ["cancel", "start"]
+
+
+def test_restart_double_click_runs_before_start_once_and_preserves_host_outcomes(browser_page):
+    # 1. Double-clicking Restart while signinBeforeStart is pending invokes the hook once.
+    calls = []
+
+    def serve(route):
+        path = urlsplit(route.request.url).path
+        if path == urlsplit(LINK).path:
+            hook = (
+                "window.beforeCalls = 0; "
+                "window.signinBeforeStart = () => { window.beforeCalls++; "
+                "return new Promise(r => { window.resolveBefore = r; }); };"
+            )
+            route.fulfill(
+                content_type="text/html",
+                body=render(
+                    PageText(reconnect=True, script_extra=hook).with_outcomes(wrong_account="<h1>Wrong account</h1>"),
+                    "Sam",
+                ),
+            )
+        elif path.endswith("/cancel"):
+            calls.append("cancel")
+            route.fulfill(content_type="application/json", body=json.dumps({"state": "wrong_account"}))
+        elif path.endswith("/start"):
+            calls.append("start")
+            route.fulfill(content_type="application/json", body=json.dumps({"state": "starting"}))
+        elif path.endswith("/state"):
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps({"state": "waiting", "layout": "desktop", "can_restart": True}),
+            )
+        else:
+            route.abort()
+
+    browser_page.route("**/*", serve)
+    browser_page.goto(LINK)
+    browser_page.locator("iframe").wait_for()
+    btn = browser_page.get_by_role("button", name="Restart sign-in", exact=True)
+    btn.click()
+    btn.click(force=True)
+    assert browser_page.evaluate("window.beforeCalls") == 1
+    # 2. If cancel races with a host-defined terminal outcome (wrong_account), display it instead of restarting.
+    browser_page.evaluate("window.resolveBefore(true)")
+    browser_page.get_by_role("heading", name="Wrong account", exact=True).wait_for()
+    assert calls == ["cancel"]
+
+
+def test_pre_cancel_stale_poll_does_not_reattach_viewer_after_closing(browser_page):
+    held = []
+    phase = {"step": 0}
+
+    def serve(route):
+        path = urlsplit(route.request.url).path
+        if path == urlsplit(LINK).path:
+            route.fulfill(content_type="text/html", body=render(PageText(reconnect=True), "Sam"))
+        elif path.endswith("/cancel"):
+            phase["step"] = 2
+            route.fulfill(status=204)
+        elif path.endswith("/state"):
+            if phase["step"] == 0:
+                phase["step"] = 1
+                route.fulfill(
+                    content_type="application/json",
+                    body=json.dumps({"state": "waiting", "layout": "desktop", "can_restart": True}),
+                )
+            elif phase["step"] == 1:
+                held.append(route)
+            else:
+                route.fulfill(
+                    content_type="application/json",
+                    body=json.dumps({"state": "waiting", "layout": "desktop", "closing": True, "can_restart": True}),
+                )
+        else:
+            route.abort()
+
+    browser_page.route("**/*", serve)
+    browser_page.goto(LINK)
+    browser_page.locator("iframe").wait_for()
+    browser_page.wait_for_timeout(1700)
+    assert held
+    browser_page.get_by_role("button", name="Cancel sign-in", exact=True).click()
+    browser_page.wait_for_function("() => document.querySelectorAll('iframe').length === 0")
+    # Releasing the stale pre-cancel 'waiting' poll must not reattach the iframe or Restart button.
+    held[0].fulfill(
+        content_type="application/json",
+        body=json.dumps({"state": "waiting", "layout": "desktop", "can_restart": True}),
+    )
+    browser_page.wait_for_timeout(200)
+    assert browser_page.locator("iframe").count() == 0
+    assert browser_page.get_by_role("button", name="Restart sign-in", exact=True).is_hidden()
+
+
+def test_deferred_restart_completes_after_recovery_check(browser_page):
+    calls = []
+    phase = {"step": 0}
+
+    def serve(route):
+        path = urlsplit(route.request.url).path
+        if path == urlsplit(LINK).path:
+            route.fulfill(content_type="text/html", body=render(PageText(reconnect=True), "Sam"))
+        elif path.endswith("/cancel"):
+            calls.append("cancel")
+            phase["step"] = 1
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps({"state": "waiting", "layout": "desktop", "closing": True, "can_restart": True}),
+            )
+        elif path.endswith("/start"):
+            calls.append("start")
+            phase["step"] = 3
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps({"state": "waiting", "layout": "desktop", "can_restart": True}),
+            )
+        elif path.endswith("/state"):
+            if phase["step"] == 0:
+                route.fulfill(
+                    content_type="application/json",
+                    body=json.dumps({"state": "waiting", "layout": "desktop", "can_restart": True}),
+                )
+            elif phase["step"] == 1:
+                phase["step"] = 2
+                route.fulfill(status=503, body="busy")
+            elif phase["step"] == 2:
+                route.fulfill(content_type="application/json", body=json.dumps({"state": "cancelled"}))
+            else:
+                route.fulfill(
+                    content_type="application/json",
+                    body=json.dumps({"state": "waiting", "layout": "desktop", "can_restart": True}),
+                )
+        else:
+            route.abort()
+
+    browser_page.route("**/*", serve)
+    browser_page.goto(LINK)
+    browser_page.locator("iframe").wait_for()
+    browser_page.get_by_role("button", name="Restart sign-in", exact=True).click()
+    check_btn = browser_page.get_by_role("button", name="Check sign-in status", exact=True)
+    check_btn.wait_for(timeout=5000)
+    check_btn.click()
+    browser_page.locator("iframe").wait_for(timeout=5000)
+    assert calls == ["cancel", "start"]
+
+
+def test_stale_waiting_poll_does_not_reattach_viewer_after_entering_saving(browser_page):
+    held = []
+    phase = {"step": 0}
+
+    def serve(route):
+        path = urlsplit(route.request.url).path
+        if path == urlsplit(LINK).path:
+            route.fulfill(content_type="text/html", body=render(PageText(reconnect=True), "Sam"))
+        elif path.endswith("/cancel"):
+            phase["step"] = 2
+            route.fulfill(status=204)
+        elif path.endswith("/state"):
+            if phase["step"] == 0:
+                phase["step"] = 1
+                route.fulfill(
+                    content_type="application/json",
+                    body=json.dumps({"state": "waiting", "layout": "desktop", "can_restart": True}),
+                )
+            elif phase["step"] == 1:
+                held.append(route)
+            else:
+                route.fulfill(content_type="application/json", body=json.dumps({"state": "saving"}))
+        else:
+            route.abort()
+
+    browser_page.route("**/*", serve)
+    browser_page.goto(LINK)
+    browser_page.locator("iframe").wait_for()
+    browser_page.wait_for_timeout(1700)
+    assert held
+    browser_page.get_by_role("button", name="Cancel sign-in", exact=True).click()
+    browser_page.wait_for_function("() => document.getElementById('status').textContent.includes('Saving')")
+    assert browser_page.locator("iframe").count() == 0
+    # Releasing the pre-cancel/pre-saving 'waiting' response must not reattach the iframe.
+    held[0].fulfill(
+        content_type="application/json",
+        body=json.dumps({"state": "waiting", "layout": "desktop", "can_restart": True}),
+    )
+    browser_page.wait_for_timeout(200)
+    assert browser_page.locator("iframe").count() == 0
+
+
+def test_lost_cancel_response_still_restarts_and_live_replacement_clears_pending_restart(browser_page):
+    # 1. Cancel fails with 503, recovery observes closing then cancelled -> sends /start once.
+    calls = []
+    after_cancel = iter(
+        [
+            {"state": "waiting", "layout": "desktop", "closing": True, "can_restart": True},
+            {"state": "cancelled"},
+            {"state": "waiting", "layout": "desktop", "can_restart": True},
+        ]
+    )
+
+    def serve_lost(route):
+        path = urlsplit(route.request.url).path
+        if path == urlsplit(LINK).path:
+            route.fulfill(content_type="text/html", body=render(PageText(reconnect=True), "Sam"))
+        elif path.endswith("/cancel"):
+            calls.append("cancel")
+            route.fulfill(status=503, body="lost")
+        elif path.endswith("/start"):
+            calls.append("start")
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps({"state": "waiting", "layout": "desktop", "can_restart": True}),
+            )
+        elif path.endswith("/state"):
+            body = (
+                {"state": "waiting", "layout": "desktop", "can_restart": True}
+                if not calls
+                else next(after_cancel, {"state": "waiting", "layout": "desktop", "can_restart": True})
+            )
+            route.fulfill(content_type="application/json", body=json.dumps(body))
+        else:
+            route.abort()
+
+    browser_page.route("**/*", serve_lost)
+    browser_page.goto(LINK)
+    browser_page.locator("iframe").wait_for()
+    browser_page.get_by_role("button", name="Restart sign-in", exact=True).click()
+    check_btn = browser_page.get_by_role("button", name="Check sign-in status", exact=True)
+    check_btn.wait_for(timeout=5000)
+    check_btn.click()
+    browser_page.locator("iframe").wait_for(timeout=5000)
+    assert calls == ["cancel", "start"]
+
+    # 2. Cancel fails, recovery finds non-closing waiting -> clears pendingRestart so a later cancelled does NOT start.
+    browser_page.unroute("**/*")
+    calls2 = []
+    after_cancel2 = iter(
+        [
+            {"state": "waiting", "layout": "desktop", "can_restart": True},
+            {"state": "cancelled"},
+        ]
+    )
+
+    def serve_live(route):
+        path = urlsplit(route.request.url).path
+        if path == urlsplit(LINK).path:
+            route.fulfill(content_type="text/html", body=render(PageText(reconnect=True), "Sam"))
+        elif path.endswith("/cancel"):
+            calls2.append("cancel")
+            route.fulfill(status=503, body="lost")
+        elif path.endswith("/start"):
+            calls2.append("start")
+            route.fulfill(content_type="application/json", body=json.dumps({"state": "starting"}))
+        elif path.endswith("/state"):
+            body = (
+                {"state": "waiting", "layout": "desktop", "can_restart": True}
+                if not calls2
+                else next(after_cancel2, {"state": "cancelled"})
+            )
+            route.fulfill(content_type="application/json", body=json.dumps(body))
+        else:
+            route.abort()
+
+    browser_page.route("**/*", serve_live)
+    browser_page.goto(LINK)
+    browser_page.locator("iframe").wait_for()
+    browser_page.get_by_role("button", name="Restart sign-in", exact=True).click()
+    check_btn = browser_page.get_by_role("button", name="Check sign-in status", exact=True)
+    check_btn.wait_for(timeout=5000)
+    check_btn.click()
+    browser_page.get_by_role("heading", name="Sign-in cancelled", exact=True).wait_for(timeout=5000)
+    assert calls2 == ["cancel"]

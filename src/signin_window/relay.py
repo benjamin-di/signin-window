@@ -142,15 +142,21 @@ class Link:
     poll_failures: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     context: AttemptContext | None = field(default=None, repr=False)
+    layout: str = ""
 
     def show(self, **fields: object) -> None:
         """Public fields of the link's state, for its page (never a secret: the page is the id's holder's)."""
         for name, value in fields.items():
-            if FIELD.match(name) and name not in ("state", "host"):
+            if FIELD.match(name) and name not in ("state", "host", "layout", "can_restart", "closing"):
                 self.shown[name] = str(value)[:100]
 
     def public(self) -> dict[str, Any]:
-        return {**self.shown, "state": self.state, "host": self.host}
+        data: dict[str, Any] = {**self.shown, "state": self.state, "host": self.host}
+        if self.layout:
+            data["layout"] = self.layout
+        if self.closing:
+            data["closing"] = True
+        return data
 
     @property
     def expires_at(self) -> str:
@@ -426,6 +432,7 @@ class Relay:
                 pass
         link.closing = False
         link.window_id = None
+        link.layout = ""
         if link.state in CANCELLABLE or (force and link.state in ACTIVE):
             link.state = "cancelled"
         with self._lock:
@@ -451,15 +458,18 @@ class Relay:
                     link.state = refused if refused in self.text.outcomes else "failed"
                     return
             link.starts += 1
+            chosen = layout if layout in ("phone", "desktop") else "desktop"
             try:
-                window = self.backend.start(layout if layout in ("phone", "desktop") else "desktop", **link.params)
+                window = self.backend.start(chosen, **link.params)
             except LoginBusy:
                 link.state = "busy"
                 return
             except LoginUnavailable:
                 link.state = "failed"
                 return
+            returned_layout = window.get("layout")
             link.window_id, link.state, link.host = window["id"], "starting", ""
+            link.layout = str(returned_layout) if returned_layout in ("phone", "desktop") else chosen
             link.viewer_revoked = False
             link.view_token = str(window["view_token"]) if window.get("view_token") else None  # or in a later state
             if link.closed:
@@ -483,7 +493,7 @@ class Relay:
                 backoff = min(1.0 * (2 ** min(link.poll_failures - 1, 3)), 8.0)
                 link.next_poll = now + backoff
                 if link.poll_failures >= 5 and now > link.expires + 60:
-                    link.window_id, link.view_token = None, None
+                    link.window_id, link.view_token, link.layout = None, None, ""
                     link.state = "failed"
                 return
             link.host = str(window.get("host") or "")[:100]
@@ -492,6 +502,8 @@ class Relay:
                 link.poll_failures = 0
                 link.next_poll = now + 1.0
                 link.state = state
+                if window.get("layout") in ("phone", "desktop"):
+                    link.layout = str(window["layout"])
                 if state == "saving":
                     link.view_token = None
                 elif not link.view_token and not link.closed and not link.viewer_revoked and window.get("view_token"):
@@ -509,11 +521,11 @@ class Relay:
                         return
                     session = None
                 link.poll_failures = 0
-                link.window_id, link.view_token = None, None
+                link.window_id, link.view_token, link.layout = None, None, ""
                 outcome = self._run_hook(self._on_signed_in, link, session) if session else "failed"
             else:
                 link.poll_failures = 0
-                link.window_id, link.view_token = None, None
+                link.window_id, link.view_token, link.layout = None, None, ""
                 outcome = self._run_hook(self._on_ended or self._kept, link, window)
             link.state = outcome
             log.info("%s: sign-in %s", link.key, outcome)
@@ -535,10 +547,13 @@ class Relay:
                 return "failed"
         return outcome if outcome in self.text.outcomes and outcome not in ("expired", "limited") else "failed"
 
-    def cancel(self, link: Link) -> None:
+    def cancel(self, link: Link, *, for_restart: bool = False) -> bool:
         with link.lock:
+            if for_restart and link.starts >= self.max_starts:
+                return False
             if link.state in ("starting", "waiting"):
                 self._close(link)
+            return True
 
     # -- HTTP -----------------------------------------------------------------------------------------------------
 
@@ -581,7 +596,12 @@ class Relay:
             return data if isinstance(data, dict) else {}
 
         def reply(link: Link) -> JSONResponse:
-            return JSONResponse(link.public(), headers=HEADERS)
+            data = link.public()
+            if link.state in CANCELLABLE:
+                data["can_restart"] = link.starts < self.max_starts
+                if link.viewer_revoked:
+                    data["closing"] = True
+            return JSONResponse(data, headers=HEADERS)
 
         async def page(request: Request) -> Response:
             link = self.find(request.path_params["id"], self._address(request))
@@ -615,8 +635,13 @@ class Relay:
             link = await lookup(request)
             if isinstance(link, Response) and self._authorize is not None:
                 return link
+            for_restart = False
+            if (request.headers.get("content-type") or "").split(";")[0].strip().lower() == "application/json":
+                for_restart = bool((await body(request)).get("for_restart"))
             if not isinstance(link, Response):
-                await anyio.to_thread.run_sync(self.cancel, link)
+                await anyio.to_thread.run_sync(lambda: self.cancel(link, for_restart=for_restart))
+                if for_restart:
+                    return reply(link)
             return Response(status_code=204, headers=HEADERS)
 
         async def novnc(request: Request) -> Response:

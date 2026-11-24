@@ -445,13 +445,17 @@ sudo .venv/bin/python -m signin_window.browser install-policy && uv run --group 
 `scripts/e2e.py` runs the whole path with real browsers and a stand-in site: a link, its live view, paste, a
 mobile typing, password/code paste, editing keys, hand-over and closing the page; CI runs it on every change.
 
-On a phone, tap the field in the remote page, then **Keyboard** below the viewer. Type directly into the selected
-remote field; **Paste** appears while the keyboard is open and reads the clipboard only when pressed. **Done**
-dismisses the keyboard without submitting the remote form. The native editor stays out of the page layout and
-clears after each edit and when the viewer loses focus or disconnects. Use the site's own buttons to continue.
-The viewer fits the remote display to the available width, preserving its scale when the keyboard opens.
-**Zoom** enlarges it; drag with one finger to move the view, or use two fingers to scroll the remote page.
-The header's **?** keeps the application's sign-in guidance available without crowding the remote form.
+On a phone, tap the field in the remote page, then tap **Paste** directly (reads the clipboard only when pressed) or
+**Keyboard** to type into the selected remote field. **Done** dismisses the keyboard without submitting the remote
+form. The native editor stays out of the page layout and clears after each edit and when the viewer loses focus or
+disconnects. Use the site's own buttons to continue. On desktop browsers with a fine pointer, the remote display
+aspect-fits within the viewport (capped at 1:1 native pixels, centered) and the mobile toolbar stays hidden unless
+paste feedback is shown. On phones, the viewer fits to available width and preserves its scale when the software
+keyboard opens. **Zoom** enlarges the view; a one-finger drag pans locally when the view overflows (and reaches the
+remote page when it fits), while two fingers scroll the remote page.
+The header's **?** keeps the application's sign-in guidance available, optional inline `PageText.notice` surfaces
+short site caveats, and **↻** (or the layout-mismatch switcher when changing devices) restarts cleanly when starts
+remain.
 The native editor supports printable ASCII text. It rejects an entire edit containing other characters with
 visible feedback because the virtual display can drop their keysyms; it never sends just the supported characters.
 The warning remains while typing continues. Hide and reopen the keyboard to clear it before retrying the field.

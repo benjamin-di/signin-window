@@ -124,3 +124,33 @@ def test_identity_footer_keeps_script_html_literals_intact():
     markup = render(PageText(script_extra=script, identity=PageIdentity("Example", "1.2.3", "a" * 40)), "Example")
     assert script in markup
     assert markup.rindex('<footer id="page-identity"') > markup.rindex("</script>")
+
+
+def test_notice_is_escaped_and_configured():
+    text = PageText(service="Ride & Co", notice="Use a code for {service} (<{label}>) {{INTRO}}.")
+    markup = render(text, "sam")
+    assert "Use a code for Ride &amp; Co (&lt;sam&gt;) {{INTRO}}." in markup
+    assert config(markup)["notice"] is True
+    assert config(render(PageText(), "sam"))["notice"] is False
+
+
+def test_pagetext_preserves_090_positional_constructor():
+    # Exact 0.9.0 positional field order through reconnect/auto_start/return_url.
+    text = PageText(
+        "Ride",
+        "Connect {service}",
+        "Help",
+        "Intro",
+        "Go",
+        "ride\\.example$",
+        "ride.example",
+        "Opening",
+        "Waiting",
+        "Saving",
+        True,
+        True,
+        "/connections/",
+    )
+    assert text.reconnect is True and text.auto_start is True and text.return_url == "/connections/"
+    assert text.notice == ""
+    assert "<title>Connect Ride</title>" in render(text, "sam")

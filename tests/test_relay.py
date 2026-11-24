@@ -369,7 +369,9 @@ def test_transient_state_read_failure_recovers_for_retired_window(backend, store
 
 def test_start_sends_the_links_params_and_the_layout(relay, http, backend):
     link = relay.create("example.de", params={"site": "example.de"})
-    assert start(http, link, "phone")["state"] == "starting"
+    started = start(http, link, "phone")
+    assert started["state"] == "starting"
+    assert started["layout"] == "phone"
     assert backend.started == [("phone", {"site": "example.de"})]
     assert start(http, link)["state"] == "starting"  # an open window is not opened twice
     assert len(backend.started) == 1
@@ -378,7 +380,12 @@ def test_start_sends_the_links_params_and_the_layout(relay, http, backend):
 def test_a_handed_over_session_goes_to_the_hook_and_never_to_the_page(relay, http, backend, stored):
     link = relay.create("alice")
     start(http, link)
-    assert state(http, link) == {"state": "waiting", "host": "accounts.example.com"}
+    assert state(http, link) == {
+        "state": "waiting",
+        "host": "accounts.example.com",
+        "layout": "desktop",
+        "can_restart": True,
+    }
     backend.hand_over("window-0000000000")
     body = state(http, link)
     assert body == {"state": "connected", "host": "www.example.com", "name": "J. Doe"}
@@ -386,6 +393,31 @@ def test_a_handed_over_session_goes_to_the_hook_and_never_to_the_page(relay, htt
     assert "s3cret" not in http.get(path(link) + "/state").text
     assert http.get(path(link)).status_code == 404  # a connected link opens nothing more
     assert start(http, link)["state"] == "connected" and len(backend.started) == 1
+
+
+def test_state_reports_can_restart_false_when_start_budget_exhausted_and_closing_when_deferred(backend):
+    from signin_window.relay import AttemptContext, Link, Relay
+
+    # Verify 0.9.0 positional Link constructor compatibility.
+    positional = Link("a" * 32, "k", 1.0, 2.0, "https://app.example/a", {}, "lbl", "ready", None, None, "", {"a": "1"})
+    assert positional.shown == {"a": "1"} and positional.layout == ""
+    assert positional.context is None
+
+    relay = Relay(backend, "https://app.example/connect", max_starts=1)
+    http = TestClient(Starlette(routes=relay.routes("/connect")))
+    link = relay.create("alice", context=AttemptContext(owner="alice"))
+    started = start(http, link, "phone")
+    assert started["can_restart"] is False
+    assert started["layout"] == "phone"
+    # Atomic for_restart cancel refuses to close the last usable attempt when max_starts is exhausted.
+    refused = http.post(path(link) + "/cancel", json={"for_restart": True})
+    assert refused.status_code == 200
+    assert refused.json()["state"] == "starting" and refused.json()["can_restart"] is False
+    assert link.window_id is not None
+    # Deferred cancellation marks state as closing so viewers stay detached.
+    link.closing = True
+    link.viewer_revoked = True
+    assert state(http, link)["closing"] is True
 
 
 def test_the_hook_can_refuse_with_a_state_of_its_own(relay, http, backend, stored):

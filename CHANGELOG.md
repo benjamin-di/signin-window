@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.10.0] - 2026-11-24
+
+### Added
+
+- Expose active window `layout` (`"phone"` or `"desktop"`) in `Link.public()` (`GET /{id}/state`) and show a one-click layout-mismatch switcher banner when a desktop browser opens a mobile window (or vice versa).
+- Add optional plain-text `PageText.notice` inline guidance shown while a sign-in window is starting or waiting, plus a header Restart control (`↻`) that cancels and restarts an active window without losing a just-completed sign-in.
+- Promote `Paste` in `static/paste.js` to a direct one-tap control on touch/mobile devices (preserving all clipboard fencing and whole-value validation).
+
+### Fixed
+
+- Aspect-fit the noVNC viewer canvas within both width and height (capped at 1:1 native pixels) on desktop/tablet viewports (`>= 700px`), centered with framed styling, while freezing canvas size during software keyboard opening on touch devices so forms never shrink or clip vertically.
+- Hide the mobile `Keyboard`/`Zoom` toolbar on fine-pointer desktop browsers when no paste feedback is active, reclaiming full viewport height.
+- Only intercept one-finger drag gestures for local viewport panning when `#signin_viewport` actually overflows, allowing remote drag controls when unzoomed.
+- Request crisper noVNC quality (`quality=8`, `show_dot=0`) and poll every 500ms while a sign-in window is starting.
+
+### Upgrade
+
+- Action required: none (additive `layout` field in state JSON and optional `PageText.notice`).
+- Rollback: compatible with 0.9.0; no stored state or configuration format changes.
+
 ## [0.9.0] - 2026-11-24
 
 ### Added

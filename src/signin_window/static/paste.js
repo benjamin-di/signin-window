@@ -187,6 +187,8 @@ function installKeyboard() {
     #signin_keyboard{position:fixed;inset:auto 0 0;z-index:11;box-sizing:border-box;padding:6px 10px;
       padding-bottom:max(6px,env(safe-area-inset-bottom));background:#fff;color:#161616;border-top:1px solid #ddd;
       font:14px/1.3 system-ui,sans-serif;touch-action:manipulation;user-select:text}
+    #signin_keyboard.signin_desktop .actions{display:none}
+    #signin_keyboard.signin_desktop:not(.signin_has_feedback){display:none}
     #signin_keyboard .actions{display:flex;gap:6px}
     #signin_keyboard button{min-height:44px;padding:8px 12px;border:0;border-radius:8px;
       color:#161616;background:#eef2f3;font:14px system-ui;cursor:pointer;min-width:44px}
@@ -198,8 +200,11 @@ function installKeyboard() {
     #signin_keyboard p{font-size:13px;margin:4px 0 0}
     #signin_feedback:empty{display:none}
     #signin_viewport{position:fixed;inset:0 0 var(--signin-keyboard-height,57px);overflow:auto;
-      overscroll-behavior:contain;background:#fff}
-    #noVNC_container{position:relative;border-radius:0;background:#fff}
+      overscroll-behavior:contain;background:#f4f4f4;display:flex;align-items:flex-start;justify-content:flex-start}
+    #signin_viewport.signin_framed{padding:12px;box-sizing:border-box}
+    #noVNC_container{position:relative;flex-shrink:0;border-radius:0;background:#fff}
+    #signin_viewport.signin_framed #noVNC_container{margin:auto;border:1px solid #d8dde3;border-radius:10px;
+      box-shadow:0 4px 18px rgba(0,0,0,.08);overflow:hidden}
     #noVNC_control_bar_anchor{display:none!important}
     #signin_keyboard [hidden]{display:none!important}
   `;
@@ -214,13 +219,62 @@ function installKeyboard() {
   const show = panel.querySelector("#signin_show");
   const paste = panel.querySelector("#signin_paste");
   const zoom = panel.querySelector("#signin_zoom");
-  let zoomed = false;
+  let zoomed = false, lastFitWidth = 0, lastFitHeight = 0, lastViewportWidth = 0, lastCanvasKey = "";
+  function isDesktopPointer() {
+    const wide = window.innerWidth >= 700;
+    const fine = window.matchMedia && matchMedia("(pointer: fine) and (hover: hover)").matches;
+    const coarse = window.matchMedia && matchMedia("(pointer: coarse)").matches;
+    return wide && fine && !coarse && !(navigator.maxTouchPoints > 0);
+  }
+  function updatePanelChrome() {
+    const desktop = isDesktopPointer() && !ownsFocus;
+    const hasFeedback = Boolean(feedback.textContent && feedback.textContent.trim());
+    panel.classList.toggle("signin_desktop", desktop);
+    panel.classList.toggle("signin_has_feedback", hasFeedback);
+    paste.hidden = desktop || !navigator.clipboard?.readText;
+    const height = desktop && !hasFeedback ? 0 : panel.offsetHeight;
+    document.documentElement.style.setProperty("--signin-keyboard-height", `${height}px`);
+  }
   function fitWidth() {
     const canvas = screen.querySelector("canvas");
     if (!canvas || !canvas.width || !canvas.height) return;
-    const width = Math.floor(viewport.clientWidth * (zoomed ? 1.4 : 1));
+    const canvasKey = `${canvas.width}x${canvas.height}`;
+    if (canvasKey !== lastCanvasKey) {
+      lastCanvasKey = canvasKey;
+      lastFitWidth = 0;
+      lastFitHeight = 0;
+      lastViewportWidth = 0;
+    }
+    const vw = viewport.clientWidth;
+    const vh = viewport.clientHeight;
+    if (!vw) return;
+    // Keep the remote form stable while a touch/software keyboard shrinks height at the same width.
+    const keyboardActive = ownsFocus || (window.visualViewport && visualViewport.height < innerHeight * 0.8);
+    const widthChanged = vw !== lastViewportWidth;
+    const framed = vw >= 700;
+    // Account for 12px padding on each side plus 1px container border on each side when framed.
+    const pad = framed ? 26 : 0;
+    const availW = Math.max(1, vw - pad);
+    const availH = Math.max(1, vh - pad);
+    let baseW = lastFitWidth, baseH = lastFitHeight;
+    if (widthChanged || !keyboardActive || !baseW || !baseH) {
+      if (framed && vh > 0) {
+        const scale = Math.min(1, availW / canvas.width, availH / canvas.height);
+        baseW = Math.max(1, Math.floor(canvas.width * scale));
+        baseH = Math.max(1, Math.floor(canvas.height * scale));
+      } else {
+        baseW = vw;
+        baseH = Math.ceil(baseW * canvas.height / canvas.width);
+      }
+      lastFitWidth = baseW;
+      lastFitHeight = baseH;
+      lastViewportWidth = vw;
+    }
+    const width = zoomed ? Math.max(1, Math.floor(baseW * 1.4)) : baseW;
+    const height = zoomed ? Math.ceil(width * canvas.height / canvas.width) : baseH;
     screen.style.width = `${width}px`;
-    screen.style.height = `${Math.ceil(width * canvas.height / canvas.width)}px`;
+    screen.style.height = `${height}px`;
+    viewport.classList.toggle("signin_framed", framed);
   }
   // Keep editor focus on mouse presses; cancelling pointerdown suppresses touch clicks in WebKit.
   zoom.addEventListener("mousedown", event => event.preventDefault());
@@ -230,11 +284,14 @@ function installKeyboard() {
     zoom.setAttribute("aria-pressed", String(zoomed));
     fitWidth();
   });
-  // Let noVNC decode taps and two-finger remote scrolling; a one-finger drag pans this readable local view.
+  // Let noVNC decode taps and two-finger remote scrolling; a one-finger drag pans only when this view overflows.
   let pan = null;
   for (const kind of ["gesturestart", "gesturemove", "gestureend"]) {
     screen.addEventListener(kind, event => {
       if (event.detail.type !== "drag") return;
+      const canPan = viewport.scrollWidth > viewport.clientWidth || viewport.scrollHeight > viewport.clientHeight;
+      if (kind === "gesturestart" && !canPan) return;
+      if (kind !== "gesturestart" && !pan) return;
       event.stopPropagation();
       const {clientX: x, clientY: y} = event.detail;
       if (kind === "gesturestart") pan = {x, y};
@@ -259,15 +316,16 @@ function installKeyboard() {
   }
   function clear() {
     clipboardRequest++;
+    invalidatePasteGesture();
     composing = false;
     input.value = "";
     cancelTyping();
     if (rfb && ownsFocus) rfb.focusOnClick = previousFocusOnClick;
     ownsFocus = false;
     panel.classList.remove("signin_active");
-    paste.hidden = true;
     show.textContent = "Keyboard";
     show.setAttribute("aria-pressed", "false");
+    updatePanelChrome();
   }
   function sync() {
     if (rfb !== UI.rfb) {
@@ -285,6 +343,7 @@ function installKeyboard() {
       input.blur();
       feedback.textContent = "Keyboard unavailable while disconnected.";
     } else if (feedback.textContent === "Keyboard unavailable while disconnected.") feedback.textContent = "";
+    updatePanelChrome();
     return ready;
   }
   function focus() {
@@ -297,26 +356,36 @@ function installKeyboard() {
     // Synchronization clears ownership before a native event can reach a replacement viewer.
     return sync() && ownsFocus && document.activeElement === input;
   }
-  function queue(keys) {
-    if (!editorReady()) return;
-    if (!enqueue(keys)) {
-      feedback.textContent = "Input was not sent. Wait for pending typing; send at most 1000 characters at a time.";
-    }
-  }
-  function send(text) {
-    if (!editorReady() || !text) return;
+  function sendText(text, requireEditor = true) {
+    if ((requireEditor ? !editorReady() : !sync()) || !text) return;
     // Pasting a credential must never execute a newline/tab as a remote Submit or move to another field.
     // Reject the whole value rather than sending a silently changed or truncated password.
     if (/[\u0000-\u001f\u007f]/u.test(text)) {
       feedback.textContent = "Text containing line breaks, tabs or control characters was not sent.";
+      updatePanelChrome();
       return;
     }
     // A keysym lookup can succeed while x11vnc drops it on the virtual display. Do not send a partial credential.
     if (/[^\u0020-\u007e]/u.test(text)) {
       feedback.textContent = "Text was not sent. This remote keyboard supports English letters, numbers and symbols only.";
+      updatePanelChrome();
       return;
     }
-    queue(Array.from(text).map(ch => keysyms.lookup(ch.codePointAt(0))));
+    const keys = Array.from(text).map(ch => keysyms.lookup(ch.codePointAt(0)));
+    if (!enqueue(keys)) {
+      feedback.textContent = "Input was not sent. Wait for pending typing; send at most 1000 characters at a time.";
+      updatePanelChrome();
+    }
+  }
+  function queue(keys) {
+    if (!editorReady()) return;
+    if (!enqueue(keys)) {
+      feedback.textContent = "Input was not sent. Wait for pending typing; send at most 1000 characters at a time.";
+      updatePanelChrome();
+    }
+  }
+  function send(text) {
+    sendText(text, true);
   }
   function commit(inserted) {
     if (!editorReady()) { clear(); return; }
@@ -345,9 +414,9 @@ function installKeyboard() {
     ownsFocus = true;
     rfb.focusOnClick = false;
     panel.classList.add("signin_active");
-    paste.hidden = !navigator.clipboard?.readText;
     show.textContent = "Done";
     show.setAttribute("aria-pressed", "true");
+    updatePanelChrome();
     reset();
   });
   input.addEventListener("blur", clear);
@@ -365,7 +434,7 @@ function installKeyboard() {
       }
       if (keys[event.key]) {
         event.preventDefault();
-        if (event.key === "Tab") clipboardRequest++;
+        if (event.key === "Tab") { clipboardRequest++; invalidatePasteGesture(); }
         queue([KeyTable[`XK_${keys[event.key]}`]]);
         reset();
       }
@@ -417,23 +486,70 @@ function installKeyboard() {
     reset();
     send(text);
   });
-  paste.addEventListener("mousedown", event => event.preventDefault());
+  let pasteGesture = null;
+  const pastePointers = new Set();
+  function invalidatePasteGesture() {
+    if (pasteGesture) pasteGesture.invalidated = true;
+  }
+  paste.addEventListener("pointerdown", event => {
+    if (pastePointers.size === 0) {
+      pasteGesture = {rfb: UI.rfb, generation, invalidated: false};
+    } else {
+      invalidatePasteGesture();
+    }
+    pastePointers.add(event.pointerId);
+  });
+  const onWindowPointerEnd = event => {
+    if (pastePointers.delete(event.pointerId) && event.type === "pointercancel") {
+      invalidatePasteGesture();
+    }
+  };
+  window.addEventListener("pointerup", onWindowPointerEnd, true);
+  window.addEventListener("pointercancel", onWindowPointerEnd, true);
+  paste.addEventListener("mousedown", event => {
+    event.preventDefault();
+    if (!pasteGesture && pastePointers.size === 0) pasteGesture = {rfb: UI.rfb, generation, invalidated: false};
+  });
+  // Invalidate pending clipboard reads and held Paste presses on hardware Tab/Enter even when the native editor is closed.
+  document.addEventListener("keydown", event => {
+    if (event.target === input) return;
+    if (event.key === "Tab" || event.key === "Enter") {
+      clipboardRequest++;
+      invalidatePasteGesture();
+    }
+  }, true);
   paste.addEventListener("click", async () => {
-    if (!editorReady() || !navigator.clipboard?.readText) return;
-    const origin = UI.rfb, editGeneration = generation, request = ++clipboardRequest;
+    if (pastePointers.size > 0) {
+      invalidatePasteGesture();
+      return;
+    }
+    const started = pasteGesture;
+    pasteGesture = null;
+    if (!sync() || !navigator.clipboard?.readText) return;
+    if (started && (started.invalidated || started.rfb !== UI.rfb || started.generation !== generation)) return;
+    const origin = UI.rfb, editGeneration = generation, request = ++clipboardRequest, wasFocused = ownsFocus;
     try {
       const text = await navigator.clipboard.readText();
-      if (request !== clipboardRequest || origin !== UI.rfb || editGeneration !== generation || !editorReady()) return;
-      composing = false; reset(); send(text);
+      if (request !== clipboardRequest || origin !== UI.rfb || editGeneration !== generation || !sync()) return;
+      if (wasFocused && !editorReady()) return;
+      if (wasFocused) { composing = false; reset(); }
+      sendText(text, wasFocused);
     } catch (_) {
-      if (request === clipboardRequest && editorReady())
+      if (request === clipboardRequest && sync() && (!wasFocused || editorReady())) {
         feedback.textContent = "Paste was not allowed. Allow clipboard access and try Paste again.";
+        updatePanelChrome();
+      }
     }
   });
   screen.addEventListener("pointerdown", () => {
+    clipboardRequest++;
+    invalidatePasteGesture();
     const interrupted = pending.length > 0;
     cancelTyping();
-    if (interrupted) feedback.textContent = "Typing was interrupted before finishing. Check the remote field.";
+    if (interrupted) {
+      feedback.textContent = "Typing was interrupted before finishing. Check the remote field.";
+      updatePanelChrome();
+    }
     if (ownsFocus) reset();
   }, true);
   const stockButton = document.getElementById("noVNC_keyboard_button");
@@ -442,19 +558,28 @@ function installKeyboard() {
     show.click();
   }, true);
   const observer = new ResizeObserver(() => {
-    document.documentElement.style.setProperty("--signin-keyboard-height", `${panel.offsetHeight}px`);
+    updatePanelChrome();
+    fitWidth();
   });
   observer.observe(panel);
-  const viewportObserver = new ResizeObserver(fitWidth);
+  const feedbackObserver = new MutationObserver(updatePanelChrome);
+  feedbackObserver.observe(feedback, {childList: true, characterData: true, subtree: true});
+  const viewportObserver = new ResizeObserver(() => {
+    updatePanelChrome();
+    fitWidth();
+  });
   viewportObserver.observe(viewport);
   const canvasObserver = new MutationObserver(fitWidth);
   canvasObserver.observe(screen, {subtree:true, childList:true, attributes:true, attributeFilter:["width", "height"]});
+  updatePanelChrome();
   fitWidth();
   const timer = setInterval(sync, 250);
   document.addEventListener("visibilitychange", () => { if (document.hidden) { clear(); input.blur(); } });
   window.addEventListener("pagehide", () => {
-    clear(); input.blur(); clearInterval(timer); observer.disconnect();
+    clear(); input.blur(); clearInterval(timer); observer.disconnect(); feedbackObserver.disconnect();
     viewportObserver.disconnect(); canvasObserver.disconnect();
+    window.removeEventListener("pointerup", onWindowPointerEnd, true);
+    window.removeEventListener("pointercancel", onWindowPointerEnd, true);
   });
   sync();
 }
