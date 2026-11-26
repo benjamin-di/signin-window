@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.10.1] - 2026-11-26
+
+### Fixed
+
+- Allow up to 10 concurrent multi-device `direct-browser` sessions per owner in `DirectOAuthManager`, bound to a disconnect/revocation-only `session_epoch` so signing in on a second device no longer logs out existing devices while Disconnect and post-revocation reconnects still atomically invalidate every prior session.
+
+### Upgrade
+
+- Action required: none
+- Rollback: compatible with 0.10.0; stored `session_epoch` metadata is ignored by older versions and existing grants remain readable.
+
 ## [0.10.0] - 2026-11-24
 
 ### Added

@@ -102,8 +102,21 @@ IDLE = """() => document.body.dispatchEvent(new KeyboardEvent("keyup", {
 SETTLE_MS = 1000
 
 
+@pytest.fixture(scope="module")
+def _paste_browser():
+    with sync_api.sync_playwright() as p:
+        try:
+            browser = p.chromium.launch(headless=True)
+        except Exception as exc:  # browser binary missing
+            pytest.skip(f"chromium unavailable: {exc}")
+        try:
+            yield browser
+        finally:
+            browser.close()
+
+
 @pytest.fixture
-def viewer():
+def viewer(_paste_browser):
     files = {
         "/vnc.html": ("text/html", VIEWER),
         "/paste.js": ("text/javascript", ADD_ON.read_text(encoding="utf-8")),
@@ -119,18 +132,14 @@ def viewer():
         content_type, body = found
         route.fulfill(content_type=content_type, body=body)
 
-    with sync_api.sync_playwright() as p:
-        try:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-        except Exception as exc:  # browser binary missing
-            pytest.skip(f"chromium unavailable: {exc}")
-        try:
-            page.route("**/*", serve)
-            page.goto(f"{ORIGIN}/vnc.html")
-            yield page
-        finally:
-            browser.close()
+    context = _paste_browser.new_context()
+    try:
+        page = context.new_page()
+        page.route("**/*", serve)
+        page.goto(f"{ORIGIN}/vnc.html")
+        yield page
+    finally:
+        context.close()
 
 
 def state(page, name: str) -> str:

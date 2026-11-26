@@ -31,12 +31,21 @@ def wait_for(predicate, seconds=20):
         time.sleep(0.05)
 
 
+def _display_range():
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "")
+    if worker.startswith("gw") and worker[2:].isdigit():
+        start = 210 + int(worker[2:]) * 20
+        return range(start, start + 20)
+    return range(210, 310)
+
+
 @pytest.fixture
 def host(tmp_path, monkeypatch, request):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "viewer-config"))
+    Path("/tmp/.X11-unix").mkdir(mode=0o1777, exist_ok=True)
     display = next(
         n
-        for n in range(210, 310)
+        for n in _display_range()
         if not Path(f"/tmp/.X{n}-lock").exists() and not Path(f"/tmp/.X11-unix/X{n}").exists()
     )
     process = subprocess.Popen(

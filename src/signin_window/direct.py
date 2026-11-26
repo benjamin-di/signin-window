@@ -15,6 +15,8 @@ from contextlib import contextmanager
 
 from .delegation import OAuthError, OAuthManager, _hash, _owner
 
+MAX_BROWSER_SESSIONS = 10
+
 
 class DirectOAuthManager(OAuthManager):
     """Use the same confidential client, consent, refresh grant and store.
@@ -78,6 +80,19 @@ class DirectOAuthManager(OAuthManager):
         with self._db() as db:
             self._store_sequence(db, "owner:" + owner, self._advance(db))
 
+    def _session_epoch(self, owner, *, db=None):
+        if db is not None:
+            return self._metadata_value(db, "session-epoch:" + owner) or 0
+        with self._db() as conn:
+            return self._metadata_value(conn, "session-epoch:" + owner) or 0
+
+    def _session_epoch_matches(self, owner, session, *, db=None):
+        if "session_epoch" in session:
+            return type(session["session_epoch"]) is int and session["session_epoch"] == self._session_epoch(
+                owner, db=db
+            )
+        return session.get("generation") == self.revision(owner)
+
     def _clear(self, account):
         # Called while the inherited per-owner lock is held. Commit the barrier,
         # disconnected account, and capability cleanup atomically so a failed
@@ -89,6 +104,7 @@ class DirectOAuthManager(OAuthManager):
         account.update(generation=str(int(account["generation"]) + 1), status="disconnected")
         with self._db() as db:
             self._store_sequence(db, "owner:" + account["owner"], self._advance(db))
+            self._store_sequence(db, "session-epoch:" + account["owner"], self._advance(db))
             self._save(account, db=db)
             db.execute(
                 "DELETE FROM capabilities WHERE owner=? AND kind IN ('state', 'direct-browser')",
@@ -110,7 +126,7 @@ class DirectOAuthManager(OAuthManager):
             return {"owner": None, "csrf": session["csrf"]}
         absolute_expires = session.get("absolute_expires")
         if (
-            session["generation"] != self.revision(owner)
+            not self._session_epoch_matches(owner, session)
             or not self.connected(owner)
             or (absolute_expires is not None and absolute_expires <= time.time())
         ):
@@ -146,7 +162,7 @@ class DirectOAuthManager(OAuthManager):
                 session = self._decrypt("direct-browser", owner, [digest, row["expires"]], row["encrypted"])
                 absolute_expires = session.get("absolute_expires")
                 if (
-                    session["generation"] != self.revision(owner)
+                    not self._session_epoch_matches(owner, session, db=db)
                     or not self.connected(owner)
                     or (absolute_expires is not None and absolute_expires <= now)
                 ):
@@ -257,6 +273,7 @@ class DirectOAuthManager(OAuthManager):
                     or (account["subject"] and account["subject"] != grant["subject"])
                 ):
                     raise OAuthError()
+                was_connected = account["status"] == "connected"
                 account.update(
                     subject=grant["subject"], generation=str(int(account["generation"]) + 1), status="connected"
                 )
@@ -282,13 +299,28 @@ class DirectOAuthManager(OAuthManager):
                         if incoming_abs is not None and incoming_abs <= now:
                             raise OAuthError("oauth_connection_invalid")
                     db.execute("DELETE FROM capabilities WHERE digest=? AND kind=?", (incoming_digest, kind))
-                    db.execute("DELETE FROM capabilities WHERE owner=? AND kind='direct-browser'", (owner,))
+                    if not was_connected:
+                        self._store_sequence(db, "session-epoch:" + owner, self._advance(db))
+                        db.execute("DELETE FROM capabilities WHERE owner=? AND kind='direct-browser'", (owner,))
+                    else:
+                        db.execute(
+                            "DELETE FROM capabilities WHERE owner=? AND kind='direct-browser' AND expires<=?",
+                            (owner, now),
+                        )
+                        existing = db.execute(
+                            "SELECT digest FROM capabilities WHERE owner=? AND kind='direct-browser' "
+                            "ORDER BY expires DESC, rowid DESC",
+                            (owner,),
+                        ).fetchall()
+                        for stale in existing[MAX_BROWSER_SESSIONS - 1 :]:
+                            db.execute("DELETE FROM capabilities WHERE digest=?", (stale["digest"],))
                     authenticated = self._new_cap(
                         "direct-browser",
                         owner,
                         {
                             "csrf": csrf,
                             "generation": account["generation"],
+                            "session_epoch": self._session_epoch(owner, db=db),
                             "absolute_expires": now + self.config.browser_absolute_lifetime,
                         },
                         lifetime=self.config.browser_idle_lifetime,

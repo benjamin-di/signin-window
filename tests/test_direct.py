@@ -496,3 +496,62 @@ def test_touch_samples_clock_inside_db_transaction(direct, tmp_path, monkeypatch
     monkeypatch.setattr(short, "_db", slow_db)
     with pytest.raises(OAuthError, match="oauth_connection_invalid"):
         short.touch_browser_session(cookie)
+
+
+def test_second_device_sign_in_preserves_existing_browser_session_and_disconnect_revokes_all(direct, tmp_path):
+    manager, provider = direct
+    short = DirectOAuthManager(manager.config, tmp_path / "multi-device", required_groups={"example-app"})
+    laptop_cookie, laptop_session = complete(short, provider, "user-a", begin(short, provider, "user-a"))
+    phone_cookie, phone_session = complete(short, provider, "user-a", begin(short, provider, "user-a"))
+
+    assert laptop_cookie != phone_cookie
+    assert short.browser_session(laptop_cookie) == laptop_session
+    assert short.browser_session(phone_cookie) == phone_session
+    with short.management_session(laptop_cookie, laptop_session["csrf"]) as active:
+        assert active == laptop_session
+
+    # Disconnecting from one device must immediately revoke every device's browser session.
+    short.disconnect_browser(phone_cookie, phone_session["csrf"])
+    for cookie in (laptop_cookie, phone_cookie):
+        with pytest.raises(OAuthError, match="oauth_connection_invalid"):
+            short.browser_session(cookie)
+
+
+def test_multi_device_sessions_enforce_per_owner_cap_without_exhausting_budget(direct, tmp_path):
+    manager, provider = direct
+    short = DirectOAuthManager(manager.config, tmp_path / "session-cap", required_groups={"example-app"})
+    cookies = []
+    for _ in range(15):
+        cookie, _ = complete(short, provider, "user-a", begin(short, provider, "user-a"))
+        cookies.append(cookie)
+    with short._db() as db:
+        count = db.execute(
+            "SELECT COUNT(*) FROM capabilities WHERE owner=? AND kind='direct-browser'", ("user-a",)
+        ).fetchone()[0]
+    assert count == 10
+    # Oldest 5 were evicted; newest 10 remain valid.
+    for old in cookies[:5]:
+        with pytest.raises(OAuthError, match="oauth_connection_invalid"):
+            short.browser_session(old)
+    for recent in cookies[5:]:
+        assert short.browser_session(recent)["owner"] == "user-a"
+
+
+def test_reconnect_after_uncertain_status_revokes_prior_device_sessions(direct, tmp_path):
+    manager, provider = direct
+    short = DirectOAuthManager(manager.config, tmp_path / "uncertain-barrier", required_groups={"example-app"})
+    laptop_cookie, _ = complete(short, provider, "user-a", begin(short, provider, "user-a"))
+
+    # Simulate a failed refresh / provider revocation moving the account to uncertain.
+    with short._lock("user-a"):
+        acct = short._account("user-a")
+        grant = short._grant(acct)
+        acct.update(generation=str(int(acct["generation"]) + 1), status="uncertain")
+        short._save(acct, grant)
+    assert not short.connected("user-a")
+
+    # Reconnecting from another device must not revive pre-revocation cookies.
+    phone_cookie, phone_session = complete(short, provider, "user-a", begin(short, provider, "user-a"))
+    assert short.browser_session(phone_cookie) == phone_session
+    with pytest.raises(OAuthError, match="oauth_connection_invalid"):
+        short.browser_session(laptop_cookie)

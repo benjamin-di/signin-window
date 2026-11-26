@@ -17,7 +17,7 @@ sync_api = pytest.importorskip("playwright.sync_api")
 LINK = "https://app.example/connect/" + "a" * 32
 
 
-def visit(text, state="ready"):
+def visit(browser_page, text, state="ready"):
     """Load the link page with a stand-in host; returns the POST paths the page sent, in order."""
     posts = []
 
@@ -33,35 +33,26 @@ def visit(text, state="ready"):
         else:
             route.abort()
 
-    with sync_api.sync_playwright() as p:
-        try:
-            browser = p.chromium.launch(headless=True)
-        except Exception as exc:  # browser binary missing
-            pytest.skip(f"chromium unavailable: {exc}")
-        try:
-            page = browser.new_page()
-            page.route("**/*", serve)
-            page.goto(LINK)
-            page.wait_for_timeout(500)
-            return posts, page.is_visible("#go")
-        finally:
-            browser.close()
+    browser_page.route("**/*", serve)
+    browser_page.goto(LINK)
+    browser_page.wait_for_timeout(500)
+    return posts, browser_page.is_visible("#go")
 
 
 @pytest.mark.parametrize("reconnect", [False, True])
-def test_auto_start_opens_the_window_without_the_intro(reconnect):
-    posts, intro = visit(PageText(service="Example", auto_start=True, reconnect=reconnect))
+def test_auto_start_opens_the_window_without_the_intro(browser_page, reconnect):
+    posts, intro = visit(browser_page, PageText(service="Example", auto_start=True, reconnect=reconnect))
     assert posts == ["start"] and not intro
 
 
 @pytest.mark.parametrize("reconnect", [False, True])
-def test_by_default_the_page_waits_for_the_person(reconnect):
-    posts, intro = visit(PageText(service="Example", reconnect=reconnect))
+def test_by_default_the_page_waits_for_the_person(browser_page, reconnect):
+    posts, intro = visit(browser_page, PageText(service="Example", reconnect=reconnect))
     assert posts == [] and intro
 
 
-def test_auto_start_resumes_an_active_attempt_instead_of_starting_another():
-    posts, intro = visit(PageText(service="Example", auto_start=True, reconnect=True), state="waiting")
+def test_auto_start_resumes_an_active_attempt_instead_of_starting_another(browser_page):
+    posts, intro = visit(browser_page, PageText(service="Example", auto_start=True, reconnect=True), state="waiting")
     assert posts == [] and not intro
 
 
@@ -116,17 +107,26 @@ def test_saving_disposes_the_viewer_and_keeps_progress_readable(browser_page, in
     assert browser_page.locator("iframe").count() == 0
 
 
-@pytest.fixture
-def browser_page():
+@pytest.fixture(scope="module")
+def _chromium_browser():
     with sync_api.sync_playwright() as driver:
         try:
             browser = driver.chromium.launch(headless=True)
         except Exception as exc:
             pytest.skip(f"chromium unavailable: {exc}")
         try:
-            yield browser.new_page()
+            yield browser
         finally:
             browser.close()
+
+
+@pytest.fixture
+def browser_page(_chromium_browser):
+    context = _chromium_browser.new_context()
+    try:
+        yield context.new_page()
+    finally:
+        context.close()
 
 
 def test_shared_connection_refresh_runs_under_exact_csp_and_preserves_focus(browser_page):
@@ -192,12 +192,14 @@ def test_build_change_keeps_the_loaded_shell_and_form_and_stops_polling(browser_
             ),
         )
 
+    browser_page.clock.install()
     browser_page.route("**/*", serve)
     browser_page.goto("https://app.example/connections/")
     browser_page.locator("#choice").focus()
     if edited:
         browser_page.locator("#choice").fill("unsent choice")
     browser_page.evaluate("window.originalForm = document.querySelector('form')")
+    browser_page.clock.run_for(2100)
     link = browser_page.get_by_role("link", name="Reload page", exact=True)
     link.wait_for()
     assert link.get_attribute("href") == "https://app.example/connections/"
@@ -209,7 +211,7 @@ def test_build_change_keeps_the_loaded_shell_and_form_and_stops_polling(browser_
     assert footer.inner_text() == "Example v1.2.3 · abcdef123456"
     assert footer.get_attribute("data-source-revision") == original_identity.source_revision
     assert browser_page.locator("#connection-content").get_attribute("data-refresh") is None
-    browser_page.wait_for_timeout(2300)
+    browser_page.clock.run_for(2300)
     assert reads == ["GET", "GET"]
 
 
@@ -466,13 +468,15 @@ def test_stalled_cancellation_has_bounded_recovery(browser_page):
         else:
             route.abort()
 
+    browser_page.clock.install()
     browser_page.route("**/*", serve)
     browser_page.goto(LINK)
     cancel = browser_page.get_by_role("button", name="Cancel sign-in", exact=True)
     cancel.click()
-    browser_page.get_by_text("We could not confirm the cancellation.", exact=False).wait_for(timeout=15000)
+    browser_page.clock.run_for(10100)
+    browser_page.get_by_text("We could not confirm the cancellation.", exact=False).wait_for(timeout=5000)
     assert cancel.is_enabled()
-    browser_page.wait_for_timeout(2500)  # Ordinary waiting polls must not erase uncertain cancellation.
+    browser_page.clock.run_for(2500)  # Ordinary waiting polls must not erase uncertain cancellation.
     assert browser_page.get_by_role("button", name="Check sign-in status").is_visible()
 
 
