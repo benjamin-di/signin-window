@@ -1110,3 +1110,164 @@ def test_delegation_footer_escapes_metadata_without_changing_the_consent_form(ma
     assert b"&lt;img src=x onerror=&quot;bad()&quot;&gt; v1.2.3&quot; &lt;dev&gt;" in response.body
     assert b"<code>abcdef1234567890&quot; &lt;revision&gt;</code>" in response.body
     assert b"<style>" not in response.body
+
+
+def test_pooled_http_client_reuses_single_instance_and_closes_cleanly(config, tmp_path, monkeypatch):
+    import threading
+
+    provider = Provider(config)
+    transport = httpx2.MockTransport(provider)
+    real_oauth = OAuth2Client
+    created = []
+
+    def counting_http(_self):
+        client = httpx2.Client(
+            trust_env=False,
+            follow_redirects=False,
+            timeout=8,
+            event_hooks={"response": [oauth._bounded]},
+            transport=transport,
+        )
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(oauth, "OAuth2Client", lambda *args, **kwargs: real_oauth(*args, **kwargs, transport=transport))
+    monkeypatch.setattr(OAuthManager, "_http", counting_http)
+    manager = OAuthManager(config, tmp_path)
+
+    # First connection exercises _metadata(), _keys(), and _prove_owner() via one pooled client.
+    connected(manager, provider, "user-a")
+    assert len(created) == 1
+    first_client = created[0]
+    assert not first_client.is_closed
+
+    # Forced refreshes and owner proofs continue reusing the same client.
+    metadata = manager._metadata(force_refresh=True)
+    manager._keys(metadata, force_refresh=True)
+    manager._prove_owner("user-a", manager.access_token("user-a", 0))
+    assert len(created) == 1
+
+    # Closing releases the pooled client; a later call lazily creates a replacement.
+    manager.close()
+    assert first_client.is_closed
+    manager.close()  # idempotent
+    manager._metadata(force_refresh=True)
+    assert len(created) == 2
+    assert created[1] is not first_client and not created[1].is_closed
+
+    # Concurrent initialization after close creates exactly one client.
+    manager.close()
+    barrier = threading.Barrier(4)
+    seen = []
+    seen_lock = threading.Lock()
+
+    def worker():
+        barrier.wait(5)
+        with manager._borrow_http() as client:
+            with seen_lock:
+                seen.append(client)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert len(created) == 3
+    assert len({id(c) for c in seen}) == 1
+    manager.close()
+
+
+def test_pooled_http_client_never_stores_or_leaks_cookies_across_owners(config, tmp_path, monkeypatch):
+    seen_cookies = []
+
+    def handler(request: httpx2.Request):
+        seen_cookies.append((request.headers.get("Authorization"), request.headers.get("Cookie")))
+        auth = request.headers.get("Authorization", "")
+        owner = "user-a" if auth.endswith("token-a") else "user-b"
+        headers = {config.owner_header: owner}
+        if owner == "user-a":
+            headers["Set-Cookie"] = "session=owner-a-secret; Path=/; HttpOnly; Secure"
+        return httpx2.Response(
+            200,
+            headers=headers,
+            json={"jsonrpc": "2.0", "id": "delegated-oauth", "result": {"protocolVersion": "2025-03-26"}},
+        )
+
+    transport = httpx2.MockTransport(handler)
+    real_http = OAuthManager._http
+
+    def pooled_with_mock(self):
+        client = real_http(self)
+        client._transport = transport
+        return client
+
+    monkeypatch.setattr(OAuthManager, "_http", pooled_with_mock)
+    manager = OAuthManager(config, tmp_path)
+    try:
+        manager._prove_owner("user-a", "token-a")
+        manager._prove_owner("user-b", "token-b")
+        assert seen_cookies == [("Bearer token-a", None), ("Bearer token-b", None)]
+        with manager._borrow_http() as client:
+            assert len(client.cookies) == 0
+    finally:
+        manager.close()
+
+
+def test_close_defers_closing_pooled_client_until_inflight_request_finishes(config, tmp_path, monkeypatch):
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    closed_during_use = []
+    clients = []
+
+    class FakeClient:
+        def __init__(self):
+            self.is_closed = False
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            self.is_closed = True
+
+    def make_client(_self):
+        c = FakeClient()
+        clients.append(c)
+        return c
+
+    monkeypatch.setattr(OAuthManager, "_http", make_client)
+    manager = OAuthManager(config, tmp_path)
+
+    def inflight():
+        with manager._borrow_http() as client:
+            entered.set()
+            release.wait(5)
+            closed_during_use.append(client.is_closed)
+
+    t = threading.Thread(target=inflight)
+    t.start()
+    assert entered.wait(5)
+    # Closing while in-flight must NOT close the active client yet.
+    manager.close()
+    assert clients[0].is_closed is False
+    release.set()
+    t.join(5)
+    assert closed_during_use == [False]
+    assert clients[0].is_closed is True
+    assert clients[0].close_calls == 1
+
+
+def test_default_http_client_configures_pooling_limits_and_security_options(config, tmp_path):
+    manager = OAuthManager(config, tmp_path)
+    client = manager._http()
+    try:
+        assert client._trust_env is False
+        assert client.follow_redirects is False
+        assert client.timeout == httpx2.Timeout(8)
+        assert client.event_hooks["response"] == [oauth._bounded]
+        pool = client._transport._pool
+        assert pool._max_connections == 8
+        assert pool._max_keepalive_connections == 4
+        assert pool._keepalive_expiry == 45.0
+    finally:
+        client.close()

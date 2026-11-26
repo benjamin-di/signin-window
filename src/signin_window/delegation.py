@@ -20,6 +20,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import threading
 import time
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
@@ -271,6 +272,35 @@ def load_client_key(directory: Path) -> bytes:
     return encoded
 
 
+class _NoCookies(httpx2.Cookies):
+    """Stateless cookie jar for pooled OIDC/proof clients: never store or replay Set-Cookie."""
+
+    def extract_cookies(self, response):
+        return None
+
+    def set(self, name, value, domain="", path="/"):
+        return None
+
+    def set_cookie_header(self, request):
+        return None
+
+
+class _PooledClientSlot:
+    __slots__ = ("active", "client", "factory", "retired")
+
+    def __init__(self, client, factory):
+        self.client = client
+        self.factory = factory
+        self.active = 0
+        self.retired = False
+
+
+def _close_http_client(client):
+    close = getattr(client, "close", None)
+    if callable(close):
+        close()
+
+
 class OAuthManager:
     def __init__(self, config: OAuthConfig, state_dir: Path):
         self.config = config
@@ -304,6 +334,8 @@ class OAuthManager:
             """)
         self._metadata_cache = None
         self._keys_cache = {}
+        self._http_lock = threading.Lock()
+        self._http_slot = None
         self._client_kid = (
             public_client_jwk(self.config.client_private_key)["kid"]
             if self.config.client_private_key is not None
@@ -470,7 +502,54 @@ class OAuthManager:
         return self.config.public_base_url + "/oauth/connect/" + ticket
 
     def _http(self):
-        return httpx2.Client(trust_env=False, follow_redirects=False, timeout=8, event_hooks={"response": [_bounded]})
+        client = httpx2.Client(
+            trust_env=False,
+            follow_redirects=False,
+            timeout=8,
+            limits=httpx2.Limits(max_connections=8, max_keepalive_connections=4, keepalive_expiry=45.0),
+            event_hooks={"response": [_bounded]},
+        )
+        client._cookies = _NoCookies()
+        return client
+
+    @contextmanager
+    def _borrow_http(self):
+        factory = self._http
+        to_close = None
+        with self._http_lock:
+            slot = self._http_slot
+            if slot is None or slot.retired or getattr(slot.client, "is_closed", False) or slot.factory != factory:
+                if slot is not None:
+                    slot.retired = True
+                    if slot.active == 0:
+                        to_close = slot.client
+                slot = _PooledClientSlot(factory(), factory)
+                self._http_slot = slot
+            slot.active += 1
+        if to_close is not None and to_close is not slot.client:
+            _close_http_client(to_close)
+        try:
+            yield slot.client
+        finally:
+            close_now = None
+            with self._http_lock:
+                slot.active -= 1
+                if slot.retired and slot.active == 0:
+                    close_now = slot.client
+            if close_now is not None:
+                _close_http_client(close_now)
+
+    def close(self):
+        close_now = None
+        with self._http_lock:
+            slot = self._http_slot
+            self._http_slot = None
+            if slot is not None:
+                slot.retired = True
+                if slot.active == 0:
+                    close_now = slot.client
+        if close_now is not None:
+            _close_http_client(close_now)
 
     def _endpoint(self, value):
         parsed, issuer = _url(value), _url(self.config.issuer)
@@ -483,7 +562,7 @@ class OAuthManager:
         if not force_refresh and self._metadata_cache is not None and now < self._metadata_cache[0]:
             return self._metadata_cache[1]
         try:
-            with self._http() as client:
+            with self._borrow_http() as client:
                 value = client.get(self.config.issuer + "/.well-known/openid-configuration").json()
             if (
                 not isinstance(value, dict)
@@ -535,7 +614,7 @@ class OAuthManager:
         cached = self._keys_cache.get(jwks_uri)
         if not force_refresh and cached is not None and now < cached[0]:
             return cached[1]
-        with self._http() as client:
+        with self._borrow_http() as client:
             value = client.get(jwks_uri).json()
         if not isinstance(value, dict) or not isinstance(value.get("keys"), list) or not 1 <= len(value["keys"]) <= 16:
             raise OAuthError()
@@ -687,7 +766,7 @@ class OAuthManager:
                 "clientInfo": {"name": "delegated-oauth", "version": "1"},
             },
         }
-        with self._http() as client:
+        with self._borrow_http() as client:
             response = client.post(
                 self.config.resource,
                 json=message,

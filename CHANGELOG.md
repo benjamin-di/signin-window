@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.11.1] - 2026-11-26
+
+### Fixed
+
+- Construct synthetic malformed preconnect URL test cases dynamically in `tests/test_connection_pages.py` so public-mirror URL and credential scanners do not flag negative test vectors.
+
+### Upgrade
+
+- Action required: none
+- Rollback: compatible with 0.11.0.
+
+## [0.11.0] - 2026-11-26
+
+### Added
+
+- Reuse a lazy, thread-safe, refcounted pooled `httpx2.Client` with a stateless cookie jar across `OAuthManager` metadata, JWKS, and owner-proof requests (`close()` defers transport shutdown until in-flight calls finish).
+- Add `DirectOAuthManager.prove_owner()` and strict-bool `prove=True` on `current_identity()` / `_identity()` so callers can run owner proof concurrently while keeping default fail-closed behavior unchanged.
+- Add optional validated `preconnect` origin support to `signin_window.connections.page()`.
+
+### Upgrade
+
+- Action required: none (additive optional parameters and internal HTTP connection pooling).
+- Rollback: compatible with 0.10.1; no stored state or configuration format changes.
+
 ## [0.10.1] - 2026-11-26
 
 ### Fixed

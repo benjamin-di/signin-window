@@ -210,7 +210,15 @@ class DirectOAuthManager(OAuthManager):
             )
         return location
 
-    def _identity(self, token, metadata):
+    def prove_owner(self, owner, token):
+        owner = _owner(owner)
+        if not isinstance(token, str) or not token:
+            raise OAuthError()
+        self._prove_owner(owner, token)
+
+    def _identity(self, token, metadata, *, prove=True):
+        if type(prove) is not bool:
+            raise OAuthError()
         claims, _ = self._decode(token, self._keys(metadata), self.config.resource, access=True)
         owner = _owner(claims.get(self.owner_claim))
         groups = claims.get("groups", [])
@@ -221,12 +229,15 @@ class DirectOAuthManager(OAuthManager):
             or not self.required_groups <= set(groups)
         ):
             raise OAuthError()
-        self._prove_owner(owner, token)
+        if prove:
+            self._prove_owner(owner, token)
         return owner, claims
 
-    def current_identity(self, owner):
+    def current_identity(self, owner, *, prove=True):
+        if type(prove) is not bool:
+            raise OAuthError()
         token = self.access_token(owner, 60)
-        actual, claims = self._identity(token, self._metadata())
+        actual, claims = self._identity(token, self._metadata(), prove=prove)
         if actual != owner:
             raise OAuthError()
         return token, claims

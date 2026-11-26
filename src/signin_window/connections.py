@@ -10,13 +10,20 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import ipaddress
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
+import idna
+
 from ._identity import footer as identity_footer
 from .connection_state import ConnectionStatus
+
+_DNS_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+_HEX_NUMBER_LABEL = re.compile(r"^0[xX][0-9A-Fa-f]*$")
 
 _SCRIPT = """(() => {
   const content = document.getElementById('connection-content');
@@ -198,6 +205,63 @@ class PageIdentity:
     source_revision: str
 
 
+def _valid_hostname(host: str, *, bracketed: bool) -> bool:
+    if not host or len(host) > 253 or "%" in host:
+        return False
+    if bracketed:
+        try:
+            ipaddress.IPv6Address(host)
+            return True
+        except ValueError:
+            return False
+    try:
+        ipaddress.IPv4Address(host)
+        return True
+    except ValueError:
+        pass
+    labels = host.split(".")
+    if labels[-1].isdigit() or _HEX_NUMBER_LABEL.fullmatch(labels[-1]):
+        return False
+    if not all(_DNS_LABEL.fullmatch(label) for label in labels):
+        return False
+    for label in labels:
+        if label.lower().startswith("xn--"):
+            try:
+                idna.decode(label, uts46=True)
+            except idna.IDNAError:
+                return False
+    return True
+
+
+def _preconnect_origin(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(char.isspace() or ord(char) < 32 or ord(char) == 127 or char == "\\" for char in value)
+    ):
+        raise ValueError("preconnect must be a clean https:// origin")
+    parsed = urlsplit(value)
+    port = parsed.port
+    bracketed = parsed.netloc.startswith("[")
+    host = parsed.hostname
+    expected_netloc = (f"[{host}]" if bracketed else (host or "")) + (f":{port}" if port is not None else "")
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or not host
+        or parsed.netloc.lower() != expected_netloc
+        or not _valid_hostname(host, bracketed=bracketed)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or value != f"https://{parsed.netloc}"
+    ):
+        raise ValueError("preconnect must be a clean https:// origin")
+    return value
+
+
 def page(
     title: str,
     body: str,
@@ -206,13 +270,20 @@ def page(
     refresh: bool = False,
     login_url: str = "/connections/login",
     identity: PageIdentity | None = None,
+    preconnect: str | None = None,
 ) -> str:
     """Render trusted application markup, with optional host-supplied build identity."""
     live = " data-refresh" if refresh else ""
     footer = identity_footer(identity, element_id="connection-identity") if identity is not None else ""
+    preconnect_tag = (
+        f'<link rel="preconnect" href="{html.escape(_preconnect_origin(preconnect), quote=True)}" crossorigin>'
+        if preconnect is not None
+        else ""
+    )
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f"{preconnect_tag}"
         f"<title>{html.escape(title)} · Connections</title><style>{_STYLE}</style></head><body><main>"
         '<p class="eyebrow">Connections</p>'
         f"<h1>{html.escape(title)}</h1>"

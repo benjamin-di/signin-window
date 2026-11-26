@@ -555,3 +555,52 @@ def test_reconnect_after_uncertain_status_revokes_prior_device_sessions(direct, 
     assert short.browser_session(phone_cookie) == phone_session
     with pytest.raises(OAuthError, match="oauth_connection_invalid"):
         short.browser_session(laptop_cookie)
+
+
+def test_current_identity_prove_split_and_prove_owner_helper(direct):
+    manager, provider = direct
+    complete(manager, provider, "user-a", begin(manager, provider, "user-a"))
+    provider.reads.clear()
+
+    # Default prove=True verifies locally AND calls owner proof on the resource.
+    token, claims = manager.current_identity("user-a")
+    assert claims["person_id"] == "user-a"
+    assert ("POST", RESOURCE) in provider.reads
+
+    # Default prove=True stays fail-closed when resource owner proof disagrees.
+    provider.proof_owner = "user-b"
+    with pytest.raises(OAuthError):
+        manager.current_identity("user-a")
+
+    # prove=False verifies token/claims/groups locally without calling _prove_owner.
+    provider.reads.clear()
+    local_token, local_claims = manager.current_identity("user-a", prove=False)
+    assert local_token == token
+    assert local_claims["person_id"] == "user-a"
+    assert ("POST", RESOURCE) not in provider.reads
+
+    # prove_owner delegates to _prove_owner and fails closed on mismatch or bad inputs.
+    with pytest.raises(OAuthError):
+        manager.prove_owner("user-a", local_token)
+    provider.proof_owner = None
+    manager.prove_owner("user-a", local_token)
+    assert ("POST", RESOURCE) in provider.reads
+    with pytest.raises(OAuthError):
+        manager.prove_owner("user-b", local_token)
+    with pytest.raises(OAuthError):
+        manager.prove_owner("bad owner!", local_token)
+    with pytest.raises(OAuthError):
+        manager.prove_owner("user-a", "")
+    with pytest.raises(OAuthError):
+        manager.prove_owner("user-a", None)
+
+    # Non-bool prove values (e.g. None, 0) fail closed instead of skipping remote proof.
+    with pytest.raises(OAuthError):
+        manager.current_identity("user-a", prove=None)
+    with pytest.raises(OAuthError):
+        manager.current_identity("user-a", prove=0)
+
+    # prove=False still fails closed on missing required group or wrong owner claim.
+    manager.required_groups = frozenset({"missing-group"})
+    with pytest.raises(OAuthError):
+        manager.current_identity("user-a", prove=False)

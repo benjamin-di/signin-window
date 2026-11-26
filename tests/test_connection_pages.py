@@ -91,3 +91,67 @@ def test_timestamps_are_readable_and_missing_facts_are_not_invented():
     assert "not recorded" in timestamp(None)
     assert "not recorded" in timestamp("not-a-date")
     assert "not recorded" in timestamp(float("inf"))
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://id.example.com",
+        "https://id.example.com:8443",
+        "https://id--prod.example",
+        "https://xn--strae-oqa.example",
+        "https://[2001:db8::1]",
+    ],
+)
+def test_page_emits_preconnect_link_in_head_for_clean_https_origin(origin):
+    without = page("Example", "<p>Saved</p>")
+    assert 'rel="preconnect"' not in without
+    rendered = page("Example", "<p>Saved</p>", preconnect=origin)
+    head = rendered.split("</head>", 1)[0]
+    assert f'<link rel="preconnect" href="{origin}" crossorigin>' in head
+    script = re.search(r"<script>(.*?)</script>", rendered, re.S).group(1)
+    digest = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
+    assert SCRIPT_SOURCE == f"'sha256-{digest}'"
+
+
+_HTTPS = "https://"
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "",
+        "http://id.example.com",
+        "HTTPS://id.example.com",
+        _HTTPS,
+        "https://id.example.com/",
+        "https://id.example.com/auth",
+        f"{_HTTPS}id.example.com?a=1",
+        f"{_HTTPS}id.example.com?",
+        f"{_HTTPS}id.example.com#frag",
+        f"{_HTTPS}id.example.com#",
+        f"{_HTTPS}user:pass@id.example.com",
+        "https://@id.example.com",
+        "https://id.example.com ",
+        " https://id.example.com",
+        "https://id.example.com\n",
+        "https://id.example.com:99999",
+        "https://id.example.com\\path",
+        "https://id.example.com|invalid",
+        f"{_HTTPS}id.example.com%zz",
+        "https://-bad.example.com",
+        "https://bad..example.com",
+        f"{_HTTPS}999.999.999.999",
+        f"{_HTTPS}id.example.0x1",
+        f"{_HTTPS}id.example.0Xff",
+        "https://xn--a.example",
+        "https://xn--a-wbb.example",
+        "https://[v1.example]",
+        "https://[2001:db8::1]junk:443",
+        "https://[fe80::1%demo]",
+        "javascript:alert(1)",
+    ],
+)
+def test_page_rejects_invalid_preconnect_origins(invalid):
+    with pytest.raises(ValueError):
+        page("Example", "<p>Saved</p>", preconnect=invalid)
