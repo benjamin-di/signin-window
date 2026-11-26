@@ -43,11 +43,11 @@ import re
 import secrets
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib import resources
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
 
 import anyio.to_thread
@@ -143,6 +143,7 @@ class Link:
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     context: AttemptContext | None = field(default=None, repr=False)
     layout: str = ""
+    _purged: bool = field(default=False, repr=False)
 
     def show(self, **fields: object) -> None:
         """Public fields of the link's state, for its page (never a secret: the page is the id's holder's)."""
@@ -161,6 +162,104 @@ class Link:
     @property
     def expires_at(self) -> str:
         return datetime.fromtimestamp(self.expires, UTC).isoformat(timespec="seconds")
+
+
+@dataclass
+class SlotReservation:
+    """Binding capacity and hourly-quota reservation handle for a key.
+
+    Use as a context manager or call ``release()`` explicitly. Passing the
+    handle to ``Relay.create(..., reservation=...)`` or ``Relay.replace()``
+    consumes one reserved unit; any unconsumed units are released on context
+    exit or explicit ``release()`` (idempotent).
+    """
+
+    key: str
+    count: int = 1
+    _relay: Relay | None = field(default=None, repr=False, compare=False)
+    _remaining: int = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.count < 1:
+            raise ValueError("count must be at least 1")
+        self._remaining = self.count
+
+    @property
+    def active(self) -> bool:
+        """True while at least one reserved unit remains unconsumed and unreleased."""
+        return self._remaining > 0
+
+    @property
+    def remaining(self) -> int:
+        return self._remaining
+
+    def release(self) -> None:
+        """Release any unconsumed capacity and hourly-quota reservation (idempotent)."""
+        if self._relay is not None:
+            self._relay._release_reservation(self)
+
+    def __enter__(self) -> SlotReservation:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.release()
+
+
+@dataclass(frozen=True)
+class LinkSpec:
+    """Parameters for creating a replacement link via ``Relay.replace()``."""
+
+    params: dict[str, Any] | None = None
+    label: str | None = None
+    context: AttemptContext | None = None
+
+
+@dataclass(frozen=True)
+class ReplaceResult:
+    """Structured outcome of ``Relay.replace()``."""
+
+    outcome: Literal["created", "stale_target", "saving", "completed", "closing"]
+    link: Link | None = None
+    preserved: Link | None = None
+    drained: tuple[Link, ...] = ()
+    still_open: tuple[Link, ...] = ()
+
+    @property
+    def created(self) -> bool:
+        return self.outcome == "created" and self.link is not None
+
+
+@dataclass(frozen=True)
+class DrainResult:
+    """Structured outcome of ``Relay.drain_and_purge()``."""
+
+    purged: tuple[Link, ...] = ()
+    preserved: tuple[Link, ...] = ()
+    still_open: tuple[Link, ...] = ()
+
+    @property
+    def drained(self) -> tuple[Link, ...]:
+        return self.purged
+
+
+@dataclass(frozen=True)
+class KeySnapshot:
+    """Non-blocking snapshot of a key's active, retired, and draining state."""
+
+    key: str
+    active: tuple[Link, ...]
+    retired: tuple[Link, ...]
+    draining: bool
+
+    @property
+    def links(self) -> tuple[Link, ...]:
+        """All tracked links for this key (active first, then retired not already in active)."""
+        seen = {link.id for link in self.active}
+        return self.active + tuple(link for link in self.retired if link.id not in seen)
+
+    @property
+    def has_saving(self) -> bool:
+        return any(link.state == "saving" for link in self.links)
 
 
 class Misses:
@@ -223,6 +322,9 @@ class Relay:
         self._links: dict[str, Link] = {}
         self._retired: dict[str, Link] = {}
         self._made: dict[str, collections.deque] = {}
+        self._reserved_slots: int = 0
+        self._reserved_quota: dict[str, int] = {}
+        self._draining: dict[str, int] = {}
         self._misses = Misses()
         self._lock = threading.Lock()
         self._hooks = threading.Lock()  # one hook at a time: a check and the write that follows go together
@@ -266,6 +368,10 @@ class Relay:
             if not link.closing and link.next_poll <= now:
                 self.advance(link)
         for link in retired:
+            if link._purged:
+                with self._lock:
+                    self._retired.pop(link.id, None)
+                continue
             if link.next_poll <= now:
                 if link.closing:
                     self._retire(link)
@@ -273,65 +379,459 @@ class Relay:
                     self.advance(link)
             if link.lock.acquire(blocking=False):
                 try:
-                    if not link.closing and (link.state not in ACTIVE or link.window_id is None):
+                    if link._purged or (not link.closing and (link.state not in ACTIVE or link.window_id is None)):
                         with self._lock:
                             self._retired.pop(link.id, None)
                 finally:
                     link.lock.release()
 
     def _track_retired_locked(self, link: Link, *, reset_poll: bool = True) -> list[Link]:
+        if link._purged:
+            return []
         if reset_poll:
             link.next_poll = 0.0
         self._retired[link.id] = link
         return []
 
-    def create(self, key: str, *, params: dict[str, Any] | None = None, label: str | None = None,
-               context: AttemptContext | None = None) -> Link:  # fmt: skip
+    def _prune_made_locked(self, key: str, now: float) -> collections.deque:
+        made = self._made.setdefault(key, collections.deque())
+        while made and now - made[0] > 3600:
+            made.popleft()
+        return made
+
+    def _release_reservation(self, reservation: SlotReservation) -> None:
+        with self._lock:
+            rem = reservation._remaining
+            if rem <= 0:
+                return
+            reservation._remaining = 0
+            self._reserved_slots = max(0, self._reserved_slots - rem)
+            remaining_quota = self._reserved_quota.get(reservation.key, 0) - rem
+            if remaining_quota > 0:
+                self._reserved_quota[reservation.key] = remaining_quota
+            else:
+                self._reserved_quota.pop(reservation.key, None)
+
+    def _consume_reservation_locked(self, key: str, reservation: SlotReservation) -> None:
+        if reservation._relay is not self or reservation.key != key:
+            raise ValueError("reservation does not match this relay and key")
+        if reservation._remaining <= 0:
+            raise ValueError("reservation already consumed or released")
+        reservation._remaining -= 1
+        self._reserved_slots = max(0, self._reserved_slots - 1)
+        remaining_quota = self._reserved_quota.get(key, 0) - 1
+        if remaining_quota > 0:
+            self._reserved_quota[key] = remaining_quota
+        else:
+            self._reserved_quota.pop(key, None)
+
+    def _refund_quota_locked(self, key: str, created_ts: float) -> None:
+        made = self._made.get(key)
+        if not made:
+            return
+        for idx in range(len(made) - 1, -1, -1):
+            if made[idx] == created_ts:
+                del made[idx]
+                break
+        if not made:
+            self._made.pop(key, None)
+
+    def _create_locked(
+        self,
+        key: str,
+        now: float,
+        *,
+        params: dict[str, Any] | None = None,
+        label: str | None = None,
+        context: AttemptContext | None = None,
+        reservation: SlotReservation | None = None,
+    ) -> tuple[Link, list[Link]]:
+        made = self._prune_made_locked(key, now)
+        if reservation is not None:
+            self._consume_reservation_locked(key, reservation)
+            self._expire(now)
+        else:
+            if len(made) + self._reserved_quota.get(key, 0) >= self.links_per_hour:
+                raise LinkLimited(key)
+            self._expire(now)
+            if len(self._retired) + self._reserved_slots >= self.max_links:
+                raise LinkLimited(key)
+        made.append(now)
+        to_retire: list[Link] = []
+        replaced = [link for link in self._links.values() if link.key == key]
+        for link in replaced:
+            self._links.pop(link.id, None)
+            link.closed = True
+            link.view_token = None
+            if link.window_id is not None:
+                self._track_retired_locked(link)
+                if link.state != "saving":
+                    to_retire.append(link)
+        while len(self._links) >= self.max_links:
+            oldest = self._links.pop(min(self._links.values(), key=lambda link: link.created).id)
+            oldest.closed = True
+            oldest.view_token = None
+            if oldest.window_id is not None:
+                self._track_retired_locked(oldest)
+                if oldest.state != "saving":
+                    to_retire.append(oldest)
+        link_id = secrets.token_urlsafe(24)
+        link = Link(
+            link_id,
+            key,
+            now,
+            now + self.link_ttl,
+            f"{self.public_url}/{link_id}",
+            dict(params or {}),
+            key if label is None else label,
+        )
+        link.context = context
+        self._links[link.id] = link
+        return link, to_retire
+
+    def _rollback_link(self, link: Link) -> None:
+        with self._lock:
+            link.closed = True
+            link._purged = True
+            link.view_token = None
+            self._links.pop(link.id, None)
+            self._retired.pop(link.id, None)
+            self._refund_quota_locked(link.key, link.created)
+        self._retire(link)
+
+    def _drain_link(self, link: Link, completed_states: Collection[str]) -> tuple[bool, bool, bool]:
+        """Cancel ``link`` if cancellable and return ``(still_open, is_saving, is_completed)``."""
+        self.cancel(link)
+        with link.lock:
+            is_saving = link.state == "saving"
+            still_open = link.window_id is not None or link.closing or link.state in ACTIVE
+            is_completed = link.state in completed_states
+            return still_open, is_saving, is_completed
+
+    def _exit_draining(self, key: str) -> None:
+        with self._lock:
+            remaining = self._draining.get(key, 0) - 1
+            if remaining > 0:
+                self._draining[key] = remaining
+            else:
+                self._draining.pop(key, None)
+
+    def reserve(self, key: str, *, count: int = 1) -> SlotReservation:
+        """Atomically reserve capacity and hourly quota for ``key``.
+
+        Returns a ``SlotReservation`` context manager whose unconsumed units are
+        released on exit or explicit ``release()``. Raises ``LinkLimited`` if
+        capacity or hourly quota is exhausted.
+        """
+        if count < 1:
+            raise ValueError("count must be at least 1")
+        now = self._clock()
+        with self._lock:
+            made = self._prune_made_locked(key, now)
+            if len(made) + self._reserved_quota.get(key, 0) + count > self.links_per_hour:
+                raise LinkLimited(key)
+            self._expire(now)
+            if len(self._retired) + self._reserved_slots + count > self.max_links:
+                raise LinkLimited(key)
+            self._reserved_slots += count
+            self._reserved_quota[key] = self._reserved_quota.get(key, 0) + count
+        return SlotReservation(key=key, count=count, _relay=self)
+
+    def is_draining(self, key: str) -> bool:
+        """Return True while a ``replace`` or ``drain_and_purge`` is in progress for ``key``."""
+        with self._lock:
+            return self._draining.get(key, 0) > 0
+
+    def snapshot(self, key: str) -> KeySnapshot:
+        """Non-blocking snapshot of active, retired, and draining state for ``key``.
+
+        Never acquires ``link.lock``, so status reads cannot block while
+        ``backend.close()`` or a hook is running.
+        """
+        now = self._clock()
+        with self._lock:
+            self._expire(now)
+            active = tuple(link for link in self._links.values() if link.key == key)
+            retired = tuple(link for link in self._retired.values() if link.key == key)
+            draining = self._draining.get(key, 0) > 0
+        return KeySnapshot(key=key, active=active, retired=retired, draining=draining)
+
+    def create(
+        self,
+        key: str,
+        *,
+        params: dict[str, Any] | None = None,
+        label: str | None = None,
+        context: AttemptContext | None = None,
+        reservation: SlotReservation | None = None,
+    ) -> Link:
         """A link for ``key`` (what it signs in: an account, a site); it replaces any open link of that key.
         ``params`` go to the login service with each start; ``label`` is what the page names (default: the key)."""
         if self._authorize is not None and (context is None or not context.owner):
             raise ValueError("authenticated links require a host-assigned owner")
         now = self._clock()
-        evicted_retired: list[Link] = []
         with self._lock:
-            made = self._made.setdefault(key, collections.deque())
-            while made and now - made[0] > 3600:
-                made.popleft()
-            if len(made) >= self.links_per_hour:
-                raise LinkLimited(key)
-            self._expire(now)
-            if len(self._retired) >= self.max_links:
-                raise LinkLimited(key)
-            made.append(now)
-            to_retire: list[Link] = []
-            replaced = [link for link in self._links.values() if link.key == key]
-            for link in replaced:
-                self._links.pop(link.id, None)
-                link.closed = True
-                link.view_token = None
-                if link.window_id is not None:
-                    self._track_retired_locked(link)
-                    if link.state != "saving":
-                        to_retire.append(link)
-            while len(self._links) >= self.max_links:
-                oldest = self._links.pop(min(self._links.values(), key=lambda link: link.created).id)
-                oldest.closed = True
-                oldest.view_token = None
-                if oldest.window_id is not None:
-                    self._track_retired_locked(oldest)
-                    if oldest.state != "saving":
-                        to_retire.append(oldest)
-            link_id = secrets.token_urlsafe(24)
-            link = Link(link_id, key, now, now + self.link_ttl, f"{self.public_url}/{link_id}", dict(params or {}),
-                        key if label is None else label)  # fmt: skip
-            self._links[link.id] = link
-            link.context = context
+            link, to_retire = self._create_locked(
+                key,
+                now,
+                params=params,
+                label=label,
+                context=context,
+                reservation=reservation,
+            )
         for old in to_retire:
             threading.Thread(target=self._retire, args=(old,), daemon=True).start()
-        for old in evicted_retired:
-            threading.Thread(target=self._retire, args=(old,), kwargs={"force": True}, daemon=True).start()
         log.info("a sign-in link for %s", key)
         return link
+
+    def replace(
+        self,
+        key: str,
+        spec: LinkSpec | None = None,
+        *,
+        replace_id: str | None = None,
+        completed_states: Collection[str] = FINAL,
+        on_commit: Callable[[Link], Any] | None = None,
+        reservation: SlotReservation | None = None,
+        extra_links: Iterable[Link] = (),
+    ) -> ReplaceResult:
+        """Fenced drain-and-replace lifecycle for ``key``.
+
+        Atomically reserves capacity and hourly quota (unless ``reservation`` is
+        provided), validates optional ``replace_id``, protects ``saving`` and
+        in-flight ``completed_states`` links, drains prior links outside
+        ``self._lock``, rechecks post-drain state, creates the replacement link,
+        and invokes optional ``on_commit`` (rolling back the new link and its
+        quota if ``on_commit`` raises).
+        """
+        link_spec = spec or LinkSpec()
+        if self._authorize is not None and (link_spec.context is None or not link_spec.context.owner):
+            raise ValueError("authenticated links require a host-assigned owner")
+        own_reservation: SlotReservation | None = None
+        if reservation is None:
+            own_reservation = self.reserve(key)
+            active_res = own_reservation
+        else:
+            if reservation._relay is not self or reservation.key != key:
+                raise ValueError("reservation does not match this relay and key")
+            if reservation._remaining <= 0:
+                raise ValueError("reservation already consumed or released")
+            active_res = reservation
+
+        draining_entered = False
+        try:
+            now = self._clock()
+            with self._lock:
+                self._expire(now)
+                seen: dict[str, Link] = {}
+                for item in self._links.values():
+                    if item.key == key:
+                        seen[item.id] = item
+                for item in self._retired.values():
+                    if item.key == key:
+                        seen[item.id] = item
+                for item in extra_links:
+                    if item.key == key:
+                        seen[item.id] = item
+                previous = list(seen.values())
+
+                if replace_id is not None:
+                    target = self._links.get(replace_id)
+                    if (
+                        target is None
+                        or target.key != key
+                        or target.closed
+                        or target.state not in ("ready", "starting", "waiting")
+                    ):
+                        preserved = target if (target is not None and target.key == key) else None
+                        return ReplaceResult(outcome="stale_target", preserved=preserved)
+
+                saving_pre = next((old for old in previous if old.state == "saving"), None)
+                if saving_pre is not None:
+                    return ReplaceResult(outcome="saving", preserved=saving_pre, still_open=(saving_pre,))
+
+                self._draining[key] = self._draining.get(key, 0) + 1
+                draining_entered = True
+                for old in previous:
+                    old.closed = True
+
+            already_completed: set[str] = set()
+            for old in previous:
+                if old.id == replace_id:
+                    continue
+                if old.lock.acquire(blocking=False):
+                    try:
+                        if old.window_id is None and not old.closing and old.state in completed_states:
+                            already_completed.add(old.id)
+                    finally:
+                        old.lock.release()
+
+            drained_links: list[Link] = []
+            still_open_links: list[Link] = []
+            saving_link: Link | None = None
+            completed_link: Link | None = None
+            for old in previous:
+                open_now, is_saving, is_completed = self._drain_link(old, completed_states)
+                if is_saving:
+                    if saving_link is None:
+                        saving_link = old
+                    still_open_links.append(old)
+                elif open_now:
+                    still_open_links.append(old)
+                elif is_completed and old.id not in already_completed:
+                    if completed_link is None:
+                        completed_link = old
+                else:
+                    drained_links.append(old)
+
+            if saving_link is not None:
+                return ReplaceResult(
+                    outcome="saving",
+                    preserved=saving_link,
+                    drained=tuple(drained_links),
+                    still_open=tuple(still_open_links),
+                )
+            if still_open_links:
+                return ReplaceResult(
+                    outcome="closing",
+                    drained=tuple(drained_links),
+                    still_open=tuple(still_open_links),
+                )
+            if completed_link is not None:
+                return ReplaceResult(
+                    outcome="completed",
+                    preserved=completed_link,
+                    drained=tuple(drained_links),
+                )
+
+            now = self._clock()
+            with self._lock:
+                self._expire(now)
+                if replace_id is not None:
+                    newer = next(
+                        (
+                            item
+                            for item in self._links.values()
+                            if item.key == key and item.id != replace_id and not item.closed
+                        ),
+                        None,
+                    )
+                    if newer is not None:
+                        return ReplaceResult(
+                            outcome="stale_target",
+                            preserved=newer,
+                            drained=tuple(drained_links),
+                        )
+                for item in (*self._links.values(), *self._retired.values()):
+                    if item.key != key:
+                        continue
+                    if item.state == "saving":
+                        return ReplaceResult(
+                            outcome="saving",
+                            preserved=item,
+                            drained=tuple(drained_links),
+                            still_open=(item,),
+                        )
+                    if item.state in completed_states and item.id not in already_completed:
+                        return ReplaceResult(
+                            outcome="completed",
+                            preserved=item,
+                            drained=tuple(drained_links),
+                        )
+                new_link, to_retire = self._create_locked(
+                    key,
+                    now,
+                    params=link_spec.params,
+                    label=link_spec.label,
+                    context=link_spec.context,
+                    reservation=active_res,
+                )
+
+            for old in to_retire:
+                threading.Thread(target=self._retire, args=(old,), daemon=True).start()
+            if on_commit is not None:
+                try:
+                    on_commit(new_link)
+                except BaseException:
+                    self._rollback_link(new_link)
+                    raise
+            log.info("a sign-in link for %s", key)
+            return ReplaceResult(outcome="created", link=new_link, drained=tuple(drained_links))
+        finally:
+            if draining_entered:
+                self._exit_draining(key)
+            if own_reservation is not None:
+                own_reservation.release()
+
+    def drain_and_purge(
+        self,
+        key: str,
+        *,
+        predicate: Callable[[Link], bool] | None = None,
+        before_purge: Callable[[], Any] | None = None,
+        extra_links: Iterable[Link] = (),
+    ) -> DrainResult:
+        """Drain matching links for ``key`` and purge finished ones from ``_links`` and ``_retired``.
+
+        Purged links are marked ``_purged = True`` so concurrent ``_retire()``
+        or ``tick()`` calls cannot re-insert them into ``_retired``. Links that
+        are still ``saving`` or open are preserved.
+        """
+        with self._lock:
+            self._draining[key] = self._draining.get(key, 0) + 1
+        try:
+            now = self._clock()
+            with self._lock:
+                self._expire(now)
+                seen: dict[str, Link] = {}
+                for item in self._links.values():
+                    if item.key == key:
+                        seen[item.id] = item
+                for item in self._retired.values():
+                    if item.key == key:
+                        seen[item.id] = item
+                for item in extra_links:
+                    if item.key == key:
+                        seen[item.id] = item
+                candidates = list(seen.values())
+
+            targets = [link for link in candidates if predicate is None or predicate(link)]
+            to_purge: list[Link] = []
+            preserved: list[Link] = []
+            still_open: list[Link] = []
+            for link in targets:
+                link.closed = True
+                self.cancel(link)
+                with link.lock:
+                    is_saving = link.state == "saving"
+                    open_now = link.window_id is not None or link.closing or link.state in ACTIVE
+                if is_saving:
+                    preserved.append(link)
+                    still_open.append(link)
+                elif open_now:
+                    still_open.append(link)
+                else:
+                    to_purge.append(link)
+
+            if before_purge is not None:
+                before_purge()
+
+            purged: list[Link] = []
+            with self._lock:
+                for link in to_purge:
+                    link.closed = True
+                    link._purged = True
+                    link.view_token = None
+                    self._links.pop(link.id, None)
+                    self._retired.pop(link.id, None)
+                    purged.append(link)
+            return DrainResult(
+                purged=tuple(purged),
+                preserved=tuple(preserved),
+                still_open=tuple(still_open),
+            )
+        finally:
+            self._exit_draining(key)
 
     def links(self, key: str) -> list[Link]:
         """The open links of ``key``."""
@@ -482,7 +982,7 @@ class Relay:
         if not link.lock.acquire(blocking=False):
             return  # another poll is already on it
         try:
-            if link.closing or link.state not in ACTIVE or link.window_id is None:
+            if link._purged or link.closing or link.state not in ACTIVE or link.window_id is None:
                 return
             now = self._clock()
             try:

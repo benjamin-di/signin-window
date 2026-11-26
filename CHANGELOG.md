@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.12.0] - 2026-11-27
+
+### Added
+
+- Add native fenced sign-in lifecycle API on `signin_window.relay.Relay` (`SlotReservation`, `LinkSpec`, `ReplaceResult`, `DrainResult`, `KeySnapshot`, `Link._purged`, `reserve()`, `replace()`, `drain_and_purge()`, `snapshot()`, and `is_draining()`) with a deterministic barrier-driven concurrency test suite covering reservation/quota leaks, `saving`/completed protection, stale `replace_id` races, and non-blocking snapshots with `_purged` re-insertion guards.
+
+### Upgrade
+
+- Action required: none.
+- Rollback: compatible with 0.11.4 and 0.11.3; additive Relay API with no storage, route, or wire-format changes.
+
 ## [0.11.4] - 2026-11-26
 
 ### Fixed

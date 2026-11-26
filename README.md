@@ -411,6 +411,24 @@ footer. Provider-hosted pages remain the provider's content.
 The relay talks to the login service through `LoginClient`; any object with the same methods (`Backend`) works,
 for a login service of another shape.
 
+### Fenced link lifecycle (`reserve`, `replace`, `drain_and_purge`, `snapshot`)
+
+Applications that coordinate sign-in replacement, disconnect teardown, and live status pages can use the built-in
+lifecycle methods on `Relay` instead of subclassing it or touching private state:
+
+- `relay.reserve(key, count=1) -> SlotReservation`: atomically reserves capacity and hourly quota before teardown; use
+  as a context manager (or call `release()`) so exceptions and cancellations never leak slots or quota. Pass the handle
+  to `create(..., reservation=res)` or `replace(..., reservation=res)`.
+- `relay.replace(key, spec, *, replace_id=None, completed_states=("connected",), on_commit=None) -> ReplaceResult`:
+  marks `key` draining, validates an optional `replace_id` fence without tearing down newer links, preserves `saving`
+  and newly completed links across drain, creates the replacement link from `LinkSpec`, and runs `on_commit(link)`
+  (rolling back the new link and its hourly quota if `on_commit` raises).
+- `relay.drain_and_purge(key, *, predicate=None, before_purge=None) -> DrainResult`: drains matching links for `key`,
+  runs `before_purge()`, and purges finished links from active and retired tracking while guarding against concurrent
+  retirement re-insertion; `saving` and still-open links are preserved.
+- `relay.snapshot(key) -> KeySnapshot` and `relay.is_draining(key) -> bool`: return point-in-time active, retired, and
+  draining state without acquiring any `link.lock`, so status reads never block on a slow `backend.close()`.
+
 ## Security
 
 - The login service never faces the internet: put it on a private network with your server. Every route but
