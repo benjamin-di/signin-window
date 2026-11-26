@@ -502,8 +502,10 @@ def test_second_device_sign_in_preserves_existing_browser_session_and_disconnect
     manager, provider = direct
     short = DirectOAuthManager(manager.config, tmp_path / "multi-device", required_groups={"example-app"})
     laptop_cookie, laptop_session = complete(short, provider, "user-a", begin(short, provider, "user-a"))
+    rev_after_first = short.revision("user-a")
     phone_cookie, phone_session = complete(short, provider, "user-a", begin(short, provider, "user-a"))
 
+    assert short.revision("user-a") == rev_after_first
     assert laptop_cookie != phone_cookie
     assert short.browser_session(laptop_cookie) == laptop_session
     assert short.browser_session(phone_cookie) == phone_session

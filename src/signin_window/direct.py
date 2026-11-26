@@ -285,9 +285,8 @@ class DirectOAuthManager(OAuthManager):
                 ):
                     raise OAuthError()
                 was_connected = account["status"] == "connected"
-                account.update(
-                    subject=grant["subject"], generation=str(int(account["generation"]) + 1), status="connected"
-                )
+                next_generation = account["generation"] if was_connected else str(int(account["generation"]) + 1)
+                account.update(subject=grant["subject"], generation=next_generation, status="connected")
                 csrf = secrets.token_urlsafe(32)
                 kind = "direct-browser" if session["owner"] is not None else "direct-entry"
                 incoming_digest = _hash(kind + ":" + cookie)

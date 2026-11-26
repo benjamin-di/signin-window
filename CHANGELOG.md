@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.11.2] - 2026-11-26
+
+### Fixed
+
+- Keep `account["generation"]` unchanged in `DirectOAuthManager.finish_direct_callback()` when an already-connected owner signs in on another device or refreshes a browser session for the same subject, eliminating spurious grant-revision churn while preserving generation advancement on first connect, disconnect, and reconnect from `uncertain`.
+
+### Upgrade
+
+- Action required: none.
+- Rollback: compatible with 0.11.1.
+
 ## [0.11.1] - 2026-11-26
 
 ### Fixed
