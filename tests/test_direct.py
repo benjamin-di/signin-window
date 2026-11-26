@@ -606,3 +606,24 @@ def test_current_identity_prove_split_and_prove_owner_helper(direct):
     manager.required_groups = frozenset({"missing-group"})
     with pytest.raises(OAuthError):
         manager.current_identity("user-a", prove=False)
+
+
+@pytest.mark.asyncio
+async def test_browser_session_survives_in_flight_token_refresh(direct):
+    import asyncio
+    import threading
+
+    manager, provider = direct
+    provider.expires = 60
+    cookie, session = complete(manager, provider, "user-a", begin(manager, provider, "user-a"))
+    provider.expires = 900
+    provider.refresh_entered, provider.refresh_release = threading.Event(), threading.Event()
+    refreshing = asyncio.create_task(asyncio.to_thread(manager.access_token, "user-a", 400))
+    assert await asyncio.to_thread(provider.refresh_entered.wait, 5)
+    try:
+        assert manager.connected("user-a") is True
+        assert manager.browser_session(cookie) == session
+    finally:
+        provider.refresh_release.set()
+        await refreshing
+    assert manager.browser_session(cookie) == session

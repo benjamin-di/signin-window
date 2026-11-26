@@ -336,6 +336,9 @@ class OAuthManager:
         self._keys_cache = {}
         self._http_lock = threading.Lock()
         self._http_slot = None
+        self._refresh_lock = threading.Lock()
+        self._refreshing: dict[str, str] = {}
+        self._refresh_seq = 0
         self._client_kid = (
             public_client_jwk(self.config.client_private_key)["kid"]
             if self.config.client_private_key is not None
@@ -491,7 +494,20 @@ class OAuthManager:
             write(conn)
 
     def connected(self, owner):
-        return self._account(_owner(owner))["status"] == "connected"
+        owner = _owner(owner)
+        while True:
+            with self._refresh_lock:
+                seq = self._refresh_seq
+            account = self._account(owner)
+            if account["status"] == "connected":
+                return True
+            if account["status"] != "uncertain":
+                return False
+            with self._refresh_lock:
+                if self._refreshing.get(owner) == account["generation"]:
+                    return True
+                if self._refresh_seq == seq:
+                    return False
 
     def revision(self, owner):
         return self._account(_owner(owner))["generation"]
@@ -986,25 +1002,37 @@ class OAuthManager:
                 raise OAuthError() from None
             # Commit uncertainty BEFORE a one-use refresh leaves this process.
             # A crash/cancellation cannot leave an old access token usable later.
-            account["status"] = "uncertain"
-            self._save(account, grant)
+            # Record the in-flight refresh generation in memory so non-blocking
+            # connected() checks in this live process do not mistake a healthy
+            # refresh for authority loss while crash recovery still sees uncertain.
+            owner_key = account["owner"]
+            refresh_generation = account["generation"]
+            with self._refresh_lock:
+                self._refreshing[owner_key] = refresh_generation
             try:
-                with self._client() as client:
-                    token = client.refresh_token(
-                        metadata["token_endpoint"],
-                        refresh_token=grant["token"]["refresh_token"],
-                        resource=self.config.resource,
-                    )
-                new = self._validate(token, metadata, grant["nonce"], subject=account["subject"])
-                # Persist the validated rotated grant BEFORE checking caller-specific minimum_ttl,
-                # so a caller requesting a longer lifetime does not discard a valid rotation.
-                account["status"] = "connected"
-                self._save(account, new)
-            except BaseException:
                 account["status"] = "uncertain"
-                account["generation"] = str(int(account["generation"]) + 1)
                 self._save(account, grant)
-                raise OAuthError() from None
+                try:
+                    with self._client() as client:
+                        token = client.refresh_token(
+                            metadata["token_endpoint"],
+                            refresh_token=grant["token"]["refresh_token"],
+                            resource=self.config.resource,
+                        )
+                    new = self._validate(token, metadata, grant["nonce"], subject=account["subject"])
+                    # Persist the validated rotated grant BEFORE checking caller-specific minimum_ttl,
+                    # so a caller requesting a longer lifetime does not discard a valid rotation.
+                    account["status"] = "connected"
+                    self._save(account, new)
+                except BaseException:
+                    account["status"] = "uncertain"
+                    account["generation"] = str(int(account["generation"]) + 1)
+                    self._save(account, grant)
+                    raise OAuthError() from None
+            finally:
+                with self._refresh_lock:
+                    self._refreshing.pop(owner_key, None)
+                    self._refresh_seq += 1
             if new["expires_at"] < time.time() + minimum_ttl:
                 raise OAuthError()
             return new["token"]["access_token"]

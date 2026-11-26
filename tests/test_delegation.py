@@ -843,7 +843,7 @@ def test_callback_errors_consume_state_preserve_grant_and_never_use_userinfo(man
 
 
 @pytest.mark.asyncio
-async def test_status_reads_never_wait_for_a_live_refresh_or_block_the_event_loop(manager, provider):
+async def test_status_reads_never_wait_for_a_live_refresh_or_block_the_event_loop(manager, provider, config, tmp_path):
     import threading
 
     provider.expires = 60
@@ -854,10 +854,13 @@ async def test_status_reads_never_wait_for_a_live_refresh_or_block_the_event_loo
     assert await asyncio.to_thread(provider.refresh_entered.wait, 5)
     started = time.monotonic()
     try:
-        # The refresh has committed uncertainty but is still waiting on I/O
-        # while holding the owner flock. These calls deliberately run on-loop.
-        assert manager.connected("user-a") is False
+        # The refresh has committed on-disk uncertainty for crash safety while
+        # still waiting on I/O under the owner flock. Live status checks on this
+        # manager must stay connected without waiting on the lock, while a fresh
+        # process instance (simulating crash recovery) still sees uncertain.
+        assert manager.connected("user-a") is True
         assert manager.revision("user-a") == "1"
+        assert OAuthManager(config, tmp_path).connected("user-a") is False
         assert time.monotonic() - started < 0.1
         progressed = asyncio.Event()
         asyncio.get_running_loop().call_soon(progressed.set)
@@ -866,6 +869,76 @@ async def test_status_reads_never_wait_for_a_live_refresh_or_block_the_event_loo
         provider.refresh_release.set()
         await reading
     assert manager.connected("user-a") and manager.revision("user-a") == "1"
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_clears_inflight_state_and_reports_disconnected(manager, provider):
+    import threading
+
+    provider.expires = 60
+    connected(manager, provider, "user-a")
+    provider.fail_refresh = True
+    provider.refresh_entered, provider.refresh_release = threading.Event(), threading.Event()
+    reading = asyncio.create_task(asyncio.to_thread(manager.access_token, "user-a", 400))
+    assert await asyncio.to_thread(provider.refresh_entered.wait, 5)
+    try:
+        assert manager.connected("user-a") is True
+        assert manager.revision("user-a") == "1"
+    finally:
+        provider.refresh_release.set()
+        with pytest.raises(OAuthError):
+            await reading
+    assert manager.connected("user-a") is False
+    assert manager.revision("user-a") == "2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_refresh,expected", [(False, True), (True, False)])
+async def test_connected_retries_when_refresh_completes_after_account_snapshot(
+    manager, provider, monkeypatch, fail_refresh, expected
+):
+    import threading
+
+    provider.expires = 60
+    connected(manager, provider, "user-a")
+    provider.expires = 900
+    provider.fail_refresh = fail_refresh
+    provider.refresh_entered, provider.refresh_release = threading.Event(), threading.Event()
+    refresh_done = threading.Event()
+
+    def run_refresh():
+        try:
+            manager.access_token("user-a", 400)
+        except OAuthError:
+            if not fail_refresh:
+                raise
+        finally:
+            refresh_done.set()
+
+    worker = threading.Thread(target=run_refresh)
+    worker.start()
+    assert await asyncio.to_thread(provider.refresh_entered.wait, 5)
+
+    real_account = manager._account
+    first_read = True
+
+    def paused_account(owner):
+        nonlocal first_read
+        acct = real_account(owner)
+        if first_read and acct["status"] == "uncertain":
+            first_read = False
+            # Let the in-flight refresh finish and clear _refreshing before connected() checks _refresh_lock.
+            provider.refresh_release.set()
+            assert refresh_done.wait(5)
+        return acct
+
+    monkeypatch.setattr(manager, "_account", paused_account)
+    try:
+        assert manager.connected("user-a") is expected
+    finally:
+        provider.refresh_release.set()
+        worker.join(5)
+    assert not first_read
 
 
 def test_status_snapshot_reads_ignore_another_process_owner_lock(manager, config, tmp_path):

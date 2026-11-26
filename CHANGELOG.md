@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.11.4] - 2026-11-26
+
+### Fixed
+
+- Exclude private Jenkins release test (`tests/test_ci_release.py`) from public mirror export via `.gitattributes` so `0.11.3`'s in-flight token-refresh `connected()` fix can publish to the public mirror and PyPI.
+
+### Upgrade
+
+- Action required: none.
+- Rollback: compatible with 0.11.3 and 0.11.2.
+
+## [0.11.3] - 2026-11-26
+
+### Fixed
+
+- Keep `OAuthManager.connected()` returning `True` while an in-process `access_token()` refresh is actively in flight for the same grant generation, preventing background authority reconcilers and `DirectOAuthManager.browser_session()` from mistaking a routine hourly token refresh for authority loss while preserving on-disk `uncertain` crash-recovery semantics and immediate `False` on refresh failure.
+
+### Upgrade
+
+- Action required: none.
+- Rollback: compatible with 0.11.2.
+
 ## [0.11.2] - 2026-11-26
 
 ### Fixed
