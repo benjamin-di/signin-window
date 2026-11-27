@@ -616,3 +616,80 @@ def test_suite_comes_from_the_deployment_directory_and_only_for_a_signed_in_visi
     assert seen[0] is None
     assert [(link.label, link.current) for link in seen[1].links] == [("App", True), ("Ledger", False)]
     assert seen[1].name == "Example" and seen[1].account == "Example One"
+
+
+def test_custom_root_home_redirects_to_root_and_scopes_page_headers(tmp_path):
+    provider = Provider()
+    config = OIDCConfig(
+        provider.issuer, "example-app", "https://app.example.com", tmp_path / "browser", required_group="example-users"
+    )
+    auth = BrowserAuth(config, transport=provider.transport(), home="/")
+    assert auth.home == "/"
+    assert auth.step_up_url() == "/connections/login?reauth=1"
+
+    async def index(_request):
+        return JSONResponse({"ok": True})
+
+    async def mcp(_request):
+        return JSONResponse({"mcp": True})
+
+    app = auth.middleware(Starlette(routes=[Route("/", index), Route("/mcp", mcp), *auth.routes()]))
+    with TestClient(app, base_url=config.public_url, follow_redirects=False) as client:
+        callback = sign_in(provider, client)
+        assert callback.status_code == 303
+        assert callback.headers["location"] == "/"
+
+        root = client.get("/")
+        assert root.status_code == 200
+        assert root.headers["x-frame-options"] == "DENY"
+        assert "frame-ancestors 'none'" in root.headers["content-security-policy"]
+
+        other = client.get("/mcp")
+        assert other.status_code == 200
+        assert "x-frame-options" not in other.headers
+        assert "content-security-policy" not in other.headers
+
+        refused = client.post("/connections/logout", headers={"origin": "https://other.example.com"})
+        assert refused.status_code == 403
+        assert 'href="/"' in refused.text
+
+
+@pytest.mark.parametrize(
+    "bad_home",
+    [
+        "",
+        "relative",
+        "//evil.example.com",
+        "/\\evil.example.com",
+        "/a\x00b",
+        "/../escape",
+        "/a?x=1",
+        "/a#b",
+        "/a b",
+        "/connections/login",
+        "/connections/callback/",
+        "/connections/logout",
+    ],
+)
+def test_invalid_home_path_is_refused(tmp_path, bad_home):
+    provider = Provider()
+    config = OIDCConfig(provider.issuer, "example-app", "https://app.example.com", tmp_path / "browser")
+    with pytest.raises(ValueError, match="Browser home"):
+        BrowserAuth(config, transport=provider.transport(), home=bad_home)
+
+
+def test_prefixed_custom_home_applies_page_headers_on_stripped_local_path(tmp_path):
+    provider = Provider()
+    config = OIDCConfig(provider.issuer, "example-app", "https://app.example.com/app", tmp_path / "browser")
+    auth = BrowserAuth(config, transport=provider.transport(), home="/")
+    assert auth.home == "/app/"
+
+    async def index(_request):
+        return JSONResponse({"ok": True})
+
+    app = auth.middleware(Starlette(routes=[Route("/", index), *auth.routes()]))
+    with TestClient(app, base_url="https://app.example.com", follow_redirects=False) as client:
+        response = client.get("/")
+        assert response.status_code == 200
+        assert response.headers["x-frame-options"] == "DENY"
+        assert "frame-ancestors 'none'" in response.headers["content-security-policy"]

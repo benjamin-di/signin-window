@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.15.0] - 2026-11-27
+
+### Added
+
+- Add optional `home` keyword parameter to `BrowserAuth` (defaulting to `/connections/`) so dedicated browser origins can serve their home page at `/` while keeping OIDC login, callback, and logout routes under `/connections/`. Invalid paths and collisions with `/connections/{login,callback,logout}` are refused.
+- Scope `BrowserAuth.middleware()` `PAGE_HEADERS` injection to exact `auth.home` and the unprefixed local `home` path in addition to `/connections/*`, preserving security headers behind prefix-stripping proxies without affecting sibling routes.
+
+### Upgrade
+
+- Action required: None. Existing callers keep `/connections/` by default.
+- Rollback: compatible with `v0.14.0`.
+
 ## [0.14.0] - 2026-11-27
 
 ### Changed

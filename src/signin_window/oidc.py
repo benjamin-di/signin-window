@@ -312,7 +312,15 @@ class BrowserAuth:
         on_sign_in=None,
         identity: PageIdentity | None = None,
         suite: SuiteDirectory | None = None,
+        home: str = "/connections/",
     ):
+        if (
+            not isinstance(home, str)
+            or not re.fullmatch(r"/(?:[A-Za-z0-9_.~-]+/)*[A-Za-z0-9_.~-]*", home)
+            or any(segment in (".", "..") for segment in home.split("/"))
+            or home.rstrip("/") in ("/connections/login", "/connections/callback", "/connections/logout")
+        ):
+            raise ValueError("Browser home must be a clean local path starting with /")
         self.config = config
         self.page_identity = identity
         self.suite_directory = suite if suite is not None else _suite_from_environment()
@@ -323,7 +331,8 @@ class BrowserAuth:
             config.cookie_name.removeprefix("__Host-") + "-test" if config.allow_loopback_http else config.cookie_name
         )
         self.prefix = urlsplit(config.public_url).path.rstrip("/")
-        self.home = self.prefix + "/connections/"
+        self._local_home = home
+        self.home = self.prefix + home
         self.origin = "{0.scheme}://{0.netloc}".format(urlsplit(config.public_url))
         self.oauth = OAuth()
         kwargs = {
@@ -686,7 +695,10 @@ class BrowserAuth:
                             secure=not auth.config.allow_loopback_http,
                         )
                         message.setdefault("headers", []).append((b"set-cookie", cookie.headers["set-cookie"].encode()))
-                    if scope.get("path", "").startswith((auth.prefix + "/connections/", "/connections/")):
+                    path = scope.get("path", "")
+                    if path in (auth.home, auth._local_home) or path.startswith(
+                        (auth.prefix + "/connections/", "/connections/")
+                    ):
                         headers = message.setdefault("headers", [])
                         present = {name.lower() for name, _ in headers}
                         headers.extend(
