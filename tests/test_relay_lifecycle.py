@@ -8,6 +8,8 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
+from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from signin_window.client import LoginUnavailable
 from signin_window.page import PageText
@@ -34,6 +36,7 @@ class ControlledBackend:
         self.results: dict[str, dict[str, Any]] = {}
         self.on_close: Callable[[str, bool], None] | None = None
         self.on_state: Callable[[str], dict[str, Any] | None] | None = None
+        self.on_bridge: Callable[[str, str, Any], Any] | None = None
 
     def start(self, layout: str = "desktop", **params: Any) -> dict[str, Any]:
         window_id = f"win-{len(self.started):06d}"
@@ -67,6 +70,9 @@ class ControlledBackend:
         return 404, b"", "text/plain"
 
     async def bridge(self, window_id: str, view_token: str, ws: Any) -> None:
+        if self.on_bridge is not None:
+            await self.on_bridge(window_id, view_token, ws)
+            return None
         return None
 
 
@@ -576,3 +582,752 @@ def test_drain_and_purge_prevents_concurrent_retire_and_tick_reinsertion():
     relay.tick()
     assert relay.snapshot("alice").retired == ()
     assert old.id not in relay._retired
+
+
+# ---------------------------------------------------------------------------
+# Surviving links stay open: drains fence links instead of closing them early
+# ---------------------------------------------------------------------------
+
+
+def test_replace_keeps_saving_link_open_and_state_route_stays_reachable():
+    backend = ControlledBackend()
+
+    def authorize(request: Any, link: Link, _op: str) -> bool:
+        return not link.closed and request.headers.get("x-actor") == (link.context.owner if link.context else "")
+
+    relay, backend, _ = make_relay(backend=backend, links_per_hour=4, authorize=authorize)
+    old = relay.create("alice", context=AttemptContext(owner="alice"))
+    win_id = open_window(relay, old)
+
+    def transition_to_saving(wid: str, cancel_only: bool) -> None:
+        if wid == win_id and cancel_only:
+            backend.states[wid] = {"state": "saving", "host": "accounts.example.com"}
+
+    backend.on_close = transition_to_saving
+
+    result = relay.replace("alice", LinkSpec(context=AttemptContext(owner="alice")))
+    assert result.outcome == "saving"
+    assert result.preserved is old
+    assert old.closed is False
+
+    with TestClient(relay.app(), base_url="https://mcp.example.com") as client:
+        resp = client.get(f"/{old.id}/state", headers={"x-actor": "alice"})
+        assert resp.status_code == 200
+        assert resp.json()["state"] == "saving"
+
+
+def test_replace_closes_stuck_teardown_and_keeps_completed_and_exception_survivors_open():
+    # Case A: closing (backend close unavailable) marks the stuck-teardown link closed.
+    relay, backend, _ = make_relay(links_per_hour=4)
+    old = relay.create("alice")
+    open_window(relay, old)
+    backend.on_close = lambda _wid, _cancel_only: (_ for _ in ()).throw(LoginUnavailable("down"))
+
+    res_closing = relay.replace("alice", LinkSpec())
+    assert res_closing.outcome == "closing"
+    assert old in res_closing.still_open
+    # A link whose requested teardown is still in flight is dying, so it is closed (as before this change).
+    assert old.closed is True
+
+    # Case B: a link completed in flight is preserved and stays open.
+    hook_entered = threading.Event()
+    release_hook = threading.Event()
+
+    def on_signed_in(_link: Link, _session: dict[str, Any]) -> str:
+        hook_entered.set()
+        assert release_hook.wait(timeout=5)
+        return "connected"
+
+    relay2, backend2, _ = make_relay(links_per_hour=4, on_signed_in=on_signed_in)
+    old2 = relay2.create("alice")
+    win2 = open_window(relay2, old2)
+    backend2.states[win2] = {"state": "signed_in", "host": "accounts.example.com"}
+    backend2.results[win2] = {"ok": True}
+
+    adv_thread = threading.Thread(target=relay2.advance, args=(old2,))
+    adv_thread.start()
+    assert hook_entered.wait(timeout=5)
+
+    out: list[ReplaceResult] = []
+    rep_thread = threading.Thread(target=lambda: out.append(relay2.replace("alice", LinkSpec())))
+    rep_thread.start()
+    waiter = threading.Event()
+    for _ in range(500):
+        if relay2.is_draining("alice"):
+            break
+        waiter.wait(0.002)
+    assert relay2.is_draining("alice")
+
+    release_hook.set()
+    adv_thread.join(timeout=5)
+    rep_thread.join(timeout=5)
+    assert out[0].outcome == "completed"
+    assert out[0].preserved is old2
+    assert old2.closed is False
+
+    # Case C: unexpected exception during drain leaves the drained link closed and the unreached link open.
+    relay3, backend3, _ = make_relay(links_per_hour=4)
+    drained_old = relay3.create("alice")
+    win_ok = open_window(relay3, drained_old)
+    boom_old = Link(
+        id="b" * 32,
+        key="alice",
+        created=1_000_000.0,
+        expires=1_001_200.0,
+        url="https://mcp.example.com/connect/" + "b" * 32,
+        state="waiting",
+        window_id="win-boom",
+        closed=False,
+    )
+    backend3.states["win-boom"] = {"state": "waiting", "host": "accounts.example.com"}
+
+    def selective_boom(wid: str, cancel_only: bool) -> None:
+        if wid == win_ok:
+            backend3.states[wid] = {"state": "cancelled"}
+            return
+        raise RuntimeError("unexpected backend crash")
+
+    backend3.on_close = selective_boom
+
+    with pytest.raises(RuntimeError, match="unexpected backend crash"):
+        relay3.replace("alice", LinkSpec(), extra_links=(boom_old,))
+
+    assert drained_old.closed is True
+    assert boom_old.closed is False
+    assert not relay3.is_draining("alice")
+    assert relay3._reserved_slots == 0
+    assert relay3._reserved_quota == {}
+
+
+def test_drain_and_purge_keeps_saving_link_open_and_closes_stuck_teardown():
+    backend = ControlledBackend()
+
+    def authorize(request: Any, link: Link, _op: str) -> bool:
+        return not link.closed and request.headers.get("x-actor") == (link.context.owner if link.context else "")
+
+    relay, backend, _ = make_relay(backend=backend, links_per_hour=6, authorize=authorize)
+
+    # Pre-existing saving link stays closed=False and reachable via state route.
+    saving_link = relay.create("alice", context=AttemptContext(owner="alice"))
+    win_s = open_window(relay, saving_link)
+    backend.states[win_s] = {"state": "saving", "host": "accounts.example.com"}
+    relay.advance(saving_link)
+
+    res_saving = relay.drain_and_purge("alice")
+    assert res_saving.purged == ()
+    assert res_saving.preserved == (saving_link,)
+    assert res_saving.still_open == (saving_link,)
+    assert saving_link.closed is False
+
+    with TestClient(relay.app(), base_url="https://mcp.example.com") as client:
+        resp = client.get(f"/{saving_link.id}/state", headers={"x-actor": "alice"})
+        assert resp.status_code == 200
+        assert resp.json()["state"] == "saving"
+
+    # Still-open link (backend unavailable) is marked closed but not purged; the drained link is closed and purged.
+    relay2, backend2, _ = make_relay(links_per_hour=6)
+    stuck = relay2.create("bob")
+    win_stuck = open_window(relay2, stuck)
+    drainable = Link(
+        id="d" * 32,
+        key="bob",
+        created=1_000_000.0,
+        expires=1_001_200.0,
+        url="https://mcp.example.com/connect/" + "d" * 32,
+        state="ready",
+        closed=False,
+    )
+
+    def fail_stuck(wid: str, _cancel_only: bool) -> None:
+        if wid == win_stuck:
+            raise LoginUnavailable("down")
+
+    backend2.on_close = fail_stuck
+    res_mixed = relay2.drain_and_purge("bob", extra_links=(drainable,))
+    assert res_mixed.purged == (drainable,)
+    assert res_mixed.still_open == (stuck,)
+    assert drainable.closed is True and drainable._purged is True
+    assert stuck.closed is True and stuck._purged is False
+
+
+# ---------------------------------------------------------------------------
+# Item 2: known_completed on Relay.replace()
+# ---------------------------------------------------------------------------
+
+
+def test_replace_known_completed_detects_just_completed_link_without_consuming_quota():
+    relay, backend, _ = make_relay(links_per_hour=2, on_signed_in=lambda _l, _s: "connected")
+    old = relay.create("alice")
+    win_id = open_window(relay, old)
+
+    # Consumer observed old while waiting (so known_completed is empty).
+    # Before replace() runs, a poller completes old.
+    backend.states[win_id] = {"state": "signed_in", "host": "accounts.example.com"}
+    backend.results[win_id] = {"cookies": [{"name": "sid", "value": "ok"}]}
+    relay.advance(old)
+    assert old.state == "connected" and old.window_id is None
+
+    res = relay.replace("alice", LinkSpec(), known_completed=())
+    assert res.outcome == "completed"
+    assert not res.created
+    assert res.link is None
+    assert res.preserved is old
+    assert old.closed is False
+    assert relay._reserved_slots == 0
+    assert relay._reserved_quota == {}
+    # Quota was not consumed: still 1 attempt remaining out of links_per_hour=2.
+    with relay.reserve("alice") as reservation:
+        assert reservation.active
+
+    # Once caller acknowledges old in known_completed, replacement succeeds.
+    res2 = relay.replace("alice", LinkSpec(), known_completed=(old.id,))
+    assert res2.outcome == "created"
+    assert res2.created and res2.link is not None and res2.link is not old
+    assert old.closed is True
+
+    # Default known_completed=None preserves previous behaviour (recomputes already_completed).
+    relay2, backend2, _ = make_relay(links_per_hour=3, on_signed_in=lambda _l, _s: "connected")
+    prior = relay2.create("alice")
+    win_p = open_window(relay2, prior)
+    backend2.states[win_p] = {"state": "signed_in", "host": "accounts.example.com"}
+    backend2.results[win_p] = {"ok": True}
+    relay2.advance(prior)
+    assert prior.state == "connected"
+
+    res_default = relay2.replace("alice", LinkSpec())
+    assert res_default.outcome == "created"
+    assert res_default.link is not None and res_default.link is not prior
+
+
+# ---------------------------------------------------------------------------
+# Item 3: Forced drain_and_purge()
+# ---------------------------------------------------------------------------
+
+
+def test_drain_and_purge_force_purges_stuck_link_revokes_token_ignores_late_completion_and_balances_capacity():
+    hook_calls: list[str] = []
+    relay, backend, clock = make_relay(
+        max_links=1,
+        links_per_hour=4,
+        on_signed_in=lambda link, _session: (hook_calls.append(link.id), "connected")[1],
+    )
+    stuck = relay.create("alice")
+    win_id = open_window(relay, stuck)
+    assert stuck.view_token is not None
+
+    backend.on_close = lambda _wid, _cancel_only: (_ for _ in ()).throw(LoginUnavailable("down"))
+
+    # Default force=False leaves stuck link open.
+    res_soft = relay.drain_and_purge("alice")
+    assert res_soft.purged == ()
+    assert res_soft.still_open == (stuck,)
+    assert stuck._purged is False
+
+    # force=True closes/revokes/purges stuck link from live and retired tracking.
+    res_force = relay.drain_and_purge("alice", force=True)
+    assert res_force.purged == (stuck,)
+    assert res_force.preserved == ()
+    assert res_force.still_open == ()
+    assert stuck.closed is True
+    assert stuck._purged is True
+    assert stuck.view_token is None
+    assert stuck.viewer_revoked is True
+    assert stuck.window_id is None
+    assert stuck.state == "cancelled"
+    assert relay.snapshot("alice").active == ()
+    assert relay.snapshot("alice").retired == ()
+    assert stuck.id not in relay._links
+    assert stuck.id not in relay._retired
+
+    # Late completion / poll / retire does nothing and never resurrects stuck.
+    backend.states[win_id] = {"state": "signed_in", "host": "accounts.example.com"}
+    backend.results[win_id] = {"cookies": [{"name": "sid", "value": "late"}]}
+    relay.advance(stuck)
+    relay._retire(stuck)
+    clock.now += 10.0
+    relay.tick()
+    assert hook_calls == []
+    assert stuck.state == "cancelled"
+    assert stuck.id not in relay._links
+    assert stuck.id not in relay._retired
+
+    # Capacity and reservation/quota accounting stay balanced (max_links=1 is now free for another key).
+    assert relay._reserved_slots == 0
+    assert relay._reserved_quota == {}
+    with relay.reserve("bob") as res_bob:
+        bob_link = relay.create("bob", reservation=res_bob)
+        assert bob_link.key == "bob"
+    assert relay._reserved_slots == 0
+    assert relay._reserved_quota == {}
+
+
+def test_drain_and_purge_force_still_preserves_saving_link():
+    relay, backend, _ = make_relay(links_per_hour=4)
+    saving = relay.create("alice")
+    win_id = open_window(relay, saving)
+    backend.states[win_id] = {"state": "saving", "host": "accounts.example.com"}
+    relay.advance(saving)
+    assert saving.state == "saving"
+
+    res = relay.drain_and_purge("alice", force=True)
+    assert res.purged == ()
+    assert res.preserved == (saving,)
+    assert res.still_open == (saving,)
+    assert saving._purged is False
+    assert saving.closed is False
+    assert saving in relay.snapshot("alice").links
+
+
+# ---------------------------------------------------------------------------
+# Drain fencing: overlapping calls, concurrent replace, force edge cases,
+# known_completed scoping, and live state route during slow drains
+# ---------------------------------------------------------------------------
+
+
+def _wait_until(predicate: Callable[[], bool], *, attempts: int = 1000) -> bool:
+    waiter = threading.Event()
+    for _ in range(attempts):
+        if predicate():
+            return True
+        waiter.wait(0.002)
+    return predicate()
+
+
+@pytest.mark.parametrize("pair", ["replace+replace", "drain+drain", "replace+drain"])
+def test_overlapping_drains_keep_surviving_link_open_with_zero_fences(pair: str):
+    in_close = threading.Event()
+    release_close = threading.Event()
+    call2_entered = threading.Event()
+    relay, backend, _ = make_relay(links_per_hour=6)
+    old = relay.create("alice")
+    win_id = open_window(relay, old)
+
+    def blocking_close(wid: str, cancel_only: bool) -> None:
+        if wid == win_id and cancel_only:
+            in_close.set()
+            assert release_close.wait(timeout=5)
+            backend.states[wid] = {"state": "saving", "host": "accounts.example.com"}
+
+    backend.on_close = blocking_close
+
+    out1: list[Any] = []
+    out2: list[Any] = []
+
+    def run_call1() -> None:
+        if pair.startswith("replace"):
+            out1.append(relay.replace("alice", LinkSpec()))
+        else:
+            out1.append(relay.drain_and_purge("alice"))
+
+    def run_call2() -> None:
+        if pair.endswith("replace"):
+            out2.append(relay.replace("alice", LinkSpec()))
+        else:
+            out2.append(
+                relay.drain_and_purge(
+                    "alice",
+                    predicate=lambda _link: (call2_entered.set(), True)[1],
+                )
+            )
+
+    t1 = threading.Thread(target=run_call1)
+    t1.start()
+    assert in_close.wait(timeout=5)
+
+    t2 = threading.Thread(target=run_call2)
+    t2.start()
+    if pair.endswith("drain"):
+        assert call2_entered.wait(timeout=5)
+    assert _wait_until(lambda: relay._draining.get("alice", 0) == 2 and old._drain_fences == 2)
+
+    release_close.set()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert len(out1) == 1 and len(out2) == 1
+    if pair.startswith("replace"):
+        assert out1[0].outcome == "saving" and out1[0].preserved is old
+    else:
+        assert out1[0].preserved == (old,) and out1[0].purged == ()
+    if pair.endswith("replace"):
+        assert out2[0].outcome == "saving" and out2[0].preserved is old
+    else:
+        assert out2[0].preserved == (old,) and out2[0].purged == ()
+
+    assert old.state == "saving"
+    assert old.closed is False
+    assert old._drain_fences == 0
+    assert relay.is_draining("alice") is False
+
+
+def test_drain_and_purge_does_not_resurrect_link_drained_by_concurrent_replace():
+    in_close = threading.Event()
+    release_close = threading.Event()
+    relay, backend, _ = make_relay(links_per_hour=6)
+
+    slow_link = Link(
+        id="s" * 32,
+        key="alice",
+        created=1_000_000.0,
+        expires=1_001_200.0,
+        url="https://mcp.example.com/connect/" + "s" * 32,
+        state="waiting",
+        window_id="win-slow",
+        closed=False,
+    )
+    other_link = Link(
+        id="o" * 32,
+        key="alice",
+        created=1_000_000.0,
+        expires=1_001_200.0,
+        url="https://mcp.example.com/connect/" + "o" * 32,
+        state="ready",
+        closed=False,
+    )
+    backend.states["win-slow"] = {"state": "waiting", "host": "accounts.example.com"}
+
+    def abort_slow(wid: str, _cancel_only: bool) -> None:
+        if wid == "win-slow":
+            in_close.set()
+            assert release_close.wait(timeout=5)
+            raise RuntimeError("abort slow drain")
+
+    backend.on_close = abort_slow
+
+    errors: list[BaseException] = []
+
+    def run_drain() -> None:
+        try:
+            relay.drain_and_purge("alice", extra_links=(slow_link, other_link))
+        except BaseException as exc:
+            errors.append(exc)
+
+    t = threading.Thread(target=run_drain)
+    t.start()
+    assert in_close.wait(timeout=5)
+
+    # Concurrent replace() legitimately drains other_link and creates a replacement.
+    rep = relay.replace("alice", LinkSpec(), extra_links=(other_link,))
+    assert rep.created and rep.link is not None
+    assert other_link in rep.drained
+    assert other_link.closed is True
+
+    release_close.set()
+    t.join(timeout=5)
+
+    assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
+    assert other_link.closed is True
+    assert other_link._drain_fences == 0
+    assert slow_link.closed is False
+    assert slow_link._drain_fences == 0
+    assert relay.is_draining("alice") is False
+
+
+def test_drain_and_purge_force_closes_attached_viewer_when_backend_close_unavailable():
+    bridge_exited = threading.Event()
+    relay, backend, _ = make_relay(links_per_hour=4)
+
+    async def holding_bridge(_wid: str, _token: str, ws: Any) -> None:
+        await ws.send_bytes(b"viewer")
+        try:
+            await asyncio.Future()
+        finally:
+            bridge_exited.set()
+
+    backend.on_bridge = holding_bridge
+    stuck = relay.create("alice")
+    open_window(relay, stuck)
+    backend.on_close = lambda _wid, _cancel_only: (_ for _ in ()).throw(LoginUnavailable("down"))
+
+    with TestClient(relay.app(), base_url="https://mcp.example.com") as client:
+        with client.websocket_connect(f"/{stuck.id}/vnc") as ws:
+            assert ws.receive_bytes() == b"viewer"
+            res = relay.drain_and_purge("alice", force=True)
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_bytes()
+
+    assert bridge_exited.wait(timeout=2)
+    assert res.purged == (stuck,)
+    assert stuck.closed is True
+    assert stuck._purged is True
+    assert stuck.view_token is None
+    assert stuck.viewer_revoked is True
+    assert stuck._drain_fences == 0
+    assert relay.is_draining("alice") is False
+
+
+def test_drain_and_purge_force_preserves_link_turning_saving_during_initial_cancel():
+    relay, backend, _ = make_relay(links_per_hour=4)
+    old = relay.create("alice")
+    win_id = open_window(relay, old)
+
+    def transition_to_saving(wid: str, cancel_only: bool) -> None:
+        if wid == win_id and cancel_only:
+            backend.states[wid] = {"state": "saving", "host": "accounts.example.com"}
+
+    backend.on_close = transition_to_saving
+
+    res = relay.drain_and_purge("alice", force=True)
+    assert res.purged == ()
+    assert res.preserved == (old,)
+    assert res.still_open == (old,)
+    assert old.state == "saving"
+    assert old.closed is False
+    assert old._purged is False
+    assert old._drain_fences == 0
+    assert backend.closed == [(win_id, True)]
+    assert old in relay.snapshot("alice").links
+
+
+def test_drain_and_purge_force_before_purge_exception_keeps_state_and_counters_balanced():
+    relay, backend, _ = make_relay(links_per_hour=4)
+    old = relay.create("alice")
+    open_window(relay, old)
+    backend.on_close = lambda _wid, _cancel_only: (_ for _ in ()).throw(LoginUnavailable("down"))
+
+    def boom() -> None:
+        assert relay.is_draining("alice") is True
+        raise RuntimeError("before_purge failed")
+
+    with pytest.raises(RuntimeError, match="before_purge failed"):
+        relay.drain_and_purge("alice", force=True, before_purge=boom)
+
+    assert relay.is_draining("alice") is False
+    assert old._drain_fences == 0
+    assert old._purged is False
+    assert old.closed is False
+    assert old.window_id is None
+    assert old.view_token is None
+    assert old.viewer_revoked is True
+    assert old in relay.snapshot("alice").active
+    assert relay._reserved_slots == 0
+    assert relay._reserved_quota == {}
+
+
+def test_replace_known_completed_ignores_foreign_open_and_replace_id_links():
+    # 1. Foreign-key id in known_completed has no effect on alice's completed link.
+    relay, backend, _ = make_relay(links_per_hour=4, on_signed_in=lambda _l, _s: "connected")
+    bob_link = relay.create("bob")
+    bob_win = open_window(relay, bob_link)
+    backend.states[bob_win] = {"state": "signed_in", "host": "accounts.example.com"}
+    backend.results[bob_win] = {"ok": True}
+    relay.advance(bob_link)
+    assert bob_link.state == "connected"
+
+    alice_link = relay.create("alice")
+    alice_win = open_window(relay, alice_link)
+    backend.states[alice_win] = {"state": "signed_in", "host": "accounts.example.com"}
+    backend.results[alice_win] = {"ok": True}
+    relay.advance(alice_link)
+    assert alice_link.state == "connected"
+
+    res_foreign = relay.replace("alice", LinkSpec(), known_completed=(bob_link.id,))
+    assert res_foreign.outcome == "completed"
+    assert res_foreign.preserved is alice_link
+    assert alice_link.closed is False
+
+    # 2. Open link id in known_completed has no effect when that link completes in-flight.
+    hook_entered = threading.Event()
+    release_hook = threading.Event()
+
+    def slow_signed_in(_link: Link, _session: dict[str, Any]) -> str:
+        hook_entered.set()
+        assert release_hook.wait(timeout=5)
+        return "connected"
+
+    relay2, backend2, _ = make_relay(links_per_hour=4, on_signed_in=slow_signed_in)
+    open_link = relay2.create("alice")
+    open_win = open_window(relay2, open_link)
+    backend2.states[open_win] = {"state": "signed_in", "host": "accounts.example.com"}
+    backend2.results[open_win] = {"ok": True}
+
+    adv_t = threading.Thread(target=relay2.advance, args=(open_link,))
+    adv_t.start()
+    assert hook_entered.wait(timeout=5)
+
+    out_open: list[ReplaceResult] = []
+    rep_t = threading.Thread(
+        target=lambda: out_open.append(relay2.replace("alice", LinkSpec(), known_completed=(open_link.id,)))
+    )
+    rep_t.start()
+    assert _wait_until(lambda: relay2.is_draining("alice"))
+
+    release_hook.set()
+    adv_t.join(timeout=5)
+    rep_t.join(timeout=5)
+    assert len(out_open) == 1
+    assert out_open[0].outcome == "completed"
+    assert out_open[0].preserved is open_link
+    assert open_link.closed is False
+
+    # 3. replace_id in known_completed has no effect when the target completes in-flight.
+    hook_entered2 = threading.Event()
+    release_hook2 = threading.Event()
+
+    def slow_signed_in2(_link: Link, _session: dict[str, Any]) -> str:
+        hook_entered2.set()
+        assert release_hook2.wait(timeout=5)
+        return "connected"
+
+    relay3, backend3, _ = make_relay(links_per_hour=4, on_signed_in=slow_signed_in2)
+    target = relay3.create("alice")
+    target_win = open_window(relay3, target)
+    backend3.states[target_win] = {"state": "signed_in", "host": "accounts.example.com"}
+    backend3.results[target_win] = {"ok": True}
+
+    adv_t2 = threading.Thread(target=relay3.advance, args=(target,))
+    adv_t2.start()
+    assert hook_entered2.wait(timeout=5)
+
+    out_target: list[ReplaceResult] = []
+    rep_t2 = threading.Thread(
+        target=lambda: out_target.append(
+            relay3.replace("alice", LinkSpec(), replace_id=target.id, known_completed=(target.id,))
+        )
+    )
+    rep_t2.start()
+    assert _wait_until(lambda: relay3.is_draining("alice"))
+
+    release_hook2.set()
+    adv_t2.join(timeout=5)
+    rep_t2.join(timeout=5)
+    assert len(out_target) == 1
+    assert out_target[0].outcome == "completed"
+    assert out_target[0].preserved is target
+    assert target.closed is False
+
+
+def test_state_route_stays_200_for_completed_link_during_slow_drain_of_sibling():
+    in_close = threading.Event()
+    release_close = threading.Event()
+
+    def authorize(request: Any, link: Link, _op: str) -> bool:
+        return not link.closed and request.headers.get("x-actor") == (link.context.owner if link.context else "")
+
+    relay, backend, _ = make_relay(
+        links_per_hour=4,
+        authorize=authorize,
+        on_signed_in=lambda _l, _s: "connected",
+    )
+    done_link = relay.create("alice", context=AttemptContext(owner="alice"))
+    done_win = open_window(relay, done_link)
+    backend.states[done_win] = {"state": "signed_in", "host": "accounts.example.com"}
+    backend.results[done_win] = {"ok": True}
+    relay.advance(done_link)
+    assert done_link.state == "connected"
+
+    slow_sibling = Link(
+        id="w" * 32,
+        key="alice",
+        created=1_000_000.0,
+        expires=1_001_200.0,
+        url="https://mcp.example.com/connect/" + "w" * 32,
+        state="waiting",
+        window_id="win-sibling",
+        closed=False,
+        context=AttemptContext(owner="alice"),
+    )
+    backend.states["win-sibling"] = {"state": "waiting", "host": "accounts.example.com"}
+
+    def slow_close(wid: str, cancel_only: bool) -> None:
+        if wid == "win-sibling" and cancel_only:
+            in_close.set()
+            assert release_close.wait(timeout=5)
+            backend.states[wid] = {"state": "cancelled"}
+
+    backend.on_close = slow_close
+
+    out: list[ReplaceResult] = []
+    rep_thread = threading.Thread(
+        target=lambda: out.append(
+            relay.replace(
+                "alice",
+                LinkSpec(context=AttemptContext(owner="alice")),
+                known_completed=(),
+                extra_links=(slow_sibling,),
+            )
+        )
+    )
+    rep_thread.start()
+    assert in_close.wait(timeout=5)
+    try:
+        # While slow_sibling is draining, done_link is fenced but NOT closed, so state stays 200.
+        assert done_link.closed is False
+        assert done_link._drain_fences == 1
+        with TestClient(relay.app(), base_url="https://mcp.example.com") as client:
+            resp = client.get(f"/{done_link.id}/state", headers={"x-actor": "alice"})
+            assert resp.status_code == 200
+            assert resp.json()["state"] == "connected"
+    finally:
+        release_close.set()
+        rep_thread.join(timeout=5)
+
+    assert len(out) == 1
+    assert out[0].outcome == "completed"
+    assert out[0].preserved is done_link
+    assert done_link.closed is False
+    assert done_link._drain_fences == 0
+    assert slow_sibling.closed is True
+    assert slow_sibling._drain_fences == 0
+    assert relay.is_draining("alice") is False
+
+
+def test_drain_and_purge_fences_saving_link_that_fails_so_it_cannot_start_a_window_mid_purge():
+    in_hook = threading.Event()
+    release_hook = threading.Event()
+    drain_entered = threading.Event()
+
+    def on_signed_in(_link: Link, _session: Any) -> str:
+        in_hook.set()
+        assert release_hook.wait(timeout=5)
+        return "failed"
+
+    relay, backend, _ = make_relay(links_per_hour=4, on_signed_in=on_signed_in)
+    link = relay.create("alice")
+    win_id = open_window(relay, link)
+    backend.states[win_id] = {"state": "saving", "host": "accounts.example.com"}
+    relay.advance(link)
+    assert link.state == "saving"
+    backend.states[win_id] = {"state": "signed_in", "host": "accounts.example.com"}
+    backend.results[win_id] = {"ok": True}
+
+    saver = threading.Thread(target=relay.advance, args=(link,))
+    saver.start()
+    assert in_hook.wait(timeout=5)
+    assert link.state == "saving"
+
+    started_before = len(backend.started)
+    during_purge: list[tuple[int, bool]] = []
+
+    def before_purge() -> None:
+        # The link has left saving for a retryable state; a retry must not open a window now.
+        relay.start(link, "desktop")
+        during_purge.append((len(backend.started), link.window_id is None))
+
+    results: list[Any] = []
+    drainer = threading.Thread(
+        target=lambda: results.append(
+            relay.drain_and_purge(
+                "alice",
+                predicate=lambda _link: (drain_entered.set(), True)[1],
+                before_purge=before_purge,
+            )
+        )
+    )
+    drainer.start()
+    assert drain_entered.wait(timeout=5)
+    # The drain fences the saving link, then waits for the hand-over that holds the link lock.
+    assert _wait_until(lambda: link._drain_fences == 1)
+
+    release_hook.set()
+    saver.join(timeout=5)
+    drainer.join(timeout=5)
+
+    assert len(results) == 1
+    assert during_purge == [(started_before, True)]
+    assert results[0].purged == (link,)
+    assert link.closed is True and link._purged is True
+    assert link.window_id is None
+    assert link._drain_fences == 0
+    assert relay.is_draining("alice") is False
+    assert relay.snapshot("alice").active == ()

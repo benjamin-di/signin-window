@@ -419,13 +419,19 @@ lifecycle methods on `Relay` instead of subclassing it or touching private state
 - `relay.reserve(key, count=1) -> SlotReservation`: atomically reserves capacity and hourly quota before teardown; use
   as a context manager (or call `release()`) so exceptions and cancellations never leak slots or quota. Pass the handle
   to `create(..., reservation=res)` or `replace(..., reservation=res)`.
-- `relay.replace(key, spec, *, replace_id=None, completed_states=("connected",), on_commit=None) -> ReplaceResult`:
-  marks `key` draining, validates an optional `replace_id` fence without tearing down newer links, preserves `saving`
-  and newly completed links across drain, creates the replacement link from `LinkSpec`, and runs `on_commit(link)`
-  (rolling back the new link and its hourly quota if `on_commit` raises).
-- `relay.drain_and_purge(key, *, predicate=None, before_purge=None) -> DrainResult`: drains matching links for `key`,
-  runs `before_purge()`, and purges finished links from active and retired tracking while guarding against concurrent
-  retirement re-insertion; `saving` and still-open links are preserved.
+- `relay.replace(key, spec, *, replace_id=None, completed_states=("connected",), known_completed=None, on_commit=None) -> ReplaceResult`:
+  marks `key` draining and transiently fences candidate links against new starts and viewer access while draining
+  (`saving` and newly completed links stay open, so their state routes stay reachable; links whose requested
+  teardown is still in flight are marked `closed`), validates an optional `replace_id`
+  fence without tearing down newer links, preserves `saving` and newly completed links across drain (passing
+  `known_completed` restricts which already-idle completed links of `key` are treated as already observed), creates the
+  replacement link from `LinkSpec`, and runs `on_commit(link)` (rolling back the new link and its hourly quota if
+  `on_commit` raises).
+- `relay.drain_and_purge(key, *, predicate=None, before_purge=None, force=False) -> DrainResult`: transiently fences
+  every matching link for `key` while draining (a hand-over in progress is not interrupted), runs `before_purge()`, and purges finished links from active
+  and retired tracking while guarding against concurrent retirement re-insertion. `saving` links are always preserved;
+  with `force=False`, other still-open links are reported in `still_open` and marked `closed`, while `force=True` force-closes and purges non-`saving` open
+  links and revokes their view tokens.
 - `relay.snapshot(key) -> KeySnapshot` and `relay.is_draining(key) -> bool`: return point-in-time active, retired, and
   draining state without acquiring any `link.lock`, so status reads never block on a slow `backend.close()`.
 

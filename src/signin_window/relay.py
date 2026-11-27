@@ -144,6 +144,7 @@ class Link:
     context: AttemptContext | None = field(default=None, repr=False)
     layout: str = ""
     _purged: bool = field(default=False, repr=False)
+    _drain_fences: int = field(default=0, repr=False)
 
     def show(self, **fields: object) -> None:
         """Public fields of the link's state, for its page (never a secret: the page is the id's holder's)."""
@@ -508,6 +509,13 @@ class Relay:
             is_completed = link.state in completed_states
             return still_open, is_saving, is_completed
 
+    def _is_fenced(self, link: Link, *, locked: bool = False) -> bool:
+        """Return True if ``link`` is permanently closed or transiently fenced by an active drain."""
+        if locked:
+            return link.closed or link._drain_fences > 0
+        with self._lock:
+            return link.closed or link._drain_fences > 0
+
     def _exit_draining(self, key: str) -> None:
         with self._lock:
             remaining = self._draining.get(key, 0) - 1
@@ -591,6 +599,7 @@ class Relay:
         *,
         replace_id: str | None = None,
         completed_states: Collection[str] = FINAL,
+        known_completed: Collection[str] | None = None,
         on_commit: Callable[[Link], Any] | None = None,
         reservation: SlotReservation | None = None,
         extra_links: Iterable[Link] = (),
@@ -603,6 +612,19 @@ class Relay:
         ``self._lock``, rechecks post-drain state, creates the replacement link,
         and invokes optional ``on_commit`` (rolling back the new link and its
         quota if ``on_commit`` raises).
+
+        When ``known_completed`` is provided, it restricts the set of
+        already-idle completed links of ``key`` (excluding ``replace_id``) that
+        the caller already observed; any other link found in
+        ``completed_states`` yields outcome ``"completed"``. When ``None``
+        (default), all already-idle completed links at entry are treated as
+        known.
+
+        Candidate links are transiently fenced against new starts and viewer
+        access during the drain rather than marked ``closed`` up front; only
+        links that are actually drained, replaced, or left with a requested
+        teardown still in flight become permanently closed. ``saving`` and
+        newly completed survivors stay open.
         """
         link_spec = spec or LinkSpec()
         if self._authorize is not None and (link_spec.context is None or not link_spec.context.owner):
@@ -619,6 +641,9 @@ class Relay:
             active_res = reservation
 
         draining_entered = False
+        previous: list[Link] = []
+        fenced: list[Link] = []
+        drained_links: list[Link] = []
         try:
             now = self._clock()
             with self._lock:
@@ -640,7 +665,7 @@ class Relay:
                     if (
                         target is None
                         or target.key != key
-                        or target.closed
+                        or self._is_fenced(target, locked=True)
                         or target.state not in ("ready", "starting", "waiting")
                     ):
                         preserved = target if (target is not None and target.key == key) else None
@@ -653,20 +678,21 @@ class Relay:
                 self._draining[key] = self._draining.get(key, 0) + 1
                 draining_entered = True
                 for old in previous:
-                    old.closed = True
+                    old._drain_fences += 1
+                    fenced.append(old)
 
-            already_completed: set[str] = set()
+            idle_completed: set[str] = set()
             for old in previous:
                 if old.id == replace_id:
                     continue
                 if old.lock.acquire(blocking=False):
                     try:
                         if old.window_id is None and not old.closing and old.state in completed_states:
-                            already_completed.add(old.id)
+                            idle_completed.add(old.id)
                     finally:
                         old.lock.release()
+            already_completed = idle_completed if known_completed is None else idle_completed & set(known_completed)
 
-            drained_links: list[Link] = []
             still_open_links: list[Link] = []
             saving_link: Link | None = None
             completed_link: Link | None = None
@@ -677,11 +703,16 @@ class Relay:
                         saving_link = old
                     still_open_links.append(old)
                 elif open_now:
+                    # Teardown was requested and is still in flight: this link is dying, not a survivor.
+                    with self._lock:
+                        old.closed = True
                     still_open_links.append(old)
                 elif is_completed and old.id not in already_completed:
                     if completed_link is None:
                         completed_link = old
                 else:
+                    with self._lock:
+                        old.closed = True
                     drained_links.append(old)
 
             if saving_link is not None:
@@ -758,6 +789,10 @@ class Relay:
             log.info("a sign-in link for %s", key)
             return ReplaceResult(outcome="created", link=new_link, drained=tuple(drained_links))
         finally:
+            if fenced:
+                with self._lock:
+                    for old in fenced:
+                        old._drain_fences -= 1
             if draining_entered:
                 self._exit_draining(key)
             if own_reservation is not None:
@@ -770,15 +805,28 @@ class Relay:
         predicate: Callable[[Link], bool] | None = None,
         before_purge: Callable[[], Any] | None = None,
         extra_links: Iterable[Link] = (),
+        force: bool = False,
     ) -> DrainResult:
         """Drain matching links for ``key`` and purge finished ones from ``_links`` and ``_retired``.
 
         Purged links are marked ``_purged = True`` so concurrent ``_retire()``
-        or ``tick()`` calls cannot re-insert them into ``_retired``. Links that
-        are still ``saving`` or open are preserved.
+        or ``tick()`` calls cannot re-insert them into ``_retired``.
+
+        Links that are ``saving`` are always preserved (even when ``force=True``)
+        so an in-flight credential hand-over is not orphaned. Every matching
+        link, ``saving`` ones included, is transiently fenced against new
+        starts and viewer access during the drain rather than marked ``closed``
+        up front; the fence does not interrupt a hand-over in progress. When
+        ``force=False`` (default), links that remain open after the drain
+        attempt are reported in ``still_open`` and marked ``closed``: their
+        teardown was requested and they are no longer usable sign-ins.
+        When ``force=True``, non-``saving`` links that remain open after the
+        drain attempt are force-closed, their view tokens are revoked, and they
+        are marked closed/purged and removed from active and retired tracking.
         """
         with self._lock:
             self._draining[key] = self._draining.get(key, 0) + 1
+        fenced: list[Link] = []
         try:
             now = self._clock()
             with self._lock:
@@ -796,19 +844,35 @@ class Relay:
                 candidates = list(seen.values())
 
             targets = [link for link in candidates if predicate is None or predicate(link)]
+            with self._lock:
+                for link in targets:
+                    # Fence saving links too: one that fails out of saving must not start a new window mid-purge.
+                    link._drain_fences += 1
+                    fenced.append(link)
+
             to_purge: list[Link] = []
             preserved: list[Link] = []
             still_open: list[Link] = []
             for link in targets:
-                link.closed = True
-                self.cancel(link)
                 with link.lock:
+                    if link.state == "saving":
+                        preserved.append(link)
+                        still_open.append(link)
+                        continue
+                    if link.state in ("starting", "waiting"):
+                        self._close(link)
                     is_saving = link.state == "saving"
                     open_now = link.window_id is not None or link.closing or link.state in ACTIVE
+                    if open_now and not is_saving and force:
+                        self._close(link, force=True)
+                        open_now = False
                 if is_saving:
                     preserved.append(link)
                     still_open.append(link)
                 elif open_now:
+                    # Teardown was requested and is still in flight: this link is dying, not a survivor.
+                    with self._lock:
+                        link.closed = True
                     still_open.append(link)
                 else:
                     to_purge.append(link)
@@ -822,6 +886,7 @@ class Relay:
                     link.closed = True
                     link._purged = True
                     link.view_token = None
+                    link.viewer_revoked = True
                     self._links.pop(link.id, None)
                     self._retired.pop(link.id, None)
                     purged.append(link)
@@ -831,6 +896,10 @@ class Relay:
                 still_open=tuple(still_open),
             )
         finally:
+            if fenced:
+                with self._lock:
+                    for link in fenced:
+                        link._drain_fences -= 1
             self._exit_draining(key)
 
     def links(self, key: str) -> list[Link]:
@@ -945,7 +1014,7 @@ class Relay:
 
     def start(self, link: Link, layout: str) -> None:
         with link.lock:
-            if link.closed or link.state in ACTIVE or link.state in FINAL or link.starts >= self.max_starts:
+            if self._is_fenced(link) or link.state in ACTIVE or link.state in FINAL or link.starts >= self.max_starts:
                 return
             if self._before_start is not None:
                 with self._hooks:
@@ -972,7 +1041,7 @@ class Relay:
             link.layout = str(returned_layout) if returned_layout in ("phone", "desktop") else chosen
             link.viewer_revoked = False
             link.view_token = str(window["view_token"]) if window.get("view_token") else None  # or in a later state
-            if link.closed:
+            if self._is_fenced(link):
                 self._close(link)
                 return
             log.info("%s opened a sign-in window", link.key)
@@ -1006,7 +1075,12 @@ class Relay:
                     link.layout = str(window["layout"])
                 if state == "saving":
                     link.view_token = None
-                elif not link.view_token and not link.closed and not link.viewer_revoked and window.get("view_token"):
+                elif (
+                    not link.view_token
+                    and not self._is_fenced(link)
+                    and not link.viewer_revoked
+                    and window.get("view_token")
+                ):
                     link.view_token = str(window["view_token"])
                 return
             window_id = link.window_id
@@ -1159,7 +1233,13 @@ class Relay:
 
         async def vnc(ws: WebSocket) -> None:
             link = self.find(ws.path_params["id"], self._address(ws))
-            if not isinstance(link, Link) or link.state != "waiting" or not link.window_id or not link.view_token:
+            if (
+                not isinstance(link, Link)
+                or self._is_fenced(link)
+                or link.state != "waiting"
+                or not link.window_id
+                or not link.view_token
+            ):
                 await ws.close(code=4404)
                 return
             if not await self._allowed(ws, link, "vnc"):
@@ -1186,7 +1266,7 @@ class Relay:
 
             async def watch():
                 while (
-                    not link.closed
+                    not self._is_fenced(link)
                     and not link.closing
                     and link.state == "waiting"
                     and link.view_token is not None

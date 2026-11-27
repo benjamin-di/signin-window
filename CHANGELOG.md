@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.14.0] - 2026-11-27
+
+### Changed
+
+- `Relay.replace()` and `Relay.drain_and_purge()` no longer mark every prior link `closed` before draining. Links are fenced against new starts and viewer access while a drain runs; `closed` is set only when a link is drained, replaced, purged, or left with a requested teardown still in flight. A `saving` link or one that completed during the drain stays open, so its sign-in page keeps working and applications that filter on `closed` keep seeing an in-flight save.
+
+### Added
+
+- `Relay.replace(..., known_completed=...)`: the link ids the caller already saw completed. Any other link found completed during the call returns outcome `completed` instead of being replaced.
+- `Relay.drain_and_purge(..., force=True)`: force-closes and purges links still open after the drain attempt and revokes their view tokens. `saving` links are still preserved.
+
+### Fixed
+
+- A refused `replace()` or a partial `drain_and_purge()` left surviving `saving` and newly completed links `closed`, which made their state route unreachable.
+
+### Upgrade
+
+- Action required: None. Applications that relied on a surviving `saving` or newly completed link being `closed` after a refused replace must check `state` instead.
+- Rollback: compatible with `v0.13.0`.
+
 ## [0.13.0] - 2026-11-27
 
 ### Changed
