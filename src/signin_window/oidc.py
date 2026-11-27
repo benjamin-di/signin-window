@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import logging
 import math
 import os
 import re
@@ -27,7 +28,7 @@ from starlette.requests import HTTPConnection, Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from .connections import SCRIPT_SOURCE, PageIdentity, page
+from .connections import SCRIPT_SOURCE, PageIdentity, Suite, SuiteDirectory, page
 
 #: Browser safety headers of every Connections page; an application's own complete policy takes precedence.
 PAGE_HEADERS = {
@@ -63,6 +64,21 @@ def _label(value):
         return None
     value = "".join(c for c in value if not unicodedata.category(c).startswith("C")).strip()[:100]
     return value if value and value != "Your account" else None
+
+
+SUITE_VARIABLE = "SIGNIN_WINDOW_SUITE"
+
+
+def _suite_from_environment() -> SuiteDirectory | None:
+    """An optional deployment directory; a malformed one costs navigation, never sign-in."""
+    text = os.environ.get(SUITE_VARIABLE, "").strip()
+    if not text:
+        return None
+    try:
+        return SuiteDirectory.from_json(text)
+    except ValueError as error:
+        logging.getLogger(__name__).warning("Ignoring %s: %s", SUITE_VARIABLE, error)
+        return None
 
 
 @dataclass(frozen=True)
@@ -295,9 +311,11 @@ class BrowserAuth:
         on_group_refused=None,
         on_sign_in=None,
         identity: PageIdentity | None = None,
+        suite: SuiteDirectory | None = None,
     ):
         self.config = config
         self.page_identity = identity
+        self.suite_directory = suite if suite is not None else _suite_from_environment()
         self.on_group_refused = on_group_refused
         self.on_sign_in = on_sign_in
         self.store = BrowserStore(config.state_dir, clock=clock)
@@ -349,6 +367,18 @@ class BrowserAuth:
             "auth_time": data.get("auth_time"),
             "reauthenticated_at": data.get("reauthenticated_at"),
         }
+
+    def suite(self, request: HTTPConnection) -> Suite | None:
+        """Sibling applications this signed-in visitor may open, for ``page(..., suite=...)``.
+
+        Navigation only: every destination authenticates and authorizes its own visitors.
+        """
+        person = self.identity(request)
+        if self.suite_directory is None or person is None:
+            return None
+        return self.suite_directory.suite(
+            groups=person["groups"], current=self.origin, account=person["label"] or person["name"]
+        )
 
     def origin_ok(self, request: HTTPConnection):
         return request.headers.getlist("origin") == [self.origin]

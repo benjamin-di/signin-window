@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.13.0] - 2026-11-27
+
+### Changed
+
+- Redesign connection pages: warmer neutral surfaces, elevated cards, a sticky top bar with the application's mark, restyled buttons (primary is now ink rather than accent), form fields and status blocks, and a matching dark theme. Existing custom properties and class names keep working; new shared properties (`--surface-2`, `--line-strong`, `--accent-soft`, `--radius`, `--shadow`, `--ok`/`--warn`/`--bad`/`--info` families) are available to application markup.
+- The fixed page script also closes the app switcher on outside click or Escape, so `SCRIPT_SOURCE` has a new value. Applications that import it need no change.
+
+### Added
+
+- Add `Suite`, `SuiteLink` and `SuiteDirectory` to `signin_window.connections`, and `page(..., suite=...)`: a shared top bar with an app switcher between sibling applications, filtered by the signed-in visitor's identity-provider groups from one deployment-supplied JSON directory. Links are navigation only and must be clean `https://` URLs.
+- `BrowserAuth` reads an optional `SIGNIN_WINDOW_SUITE` directory (or `suite=`) and exposes `auth.suite(request)` for `page(..., suite=...)`; a malformed variable is logged and ignored.
+- Add a shared component kit for application markup (`badge()`, `card-head`, `actions`, `facts`, `rows`, `steps`, `callout`, `hero`, `grid-2`) and `examples/connection_kit.py`.
+- A suite directory may name one `endpoint` address for visitors to copy into another program; applications that opt in show it as a collapsed row with a copy button (`SuiteEndpoint`). A copy button may set its confirmation text with `data-copied`.
+
+### Upgrade
+
+- Action required: none. Applications that assert exact page markup or copy the old script hash must update those expectations.
+- Rollback: compatible with 0.12.0; no storage, route or wire-format changes.
+
 ## [0.12.0] - 2026-11-27
 
 ### Added

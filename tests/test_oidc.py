@@ -581,3 +581,38 @@ def test_browser_auth_forwards_host_identity_to_every_owned_html_outcome(system,
             assert "subject-one" not in response.text
             assert "private-callback" not in response.text and "private-provider" not in response.text
         assert "private-provider" not in caplog.text and "private-callback" not in caplog.text
+
+
+def test_suite_comes_from_the_deployment_directory_and_only_for_a_signed_in_visitor(tmp_path, monkeypatch, caplog):
+    directory = (
+        '{"name": "Example", "apps": ['
+        '{"label": "App", "url": "https://app.example.com/connections/", "groups": ["example-users"]},'
+        '{"label": "Ledger", "url": "https://ledger.example.com/", "groups": ["example-users"]},'
+        '{"label": "Vault", "url": "https://vault.example.com/", "groups": ["vault-users"]}]}'
+    )
+    provider = Provider()
+    config = OIDCConfig(
+        provider.issuer, "example-app", "https://app.example.com", tmp_path / "browser", required_group="example-users"
+    )
+    assert BrowserAuth(config, transport=provider.transport()).suite_directory is None
+    monkeypatch.setenv(
+        "SIGNIN_WINDOW_SUITE", '{"name": "Example", "apps": [{"label": "Bad", "url": "http://bad.example.com"}]}'
+    )
+    assert BrowserAuth(config, transport=provider.transport()).suite_directory is None
+    assert "Ignoring SIGNIN_WINDOW_SUITE" in caplog.text
+    monkeypatch.setenv("SIGNIN_WINDOW_SUITE", directory)
+    auth = BrowserAuth(config, transport=provider.transport())
+    seen = []
+
+    async def status(request):
+        seen.append(auth.suite(request))
+        return JSONResponse({})
+
+    app = auth.middleware(Starlette(routes=[*auth.routes(), Route("/connections/status", status)]))
+    with TestClient(app, base_url=config.public_url, follow_redirects=False) as client:
+        client.get("/connections/status")
+        assert sign_in(provider, client).status_code == 303
+        client.get("/connections/status")
+    assert seen[0] is None
+    assert [(link.label, link.current) for link in seen[1].links] == [("App", True), ("Ledger", False)]
+    assert seen[1].name == "Example" and seen[1].account == "Example One"

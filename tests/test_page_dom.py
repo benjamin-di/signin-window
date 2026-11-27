@@ -658,7 +658,7 @@ def test_connection_actions_remain_accessible_and_consistent_at_phone_widths(bro
     assert browser_page.locator("label").bounding_box()["height"] >= 44
     assert browser_page.evaluate("document.documentElement.scrollWidth <= innerWidth")
     assert browser_page.locator("html").evaluate("el => getComputedStyle(el).backgroundColor") == (
-        "rgb(18, 26, 38)" if scheme == "dark" else "rgb(244, 246, 250)"
+        "rgb(13, 14, 16)" if scheme == "dark" else "rgb(246, 245, 242)"
     )
     browser_page.keyboard.press("Tab")
     assert link.evaluate("el => document.activeElement === el")

@@ -574,6 +574,74 @@ Use `disconnect_confirmation(form, service, effect)` to put an existing form
 behind an expandable explanation, and `timestamp(value, label="Last checked")`
 for readable UTC times. These helpers do not perform or authorize actions.
 
+### Navigation between sibling applications
+
+A deployment with several applications on separate origins can give every page
+the same top bar and an app switcher. Describe the applications once, as JSON
+the deployment supplies to each of them, and filter it for the signed-in visitor:
+
+```python
+from signin_window.connections import SuiteDirectory, page
+
+directory = SuiteDirectory.from_json(os.environ["EXAMPLE_SUITE"])  # validate once at startup
+# {"name": "Example", "apps": [
+#   {"label": "Shop", "url": "https://shop.example.com/connections/", "section": "Accounts",
+#    "description": "Orders and basket", "groups": ["shop-users"]},
+#   {"label": "Ledger", "url": "https://ledger.example.com/", "groups": ["ledger-users"]}]}
+
+person = auth.identity(request)
+suite = directory.suite(groups=person["groups"], current="https://shop.example.com", account=person["name"])
+html = page("Shop accounts", body, suite=suite)
+```
+
+With the optional identity integration there is nothing to wire: `BrowserAuth`
+reads the same JSON from the `SIGNIN_WINDOW_SUITE` environment variable (or
+takes `BrowserAuth(..., suite=directory)`), and `auth.suite(request)` returns the
+visitor's links, or `None` when no directory is configured or nobody is signed
+in. A malformed variable is logged and ignored; it never blocks sign-in.
+
+```python
+html = page("Shop accounts", body, suite=auth.suite(request))
+```
+
+The directory may also name one address for visitors to copy into another
+program, for example an assistant: add a top-level
+`"endpoint": {"title": "Use with your assistant", "url": "https://tools.example.com/all", "help": "..."}`
+and set `"endpoint": true` on the applications whose pages should offer it. It
+renders as one collapsed row with a copy button below the page content. The row
+uses the element id `connection-suite-endpoint`; application markup must not reuse it.
+A copy button may carry `data-copied="..."` to set its confirmation text.
+
+An entry appears when the visitor holds any of its `groups`; an entry without
+`groups` appears for every signed-in visitor, and the entry on the `current`
+origin is always present and marked. Links must be clean `https://` URLs. The
+switcher is navigation only: showing a link grants nothing and hiding one
+protects nothing. Every destination still authenticates and authorizes its own
+visitors. Without `suite`, pages keep the bar and heading but have no links.
+
+Pages follow the visitor's light or dark preference. Application markup can use
+the shared custom properties (`--bg`, `--surface`, `--surface-2`, `--text`,
+`--muted`, `--line`, `--line-strong`, `--accent`, `--accent-soft`, `--radius`,
+`--shadow`, and `--ok`/`--warn`/`--bad`/`--info` with their `-bg` and `-border`
+variants) so its own components match in both.
+
+The stylesheet also carries a small component kit for application markup, so
+pages across a deployment share one vocabulary:
+
+| Markup | Use |
+| --- | --- |
+| `<article>` / `<section class="panel">` | A card. Add `hero` to one card per page for the primary status. |
+| `<div class="card-head">` | A heading with a trailing badge or button on one row. |
+| `badge(text, tone)` / `<span class="badge ok">` | Status pill; tones `ok`, `warn`, `bad`, `info`, or none. |
+| `<div class="actions">` | A row of forms and buttons. Buttons: default, `secondary`, `quiet`, `danger`. |
+| `<dl class="facts">` | Label and value pairs about an account. |
+| `<ul class="rows">` with `<div class="who">` and `<span class="avatar">` | People or accounts, each with a trailing badge or action. |
+| `<ol class="steps">` | Numbered instructions. |
+| `<div class="callout info">` | A note; same tones as badges. |
+| `<div class="grid-2">` | Two cards side by side, stacking on narrow screens. |
+
+`examples/connection_kit.py` renders every component with invented data.
+
 For optional pause and activity controls, use a separate private root for each
 application and authenticated owner:
 
@@ -635,15 +703,17 @@ from pathlib import Path
 from signin_window.oidc import BrowserAuth, OIDCConfig
 from starlette.applications import Starlette
 
-auth = BrowserAuth(OIDCConfig(
-    issuer="https://identity.example.com",
-    client_id="example-connections",
-    public_url="https://connections.example.com",
-    state_dir=Path("/private/browser-sessions"),
-    cookie_name="__Host-example-connections",
-    required_group="example-users",
-    claim_names=("account_alias",),
-))
+auth = BrowserAuth(
+    OIDCConfig(
+        issuer="https://identity.example.com",
+        client_id="example-connections",
+        public_url="https://connections.example.com",
+        state_dir=Path("/private/browser-sessions"),
+        cookie_name="__Host-example-connections",
+        required_group="example-users",
+        claim_names=("account_alias",),
+    )
+)
 app = auth.middleware(Starlette(routes=auth.routes()))
 ```
 
@@ -708,7 +778,7 @@ must have occurred before a sensitive action:
 async def start(request):
     if auth.identity(request) is None or not auth.origin_ok(request):
         return auth.refused(request)
-    if (confirm := auth.require_fresh(request, max_age=300, action="connect an account")):
+    if confirm := auth.require_fresh(request, max_age=300, action="connect an account"):
         return confirm
     ...
 ```
@@ -754,19 +824,22 @@ message, URL parameter or forwarded header must never select that owner.
 from pathlib import Path
 from signin_window.delegation import OAuthConfig, OAuthManager, load_client_key
 
-manager = OAuthManager(OAuthConfig(
-    issuer="https://identity.example.com",
-    client_id="example-assistant",
-    client_secret="",  # private_key_jwt uses the existing private key instead
-    client_private_key=load_client_key(Path("/private/client")),
-    resource="https://tools.example.com/assistant/mcp",
-    redirect_uri="https://assistant.example.com/oauth/callback",
-    public_base_url="https://assistant.example.com",
-    scope="assistant:use",
-    store_key=encryption_key,  # application-provisioned 32 bytes; never publish
-    owner_header="X-Example-Person",
-    cookie_name="__Secure-example-assistant-oauth",
-), Path("/private/grants"))
+manager = OAuthManager(
+    OAuthConfig(
+        issuer="https://identity.example.com",
+        client_id="example-assistant",
+        client_secret="",  # private_key_jwt uses the existing private key instead
+        client_private_key=load_client_key(Path("/private/client")),
+        resource="https://tools.example.com/assistant/mcp",
+        redirect_uri="https://assistant.example.com/oauth/callback",
+        public_base_url="https://assistant.example.com",
+        scope="assistant:use",
+        store_key=encryption_key,  # application-provisioned 32 bytes; never publish
+        owner_header="X-Example-Person",
+        cookie_name="__Secure-example-assistant-oauth",
+    ),
+    Path("/private/grants"),
+)
 ```
 
 Provision a client key once with `create_client_key(directory)`: it writes an
