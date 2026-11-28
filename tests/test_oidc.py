@@ -618,6 +618,57 @@ def test_suite_comes_from_the_deployment_directory_and_only_for_a_signed_in_visi
     assert seen[1].name == "Example" and seen[1].account == "Example One"
 
 
+def test_suite_file_updates_live_requests_without_recreating_browser_auth(tmp_path, monkeypatch, caplog):
+    import os
+
+    suite_dir = tmp_path / "suite"
+    suite_dir.mkdir()
+    suite_file = suite_dir / "suite.json"
+    suite_file.write_text(
+        '{"name": "Example", "apps": ['
+        '{"label": "App", "url": "https://app.example.com/connections/", "groups": ["example-users"]}]}',
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("SIGNIN_WINDOW_SUITE", raising=False)
+    monkeypatch.setenv("SIGNIN_WINDOW_SUITE_FILE", str(suite_file))
+
+    provider = Provider()
+    config = OIDCConfig(
+        provider.issuer, "example-app", "https://app.example.com", tmp_path / "browser", required_group="example-users"
+    )
+    auth = BrowserAuth(config, transport=provider.transport())
+    seen = []
+
+    async def status(request):
+        seen.append(auth.suite(request))
+        return JSONResponse({})
+
+    app = auth.middleware(Starlette(routes=[*auth.routes(), Route("/connections/status", status)]))
+    with TestClient(app, base_url=config.public_url, follow_redirects=False) as client:
+        assert sign_in(provider, client).status_code == 303
+        client.get("/connections/status")
+
+        staged = suite_dir / ".suite.json.tmp"
+        staged.write_text(
+            '{"name": "Example", "apps": ['
+            '{"label": "App", "url": "https://app.example.com/connections/", "groups": ["example-users"]},'
+            '{"label": "Ledger", "url": "https://ledger.example.com/", "groups": ["example-users"]}]}',
+            encoding="utf-8",
+        )
+        os.replace(staged, suite_file)
+        client.get("/connections/status")
+
+        corrupt = suite_dir / ".suite.json.bad"
+        corrupt.write_text('{"name": "Example", "apps": [{"label": "Bad", "url": "http://bad.example.com"}]}')
+        os.replace(corrupt, suite_file)
+        client.get("/connections/status")
+
+    assert [link.label for link in seen[0].links] == ["App"]
+    assert [link.label for link in seen[1].links] == ["App", "Ledger"]
+    assert [link.label for link in seen[2].links] == ["App", "Ledger"]
+    assert "Ignoring SIGNIN_WINDOW_SUITE_FILE" in caplog.text
+
+
 def test_custom_root_home_redirects_to_root_and_scopes_page_headers(tmp_path):
     provider = Provider()
     config = OIDCConfig(

@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.16.0] - 2026-11-28
+
+### Added
+
+- Add `SuiteSource` and `SIGNIN_WINDOW_SUITE_FILE` support in `signin_window.connections` (and `BrowserAuth`) so deployments can mount a directory containing the suite JSON file and reload it automatically whenever `(st_ino, st_mtime_ns, st_size)` changes, without restarting the process. Read/validation errors log a warning and retain the last valid directory in memory; symlinks (`O_NOFOLLOW`) and files over 64 KiB are rejected. Unset `SIGNIN_WINDOW_SUITE_FILE` falls back to `SIGNIN_WINDOW_SUITE`.
+- Include the `email` OIDC scope automatically when `email` or `email_verified` is listed in `OIDCConfig.claim_names`.
+
+### Upgrade
+
+- Action required: None. Existing `SIGNIN_WINDOW_SUITE` callers keep working unchanged.
+- Rollback: compatible with `v0.15.0`.
+
 ## [0.15.0] - 2026-11-27
 
 ### Added

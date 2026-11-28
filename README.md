@@ -601,10 +601,14 @@ html = page("Shop accounts", body, suite=suite)
 ```
 
 With the optional identity integration there is nothing to wire: `BrowserAuth`
-reads the same JSON from the `SIGNIN_WINDOW_SUITE` environment variable (or
-takes `BrowserAuth(..., suite=directory)`), and `auth.suite(request)` returns the
+reads the same JSON from `SIGNIN_WINDOW_SUITE_FILE` (a regular file inside a
+mounted directory, reloaded automatically whenever its inode, mtime or size
+changes while retaining the last valid directory on error) or falls back to the
+`SIGNIN_WINDOW_SUITE` environment variable (or takes `BrowserAuth(..., suite=directory)`).
+Applications that do not use `BrowserAuth` can call `SuiteSource.from_environment()`
+for the same live-reloading behaviour. `auth.suite(request)` returns the
 visitor's links, or `None` when no directory is configured or nobody is signed
-in. A malformed variable is logged and ignored; it never blocks sign-in.
+in. A malformed file or variable is logged and ignored; it never blocks sign-in.
 
 ```python
 html = page("Shop accounts", body, suite=auth.suite(request))

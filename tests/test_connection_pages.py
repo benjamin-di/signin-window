@@ -290,3 +290,65 @@ def test_badge_escapes_its_text_and_accepts_only_known_tones():
     assert badge("Idle") == '<span class="badge">Idle</span>'
     with pytest.raises(ValueError):
         badge("x", 'ok" onclick="bad()')
+
+
+def test_suite_source_reloads_on_atomic_replace_and_preserves_last_good(tmp_path, monkeypatch, caplog):
+    import os
+
+    from signin_window.connections import SuiteSource
+
+    suite_dir = tmp_path / "suite"
+    suite_dir.mkdir()
+    suite_file = suite_dir / "suite.json"
+    v1 = '{"name": "Example", "apps": [{"label": "Shop", "url": "https://shop.example.com/"}]}'
+    v2 = (
+        '{"name": "Example", "apps": ['
+        '{"label": "Shop", "url": "https://shop.example.com/"},'
+        '{"label": "Ledger", "url": "https://ledger.example.com/"}]}'
+    )
+    suite_file.write_text(v1, encoding="utf-8")
+    monkeypatch.setenv("SIGNIN_WINDOW_SUITE_FILE", str(suite_file))
+    monkeypatch.setenv(
+        "SIGNIN_WINDOW_SUITE", '{"name": "Env", "apps": [{"label": "E", "url": "https://e.example.com/"}]}'
+    )
+
+    source = SuiteSource.from_environment()
+    first = source.current()
+    assert first is not None
+    assert [e.label for e in first.entries] == ["Shop"]
+
+    # Atomic replace inside mounted directory updates immediately on next current() call.
+    staged = suite_dir / ".suite.json.tmp"
+    staged.write_text(v2, encoding="utf-8")
+    os.replace(staged, suite_file)
+    second = source.current()
+    assert second is not None
+    assert [e.label for e in second.entries] == ["Shop", "Ledger"]
+
+    # Corrupting the file logs once and retains the last valid directory in memory.
+    caplog.clear()
+    bad = suite_dir / ".suite.json.bad"
+    bad.write_text("{not-json", encoding="utf-8")
+    os.replace(bad, suite_file)
+    third = source.current()
+    assert third is second
+    assert source.current() is second
+    assert caplog.text.count("Ignoring SIGNIN_WINDOW_SUITE_FILE") == 1
+
+
+def test_suite_source_rejects_symlinks_and_oversized_files(tmp_path, caplog):
+    from signin_window.connections import SuiteSource
+
+    real_file = tmp_path / "real.json"
+    real_file.write_text('{"name": "Example", "apps": [{"label": "Shop", "url": "https://shop.example.com/"}]}')
+    link = tmp_path / "link.json"
+    link.symlink_to(real_file)
+
+    assert SuiteSource(path=link).current() is None
+    assert "Ignoring SIGNIN_WINDOW_SUITE_FILE" in caplog.text
+
+    caplog.clear()
+    huge = tmp_path / "huge.json"
+    huge.write_text(" " * 70000, encoding="utf-8")
+    assert SuiteSource(path=huge).current() is None
+    assert "exceeds" in caplog.text

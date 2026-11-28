@@ -12,10 +12,15 @@ import hashlib
 import html
 import ipaddress
 import json
+import logging
+import os
 import re
+import stat
+import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import idna
@@ -548,6 +553,93 @@ class SuiteDirectory:
             if is_current or not entry.groups or entry.groups & held:
                 links.append(SuiteLink(entry.label, entry.url, entry.section, entry.description, is_current))
         return Suite(self.name, tuple(links), account, shown)
+
+
+SUITE_VARIABLE = "SIGNIN_WINDOW_SUITE"
+SUITE_FILE_VARIABLE = "SIGNIN_WINDOW_SUITE_FILE"
+_MAX_SUITE_BYTES = 65536
+
+
+class SuiteSource:
+    """Live or static source for a ``SuiteDirectory``.
+
+    When backed by a file path (for example via ``SIGNIN_WINDOW_SUITE_FILE``),
+    ``current()`` re-reads the file whenever ``(st_ino, st_mtime_ns, st_size)``
+    changes so atomic replacements inside a mounted directory take effect on the
+    next request without restarting the process. Read or validation errors log a
+    warning and retain the last valid directory in memory.
+    """
+
+    def __init__(self, *, path: str | os.PathLike[str] | None = None, directory: SuiteDirectory | None = None):
+        if path is not None and directory is not None:
+            raise ValueError("Specify either path or directory, not both")
+        self._path = Path(path) if path is not None else None
+        self._directory = directory
+        self._sig: tuple[int, int, int] | None = None
+        self._last_error: tuple[object, ...] | None = None
+        self._lock = threading.Lock()
+
+    @classmethod
+    def from_environment(cls) -> SuiteSource:
+        """Load from ``SIGNIN_WINDOW_SUITE_FILE`` if set, else ``SIGNIN_WINDOW_SUITE``."""
+        file_path = os.environ.get(SUITE_FILE_VARIABLE, "").strip()
+        if file_path:
+            source = cls(path=file_path)
+            source.current()
+            return source
+        text = os.environ.get(SUITE_VARIABLE, "").strip()
+        if not text:
+            return cls(directory=None)
+        try:
+            return cls(directory=SuiteDirectory.from_json(text))
+        except ValueError as error:
+            logging.getLogger(__name__).warning("Ignoring %s: %s", SUITE_VARIABLE, error)
+            return cls(directory=None)
+
+    def _log_error(self, sig: tuple[int, int, int] | None, error: Exception) -> None:
+        key = (sig, type(error).__name__, str(error))
+        if key != self._last_error:
+            self._last_error = key
+            logging.getLogger(__name__).warning("Ignoring %s (%s): %s", SUITE_FILE_VARIABLE, self._path, error)
+
+    def current(self) -> SuiteDirectory | None:
+        if self._path is None:
+            return self._directory
+        with self._lock:
+            sig: tuple[int, int, int] | None = None
+            try:
+                st = os.lstat(self._path)
+                if not stat.S_ISREG(st.st_mode):
+                    raise ValueError("suite file must be a regular file")
+                sig = (st.st_ino, st.st_mtime_ns, st.st_size)
+                if sig == self._sig:
+                    return self._directory
+                if st.st_size > _MAX_SUITE_BYTES:
+                    raise ValueError(f"suite file exceeds {_MAX_SUITE_BYTES} bytes")
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(self._path, flags)
+                try:
+                    fst = os.fstat(fd)
+                    if not stat.S_ISREG(fst.st_mode):
+                        raise ValueError("suite file must be a regular file")
+                    if fst.st_size > _MAX_SUITE_BYTES:
+                        raise ValueError(f"suite file exceeds {_MAX_SUITE_BYTES} bytes")
+                    with os.fdopen(fd, "rb") as handle:
+                        fd = -1
+                        raw = handle.read(_MAX_SUITE_BYTES + 1)
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+                if len(raw) > _MAX_SUITE_BYTES:
+                    raise ValueError(f"suite file exceeds {_MAX_SUITE_BYTES} bytes")
+                parsed = SuiteDirectory.from_json(raw.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError) as error:
+                self._log_error(sig, error)
+                return self._directory
+            self._directory = parsed
+            self._sig = (fst.st_ino, fst.st_mtime_ns, fst.st_size)
+            self._last_error = None
+            return self._directory
 
 
 def _mark(label: str, *, small: bool = False) -> str:
